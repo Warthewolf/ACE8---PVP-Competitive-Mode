@@ -4,22 +4,39 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Project RVNG</title>
+  <meta name="description" content="Project RVNG: ranked 1v1 ladder and knockout championship for modded ACE COMBAT 8 multiplayer.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,600;1,300&family=Jost:wght@400;500;600&family=Share+Tech+Mono&display=swap">
   <link rel="stylesheet" href="/styles.css">
   <script src="/app.js" defer></script>
 </head>
 <body>
-  <header class="top">
-    <a class="brand" href="#/"><span class="mark">◆</span> PROJECT <b>RVNG</b></a>
-    <nav>
-      <a href="#/" data-nav="leaderboard">Leaderboard</a>
+  <header class="gnav">
+    <a class="logo" href="#/">PROJECT <span>RVNG</span></a>
+    <nav aria-label="Main">
+      <a href="#/" data-nav="">Home</a>
+      <a href="#/leaderboard" data-nav="leaderboard">Leaderboard</a>
       <a href="#/matches" data-nav="matches">Matches</a>
-      <a href="#/tournaments" data-nav="tournaments">Tournaments</a>
-      <a href="#/integrity" data-nav="integrity">Fair play</a>
-      <a href="#/register" data-nav="register" class="cta">Sign up</a>
+      <a href="#/tournaments" data-nav="tournaments">Events</a>
+      <a href="#/integrity" data-nav="integrity">Fair Play</a>
     </nav>
+    <div class="side"><a class="btn-line" href="#/register">Sign up</a></div>
   </header>
-  <section class="ticker" id="stats" aria-live="polite"></section>
-  <main id="view"><p class="muted">Loading…</p></main>
-  <footer>Project RVNG: community-run 1v1 ladder for modded ACE COMBAT 8 multiplayer. Not affiliated with Bandai Namco.</footer>
+
+  <div id="view"></div>
+
+  <div class="sheet-end">Project RVNG is a community project. Not affiliated with or endorsed by Bandai Namco Entertainment Inc. ACE COMBAT is a trademark of its respective owner.</div>
+  <footer class="foot">
+    <nav aria-label="Footer">
+      <a href="#/leaderboard">Leaderboard</a><a href="#/matches">Matches</a><a href="#/tournaments">Events</a><a href="#/integrity">Fair Play</a><a href="#/register">Sign up</a>
+    </nav>
+    <a class="logo" href="#/">PROJECT <span>RVNG</span></a>
+    <div>Ranked 1v1 for modded ACE COMBAT 8 multiplayer</div>
+  </footer>
+
+  <button class="totop" type="button" aria-label="Back to top">
+    <svg viewBox="0 0 30 30" fill="none" stroke="#666" stroke-width="1"><path d="M3 4h24M15 9v18M5 19l10-10 10 10"/></svg>
+  </button>
 </body>
 </html>
