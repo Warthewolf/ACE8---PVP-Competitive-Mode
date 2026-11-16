@@ -111,6 +111,25 @@ check(r1b.matchId == "m1b" and r1b.runtime.aircraft.f22a.turnRate == 39 and r1b.
   "tampered values present at match start are kept despite a clean sample")
 setStats(30, 100)
 
+-- 1c. An AI aircraft hit by the local pilot is destroyed; the opponent's next aircraft gets the same address
+--     and crashes without being hit. That is a death without a kill, not a kill for the local pilot.
+writeState({ state = "matched", match = { id = "m1a", state = "live", role = "guest", lobbyCode = "ROOM1A" } })
+tick()
+hook("OnMatchStarted")()
+local drone = { name = "drone", addr = 0x4000 }
+hook("ReceiveDamage")(ctx(drone), 40, ctx(me))
+hook("AircraftPawn:OnDestroyed")(ctx(drone))
+local oppAddr = opp.addr
+opp.addr = drone.addr -- freed address reused
+hook("AircraftPawn:OnDestroyed")(ctx(opp))
+opp.addr = oppAddr
+clock = clock + 60
+hook("OnMatchEnded")()
+local reuse = Json.decode(read("result.json"))
+check(reuse.matchId == "m1a" and reuse.self.kills == 0 and reuse.opponent.deaths == 1,
+  "a reused address does not inherit the attacker of a destroyed AI aircraft")
+os.remove(RVNG_BRIDGE .. "result.json")
+
 -- 2. An empty match log encodes events as a JSON array.
 writeState({ state = "matched", match = { id = "m3", state = "live", role = "guest", lobbyCode = "ROOM3" } })
 tick()

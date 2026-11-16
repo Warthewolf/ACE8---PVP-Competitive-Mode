@@ -9,7 +9,8 @@
  *   rvng run        --game DIR [--region eu] [--no-cache]  bridge daemon used by the in-game mod
  *   rvng baseline   --game DIR --version V [--aircraft stats.json]             (admins) build a clean-install baseline
  *   rvng approve    --game DIR --path REL --name NAME [--version V] [--category required|cosmetic|retired]
- *                                                          (admins) pin a mod file or every file of a folder
+ *                   [--exclude SUB[,SUB...]]               (admins) pin a mod file or every file of a folder,
+ *                                                          leaving out folders that belong to another mod
  *
  * --no-cache hashes every file instead of reusing hashes from .rvng-cache.json. Use it for event matches.
  *
@@ -125,6 +126,12 @@ function cmdApprove(a) {
   const category = a.category || 'cosmetic';
   if (!['required', 'cosmetic', 'retired'].includes(category)) throw new Error('--category must be required, cosmetic or retired');
   const version = a.version === undefined ? '' : String(a.version);
+  // Folders inside this one that belong to another mod (Project RVNG inside the loader's Mods folder), given
+  // relative to --path or to the game root. Each mod's files are approved separately.
+  if (a.exclude === true) throw new Error('--exclude needs a folder, for example --exclude Mods/ProjectRVNG');
+  const excludes = [].concat(a.exclude ?? []).flatMap((x) => String(x).split(','))
+    .map((x) => x.trim().replace(/\\/g, '/').replace(/^\/+|\/+$/g, '')).filter(Boolean)
+    .map((x) => (x.toLowerCase().startsWith(sub.toLowerCase() + '/') ? x : `${sub}/${x}`).toLowerCase());
   const full = path.join(a.game, sub);
   const st = fs.lstatSync(full);
   if (st.isSymbolicLink()) throw new Error(`links cannot be approved: ${sub}`);
@@ -135,7 +142,8 @@ function cmdApprove(a) {
   if (links.length) throw new Error(`links cannot be approved: ${links.map((f) => f.path).join(', ')}`);
   // Files the players' scanner never reports (logs, crash dumps) cannot be pinned: a pinned file that is never
   // reported would reject everyone, and UE4SS rewrites its log on every launch anyway.
-  const files = all.map((f) => ({ ...f, path: f.path ? `${sub}/${f.path}` : sub }));
+  const files = all.map((f) => ({ ...f, path: f.path ? `${sub}/${f.path}` : sub }))
+    .filter((f) => !excludes.some((x) => f.path.toLowerCase() === x || f.path.toLowerCase().startsWith(x + '/')));
   const skipped = files.filter((f) => excluded(f.path, DEFAULT_EXCLUDES));
   const mods = files.filter((f) => !excluded(f.path, DEFAULT_EXCLUDES))
     .map((f) => ({ name: a.name, version, path: f.path, size: f.size, sha256: f.sha256, category }));
@@ -168,6 +176,13 @@ function createBridge({ creds, game, region, noCache = false, call = (m, p, b) =
   };
   // Ask the server where this pilot stands: after a restart, a cancel, or a refused join.
   const resync = async (message) => show(await call('GET', '/api/queue/status'), message);
+  // After a failed tick: keep what the mod shows, with the error. A transient state ('scanning', or 'waiting'
+  // with no repeat still pending) goes back to where the server has this pilot.
+  const fail = (e) => {
+    const transient = last.state === 'scanning' || (last.state === 'waiting' && !retryQueue);
+    if (transient) setState(current.state, { ...(current.match ? { match: current.match } : {}), message: last.message, error: e.message });
+    else setState(last.state, { ...last, error: e.message });
+  };
 
   // Rejections of the content itself. Everything else (network errors, 401 from a skewed clock, 408, 429,
   // 5xx) keeps the file for the next tick.
@@ -254,7 +269,7 @@ function createBridge({ creds, game, region, noCache = false, call = (m, p, b) =
     }
   }
 
-  return { dir, tick, resync, setState, current: () => current, last: () => last };
+  return { dir, tick, resync, fail, setState, current: () => current, last: () => last };
 }
 
 async function cmdRun(a) {
@@ -265,10 +280,7 @@ async function cmdRun(a) {
   for (;;) {
     try { await bridge.tick(); } catch (e) {
       console.error('bridge:', e.message);
-      try {
-        const last = bridge.last(); // keep what the mod shows, with the error, but never a transient 'scanning'
-        bridge.setState(last.state === 'scanning' ? bridge.current().state : last.state, { ...last, error: e.message });
-      } catch { /* disk error */ }
+      try { bridge.fail(e); } catch { /* disk error */ }
     }
     await sleep(1000);
   }

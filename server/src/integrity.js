@@ -154,11 +154,16 @@ function evaluate(report, baseline, approved) {
       continue;
     }
     const candidates = approvedByPath.get(path) || [];
-    const match = candidates.find((m) => m.sha256.toLowerCase() === got.sha256 && Number(m.size) === got.size);
-    if (match && match.category === 'retired') {
+    // The same file can be listed by several builds (a file two releases share). Any build that is still
+    // approved makes it approved; it is out of date only when every build that lists it is retired.
+    const matching = candidates.filter((m) => String(m.sha256).toLowerCase() === got.sha256 && Number(m.size) === got.size);
+    const current = matching.filter((m) => m.category !== 'retired');
+    const match = current.find((m) => m.category === 'required') || current[0];
+    if (!match && matching.length) {
       // A build that used to be approved: out of date, not tampered, so it never flags the account.
-      findings.push({ code: 'outdated_mod', severity: 'high', name: match.name, version: match.version || '', path });
-      mods.push({ name: match.name, path, size: got.size, approved: false, outdated: true });
+      const old = matching[0];
+      findings.push({ code: 'outdated_mod', severity: 'high', name: old.name, version: old.version || '', path });
+      mods.push({ name: old.name, path, size: got.size, approved: false, outdated: true });
       continue;
     }
     if (match) {

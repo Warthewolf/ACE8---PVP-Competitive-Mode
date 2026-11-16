@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS baselines (
   created_at   INTEGER NOT NULL
 );
 
--- Mods that are allowed in competitive play (pinned by hash + size).
+-- Mods that are allowed in competitive play (pinned by hash + size). One row per file of each build, so a
+-- file that two builds share is listed in both and each build stays complete.
 CREATE TABLE IF NOT EXISTS approved_mods (
   id       INTEGER PRIMARY KEY,
   name     TEXT NOT NULL,
@@ -48,7 +49,7 @@ CREATE TABLE IF NOT EXISTS approved_mods (
   sha256   TEXT NOT NULL,
   category TEXT NOT NULL DEFAULT 'cosmetic', -- required | cosmetic | retired (an old build: rejected, never flagged)
   version  TEXT NOT NULL DEFAULT '',         -- build of the mod; any one complete build of a required mod passes
-  UNIQUE (path, sha256)
+  UNIQUE (name, version, path)
 );
 
 CREATE TABLE IF NOT EXISTS integrity_reports (
@@ -95,6 +96,7 @@ CREATE TABLE IF NOT EXISTS matches (
   deaths_b      INTEGER,
   created_at    INTEGER NOT NULL,
   live_at       INTEGER,                  -- when the host posted the room code
+  swept_at      INTEGER,                  -- when the background sweep closed it (late logs may still settle it)
   verified_at   INTEGER
 );
 
@@ -156,42 +158,66 @@ const ADDED_COLUMNS = [
   ['matches', 'kills_a', 'INTEGER'], ['matches', 'deaths_a', 'INTEGER'],
   ['matches', 'kills_b', 'INTEGER'], ['matches', 'deaths_b', 'INTEGER'],
   ['matches', 'live_at', 'INTEGER'],
+  ['matches', 'swept_at', 'INTEGER'],
   ['approved_mods', 'version', "TEXT NOT NULL DEFAULT ''"],
 ];
 
 const parse = (s) => { try { return JSON.parse(s); } catch { return null; } };
 
 function migrate(db) {
-  const added = new Set();
   for (const [table, col, def] of ADDED_COLUMNS) {
     const cols = db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
-    if (!cols.includes(col)) { db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${def}`); added.add(`${table}.${col}`); }
+    if (!cols.includes(col)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${def}`);
   }
+  rekeyApprovedMods(db);
+  // The backfills below only touch rows that still lack the value, so they also repair databases that an
+  // earlier release had already upgraded without them.
   // Queue entries keep their build: it is the build of the scan they joined with.
-  if (added.has('queue.game_version')) {
-    db.exec(`UPDATE queue SET game_version = COALESCE((SELECT game_version FROM integrity_reports r WHERE r.id = queue.integrity_id), '')`);
-  }
+  db.exec(`UPDATE queue SET game_version = COALESCE((SELECT game_version FROM integrity_reports r WHERE r.id = queue.integrity_id), '')
+    WHERE game_version = ''`);
   // Matches still being played: the build both pilots last scanned clean on before the match was created.
-  if (added.has('matches.game_version')) {
-    const lastClean = db.prepare(`SELECT game_version FROM integrity_reports WHERE player_id = ? AND verdict = 'clean'
-      AND created_at <= ? ORDER BY id DESC LIMIT 1`);
-    const set = db.prepare('UPDATE matches SET game_version = ? WHERE id = ?');
-    for (const m of db.prepare("SELECT * FROM matches WHERE state IN ('pending', 'live', 'awaiting_reports')").all()) {
-      const a = lastClean.get(m.player_a, m.created_at); const b = lastClean.get(m.player_b, m.created_at);
-      if (a && b && a.game_version === b.game_version) set.run(a.game_version, m.id);
-    }
+  const lastClean = db.prepare(`SELECT game_version FROM integrity_reports WHERE player_id = ? AND verdict = 'clean'
+    AND created_at <= ? ORDER BY id DESC LIMIT 1`);
+  const setVersion = db.prepare('UPDATE matches SET game_version = ? WHERE id = ?');
+  for (const m of db.prepare("SELECT * FROM matches WHERE state IN ('pending', 'live', 'awaiting_reports') AND game_version = ''").all()) {
+    const a = lastClean.get(m.player_a, m.created_at); const b = lastClean.get(m.player_b, m.created_at);
+    if (a && b && a.game_version === b.game_version) setVersion.run(a.game_version, m.id);
   }
-  // Verified matches: the kills/deaths that were credited, so voiding one later undoes exactly those.
-  if (added.has('matches.kills_a')) {
-    const rep = db.prepare('SELECT report FROM match_reports WHERE match_id = ? AND player_id = ?');
-    const set = db.prepare('UPDATE matches SET kills_a = ?, deaths_a = ?, kills_b = ?, deaths_b = ? WHERE id = ?');
-    const int = (n) => (Number.isSafeInteger(n) && n >= 0 ? n : 0);
-    for (const m of db.prepare("SELECT * FROM matches WHERE state = 'verified'").all()) {
-      const ra = parse(rep.get(m.id, m.player_a)?.report); const rb = parse(rep.get(m.id, m.player_b)?.report);
-      if (ra?.self && rb?.self) set.run(int(ra.self.kills), int(ra.self.deaths), int(rb.self.kills), int(rb.self.deaths), m.id);
-      else set.run(int(m.score_a), int(m.score_b), int(m.score_b), int(m.score_a), m.id); // settled by an admin
-    }
+  // Verified matches: the kills/deaths that were credited, so voiding one later undoes exactly those. Releases
+  // before these columns credited the logs only when the match verified by itself (no flags, both logs);
+  // a match an admin settled was credited from the admin's scores, even when both logs were stored.
+  const rep = db.prepare('SELECT report FROM match_reports WHERE match_id = ? AND player_id = ?');
+  const setKd = db.prepare('UPDATE matches SET kills_a = ?, deaths_a = ?, kills_b = ?, deaths_b = ? WHERE id = ?');
+  const int = (n) => (Number.isSafeInteger(n) && n >= 0 ? n : 0);
+  for (const m of db.prepare("SELECT * FROM matches WHERE state = 'verified' AND kills_a IS NULL").all()) {
+    const flags = parse(m.flags);
+    const ra = parse(rep.get(m.id, m.player_a)?.report); const rb = parse(rep.get(m.id, m.player_b)?.report);
+    if (Array.isArray(flags) && !flags.length && ra?.self && rb?.self) setKd.run(int(ra.self.kills), int(ra.self.deaths), int(rb.self.kills), int(rb.self.deaths), m.id);
+    else setKd.run(int(m.score_a), int(m.score_b), int(m.score_b), int(m.score_a), m.id);
   }
+}
+
+// Releases before per-build rows keyed approved files by (path, sha256), so a file shared by two builds was
+// moved to whichever build was uploaded last. Rebuild the table with one row per (name, version, path).
+// Rows that collide under the new key (same file path pinned twice for one build) keep their own pseudo-build
+// "<version>#<id>". Builds that already lost shared files must be uploaded again.
+function rekeyApprovedMods(db) {
+  const keys = db.prepare("PRAGMA index_list('approved_mods')").all().filter((i) => i.unique)
+    .map((i) => db.prepare(`PRAGMA index_info('${i.name.replace(/'/g, "''")}')`).all().map((c) => c.name).join(','));
+  if (keys.includes('name,version,path')) return;
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const rows = db.prepare('SELECT * FROM approved_mods ORDER BY id').all();
+    db.exec('DROP TABLE approved_mods');
+    db.exec(SCHEMA.slice(SCHEMA.indexOf('CREATE TABLE IF NOT EXISTS approved_mods'), SCHEMA.indexOf('CREATE TABLE IF NOT EXISTS integrity_reports')));
+    const ins = db.prepare('INSERT OR IGNORE INTO approved_mods (id, name, path, size, sha256, category, version) VALUES (?, ?, ?, ?, ?, ?, ?)');
+    for (const r of rows) {
+      if (!ins.run(r.id, r.name, r.path, r.size, r.sha256, r.category, r.version).changes) {
+        ins.run(r.id, r.name, r.path, r.size, r.sha256, r.category, `${r.version}#${r.id}`);
+      }
+    }
+    db.exec('COMMIT');
+  } catch (e) { db.exec('ROLLBACK'); throw e; }
 }
 
 function openDb(path) {

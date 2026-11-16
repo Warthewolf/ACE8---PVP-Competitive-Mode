@@ -51,9 +51,10 @@ test('a ranked room that started late is voided by the sweep, but the late logs 
     const m = await queuePair(env, a, b);
     svc.sweepStaleMatches(env.db, Date.now() + 26 * MIN);
     assert.equal((await matchOf(env, m.id)).state, 'void');
-    assert.equal((await report(m.host, m.id, log())).state, 'void', 'one late log keeps the room closed');
+    const one = await report(m.host, m.id, log());
+    assert.deepEqual([one.state, one.flags.map((f) => f.code)], ['disputed', ['missing_opponent_report']], 'one late log goes to an admin');
     const r = await report(m.guest, m.id, mirror());
-    assert.equal(r.state, 'verified');
+    assert.deepEqual([r.state, r.flags], ['verified', []], 'the sweep flag goes once the logs settle it');
     assert.equal((await me(m.host)).wins, 1);
   } finally { await env.close(); }
 });

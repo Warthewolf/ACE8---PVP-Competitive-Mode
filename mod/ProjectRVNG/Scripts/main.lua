@@ -219,11 +219,13 @@ end)
 pcall(RegisterHook, HOOKS.AircraftDestroyed, function(ctx)
   if not state.log then return end
   local pawn = ctx:get()
-  local victim = sideOf(pawn)
-  if not victim then return end -- AI or other non-pilot aircraft
+  -- Forget who last hit it, for every destroyed aircraft (AI too): the engine reuses a freed object's address,
+  -- and a pilot's next aircraft at that address must not inherit the old attacker.
   local k = keyOf(pawn)
   local inst = k ~= nil and state.log.lastHitBy[k] or nil
   if k ~= nil then state.log.lastHitBy[k] = nil end
+  local victim = sideOf(pawn)
+  if not victim then return end -- AI or other non-pilot aircraft
   local killer = (victim == "self" and inst == "opponent" and "opponent")
               or (victim == "opponent" and inst == "self" and "self") or nil
   state.log[victim].deaths = state.log[victim].deaths + 1

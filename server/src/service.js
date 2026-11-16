@@ -81,19 +81,26 @@ function capList(list, n, budget) {
   return out;
 }
 
-// Most severe first, so the findings that explain a verdict are never the ones cut. Past `n` entries or
+// Tampered aircraft data or injected code in a player's own report puts the account under review.
+const SELF_INCRIMINATING = ['aircraft_stat_modified', 'proxy_dll_injection', 'approved_mod_tampered'];
+
+// The findings that explain a verdict are never the ones cut: first one finding of every code, those that flag
+// the account first and then by severity, then the remaining findings in the same order. Past `n` entries or
 // `budget` bytes, a per-code count of everything stands in for the rest.
 function capFindings(findings, n, budget = Infinity) {
-  const sorted = [...findings].sort((a, b) => (integrity.SEVERITY[b.severity] ?? 0) - (integrity.SEVERITY[a.severity] ?? 0));
-  const kept = capList(sorted, n, budget);
+  const rank = (f) => (SELF_INCRIMINATING.includes(f.code) ? 10 : 0) + (integrity.SEVERITY[f.severity] ?? 0);
+  const sorted = [...findings].sort((a, b) => rank(b) - rank(a));
+  const seen = new Set(); const firsts = []; const rest = [];
+  for (const f of sorted) {
+    if (seen.has(f.code)) rest.push(f);
+    else { seen.add(f.code); firsts.push(f); }
+  }
+  const kept = capList([...firsts, ...rest], n, budget);
   if (kept.length === sorted.length) return kept;
   const counts = {};
   for (const f of findings) counts[f.code] = (counts[f.code] || 0) + 1;
   return [...kept, { code: 'findings_truncated', severity: 'info', total: findings.length, counts }];
 }
-
-// Tampered aircraft data or injected code in a player's own report puts the account under review.
-const SELF_INCRIMINATING = ['aircraft_stat_modified', 'proxy_dll_injection', 'approved_mod_tampered'];
 
 function submitIntegrity(db, player, report) {
   const c = config.integrity;
@@ -303,12 +310,14 @@ function setLobby(db, player, matchId, lobbyCode) {
 }
 
 // ---------- match reports ----------
-// Closed by the background sweep rather than by an admin: reports that arrive late still settle the match.
+// Closed by the background sweep (swept_at) and not since ruled on: an admin can still settle or void it, and
+// logs that arrive within config.match.lateReportMs of the sweep still settle it. Only the sweep sets
+// swept_at, so rooms closed by older releases or by an admin never reopen. The sweep never voids event games.
 const SWEEP_CODES = ['no_reports', 'missing_opponent_report'];
 function closedBySweep(m) {
-  if (!['void', 'disputed'].includes(m.state)) return false;
+  if (m.swept_at == null || !['void', 'disputed'].includes(m.state) || (m.state === 'void' && m.series_id)) return false;
   const f = json(m.flags, []);
-  return Array.isArray(f) && f.length === 1 && SWEEP_CODES.includes(f[0]?.code);
+  return Array.isArray(f) && f.length > 0 && f.every((x) => SWEEP_CODES.includes(x?.code));
 }
 
 function submitReport(db, player, matchId, report) {
@@ -323,6 +332,7 @@ function submitReport(db, player, matchId, report) {
     }
     const late = closedBySweep(m);
     if (!['live', 'awaiting_reports'].includes(m.state) && !late) throw new HttpError(409, `match is ${m.state}`);
+    if (late && now() - m.swept_at > config.match.lateReportMs) throw new HttpError(409, `match is ${m.state}: logs were due long ago`);
     const errs = matchlog.validateShape(report);
     if (errs.length) throw new HttpError(400, 'invalid report: ' + errs.join(', '));
 
@@ -330,8 +340,10 @@ function submitReport(db, player, matchId, report) {
       .run(matchId, player.id, JSON.stringify(report), now());
     const reports = db.prepare('SELECT * FROM match_reports WHERE match_id = ?').all(matchId);
     if (reports.length < 2) {
-      // A room the sweep closed stays closed (nobody is held out of the queue) until the other log arrives.
-      if (!late) db.prepare("UPDATE matches SET state = 'awaiting_reports' WHERE id = ?").run(matchId);
+      // A room the sweep closed does not reopen (nobody is held out of the queue). With one log in it goes to
+      // an admin, who can award it, and the other log still settles it if it arrives in time.
+      if (late) db.prepare("UPDATE matches SET state = 'disputed', flags = ? WHERE id = ?").run(JSON.stringify([{ code: 'missing_opponent_report' }]), matchId);
+      else db.prepare("UPDATE matches SET state = 'awaiting_reports' WHERE id = ?").run(matchId);
       return getMatch(db, matchId, player.id);
     }
     resolveMatch(db, m, reports);
@@ -367,6 +379,8 @@ function resolveMatch(db, m, reports) {
     }
     return;
   }
+  // A late settle of a room the sweep closed drops the sweep's flag.
+  db.prepare("UPDATE matches SET flags = '[]' WHERE id = ?").run(m.id);
   applyResult(db, m, res.outcome, res.scoreA, res.scoreB, repA, repB);
 }
 
@@ -391,32 +405,36 @@ function applyResult(db, m, outcome, scoreA, scoreB, repA, repB) {
 // Undo a verified result: rating deltas, record, credited K/D and the series game. peak_rating is not
 // recomputed (see docs/SECURITY.md).
 function revertResult(db, m) {
-  if (m.series_id && m.winner) tournaments.revertSeriesResult(db, m.series_id, m.winner);
+  const series = m.series_id && m.winner ? tournaments.revertSeriesResult(db, m.series_id, m.winner) : undefined;
   const s = m.winner == null ? 0.5 : m.winner === m.player_a ? 1 : 0;
   const upd = db.prepare(`UPDATE players SET rating = rating - ?, wins = MAX(0, wins - ?), losses = MAX(0, losses - ?),
     draws = MAX(0, draws - ?), kills = MAX(0, kills - ?), deaths = MAX(0, deaths - ?) WHERE id = ?`);
   upd.run(m.rating_delta_a || 0, s === 1 ? 1 : 0, s === 0 ? 1 : 0, s === 0.5 ? 1 : 0, m.kills_a ?? m.score_a ?? 0, m.deaths_a ?? m.score_b ?? 0, m.player_a);
   upd.run(m.rating_delta_b || 0, s === 0 ? 1 : 0, s === 1 ? 1 : 0, s === 0.5 ? 1 : 0, m.kills_b ?? m.score_b ?? 0, m.deaths_b ?? m.score_a ?? 0, m.player_b);
+  return series;
 }
 
-// Admin: settle a disputed or stuck match, or void any match (a verified one is reverted first).
+// Admin: settle a disputed or stuck match, or void any match (a verified one is reverted first). A room the
+// sweep voided can be settled or voided for good too.
 function resolveDispute(db, matchId, { winner, scoreHost = 0, scoreGuest = 0, void: isVoid } = {}) {
   return tx(db, () => {
     const m = db.prepare('SELECT * FROM matches WHERE id = ?').get(String(matchId));
     if (!m) throw new HttpError(404, 'match not found');
+    const open = ['disputed', 'awaiting_reports', 'live', 'pending'].includes(m.state) || closedBySweep(m);
     if (isVoid === true) {
-      if (!['disputed', 'awaiting_reports', 'live', 'pending', 'verified'].includes(m.state)) throw new HttpError(409, `match is ${m.state}`);
-      if (m.state === 'verified') revertResult(db, m);
+      if (!open && m.state !== 'verified') throw new HttpError(409, `match is ${m.state}`);
+      const series = m.state === 'verified' ? revertResult(db, m) : undefined;
       // The match no longer shows a winner, score or rating change; the flag keeps what was undone. The flag
       // also marks the void as an admin decision, so late reports cannot reopen it.
       const old = json(m.flags, []);
       const flags = [...(Array.isArray(old) ? old : []), { code: 'admin_void',
-        ...(m.state === 'verified' ? { reverted: { winner: m.winner, score: [m.score_a, m.score_b], ratingDelta: [m.rating_delta_a, m.rating_delta_b] } } : {}) }];
+        ...(m.state === 'verified' ? { reverted: { winner: m.winner, score: [m.score_a, m.score_b], ratingDelta: [m.rating_delta_a, m.rating_delta_b] } } : {}),
+        ...(series ? { series } : {}) }];
       db.prepare(`UPDATE matches SET state = 'void', winner = NULL, score_a = NULL, score_b = NULL, rating_delta_a = NULL,
         rating_delta_b = NULL, kills_a = NULL, deaths_a = NULL, kills_b = NULL, deaths_b = NULL, flags = ? WHERE id = ?`)
         .run(JSON.stringify(flags), m.id);
     } else {
-      if (!['disputed', 'awaiting_reports', 'live', 'pending'].includes(m.state)) throw new HttpError(409, `match is ${m.state}`);
+      if (!open) throw new HttpError(409, `match is ${m.state}`);
       const outcome = winner === 'host' ? 'a' : winner === 'guest' ? 'b' : winner === 'draw' ? 'draw' : null;
       if (!outcome) throw new HttpError(400, 'winner must be host, guest or draw');
       const sh = Number(scoreHost); const sg = Number(scoreGuest);
@@ -433,23 +451,24 @@ function sweepStaleMatches(db, t = now()) {
   // Only one side reported inside the window: admin review.
   const stale = db.prepare(`SELECT m.id FROM matches m WHERE m.state = 'awaiting_reports'
     AND (SELECT MIN(received_at) FROM match_reports r WHERE r.match_id = m.id) < ?`).all(t - c.reportWindowMs);
-  const upd = db.prepare("UPDATE matches SET state = 'disputed', flags = ? WHERE id = ?");
-  for (const { id } of stale) upd.run(JSON.stringify([{ code: 'missing_opponent_report' }]), id);
+  const upd = db.prepare("UPDATE matches SET state = 'disputed', flags = ?, swept_at = ? WHERE id = ?");
+  for (const { id } of stale) upd.run(JSON.stringify([{ code: 'missing_opponent_report' }]), t, id);
   // Rooms never created within the window are voided.
   db.prepare("UPDATE matches SET state = 'void' WHERE state = 'pending' AND created_at < ?").run(t - c.reportWindowMs);
   // Rooms that went live but got no report from anyone are closed once the match must be over, so a guest who
   // never joined (or a fake room code) cannot lock both pilots out of the queue. A ranked room is voided. An
   // event game goes to an admin instead: voiding it would hand the series a rematch, and a pilot who is losing
-  // could stall the room to get one. Either way, logs that arrive later still settle the match.
+  // could stall the room to get one. Either way, logs that arrive later (config.match.lateReportMs) still settle
+  // the match, and an admin can rule on it.
   const live = db.prepare(`SELECT id, rules, created_at, live_at, series_id FROM matches m WHERE state = 'live'
     AND NOT EXISTS (SELECT 1 FROM match_reports r WHERE r.match_id = m.id)`).all();
-  const close = db.prepare("UPDATE matches SET state = ?, flags = ? WHERE id = ? AND state = 'live'");
+  const close = db.prepare("UPDATE matches SET state = ?, flags = ?, swept_at = ? WHERE id = ? AND state = 'live'");
   let closed = 0;
   for (const m of live) {
     const tl = Number(json(m.rules, {}).timeLimitSec);
     const limit = tl > 0 ? tl : c.untimedMatchSec; // timeLimitSec 0 means no time limit
     if ((m.live_at ?? m.created_at) + limit * 1000 + c.liveGraceMs < t) {
-      close.run(m.series_id ? 'disputed' : 'void', JSON.stringify([{ code: 'no_reports' }]), m.id); closed++;
+      close.run(m.series_id ? 'disputed' : 'void', JSON.stringify([{ code: 'no_reports' }]), t, m.id); closed++;
     }
   }
   return stale.length + closed;
@@ -502,7 +521,13 @@ function addOneMod(db, m) {
   }
   if (!MOD_CATEGORIES.includes(category)) throw new HttpError(400, 'category must be required, cosmetic or retired');
   if (typeof version !== 'string' || version.length > 64) throw new HttpError(400, 'version must be a string of up to 64 characters');
-  db.prepare('INSERT OR REPLACE INTO approved_mods (name, path, size, sha256, category, version) VALUES (?, ?, ?, ?, ?, ?)')
+  // A file belongs to one mod. A loader folder approved with another mod inside it would make the loader's
+  // build require that mod's files too, and one of the two could then never be updated.
+  const other = db.prepare("SELECT name FROM approved_mods WHERE path = ? AND name != ? AND category != 'retired' LIMIT 1").get(path, name);
+  if (other) throw new HttpError(409, `${path} is already pinned by the mod "${other.name}": approve each mod's files separately (rvng approve --exclude)`);
+  // Each build keeps its own row for every file, also for files it shares with another build.
+  db.prepare(`INSERT INTO approved_mods (name, path, size, sha256, category, version) VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT (name, version, path) DO UPDATE SET size = excluded.size, sha256 = excluded.sha256, category = excluded.category`)
     .run(name, path, size, hash.toLowerCase(), category, version);
 }
 
@@ -517,7 +542,8 @@ function addApprovedMods(db, body = {}) {
 const listApprovedMods = (db) => db.prepare('SELECT * FROM approved_mods ORDER BY name, version, path').all();
 
 // Withdrawing a mod retires it: the old build stays known, so pilots who still have it are told it is out of
-// date instead of being flagged for a tampered mod. `purge` deletes the row (for one added by mistake).
+// date instead of being flagged for a tampered mod. `purge` deletes the row (for one added by mistake). Only
+// that row changes: a build that shares the file keeps its own row.
 function removeApprovedMod(db, id, { purge = false } = {}) {
   const r = purge
     ? db.prepare('DELETE FROM approved_mods WHERE id = ?').run(id)
@@ -526,7 +552,8 @@ function removeApprovedMod(db, id, { purge = false } = {}) {
   return listApprovedMods(db);
 }
 
-// Retire every file of one build of a mod (for example the previous release of Project RVNG or UE4SS).
+// Retire every file of one build of a mod (for example the previous release of Project RVNG or UE4SS). Files
+// the build shares with another build stay approved through that build's rows.
 function retireMods(db, { name, version = '' } = {}) {
   if (typeof name !== 'string' || !name || typeof version !== 'string') throw new HttpError(400, 'name (and optional version) required');
   const r = db.prepare("UPDATE approved_mods SET category = 'retired' WHERE name = ? AND version = ?").run(name, version);

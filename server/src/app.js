@@ -1,4 +1,5 @@
 'use strict';
+const net = require('node:net');
 const path = require('node:path');
 const express = require('express');
 const config = require('./config');
@@ -8,16 +9,35 @@ const svc = require('./service');
 const tournaments = require('./tournaments');
 
 // The address a limit applies to: IPv4 (also when IPv4-mapped), or the /64 network of an IPv6 address,
-// since one IPv6 client normally holds a whole /64 and can pick any address in it.
+// since one IPv6 client normally holds a whole /64 and can pick any address in it. Anything that is not an IP
+// address gives null.
 function clientKey(ip) {
-  const s = String(ip || '').split('%')[0];
-  const v4 = s.match(/^(?:::ffff:)?(\d{1,3}(?:\.\d{1,3}){3})$/i);
-  if (v4) return v4[1];
-  if (!s.includes(':')) return s;
+  const s = String(ip ?? '').split('%')[0];
+  const family = net.isIP(s);
+  if (family === 4) return s;
+  if (family !== 6) return null;
+  // Expand to 8 groups: '::' can stand for zeros inside the prefix, and a dotted IPv4 tail is two groups.
+  const groups = (part) => (part ? part.split(':') : []).flatMap((g) => (g.includes('.')
+    ? ((o) => [((o[0] << 8) | o[1]).toString(16), ((o[2] << 8) | o[3]).toString(16)])(g.split('.').map(Number))
+    : [g]));
   const [head, tail] = s.split('::');
-  const h = head ? head.split(':') : [];
-  const groups = tail === undefined ? h : [...h, ...Array(Math.max(0, 8 - h.length - (tail ? tail.split(':').length : 0))).fill('0')];
-  return groups.concat(['0', '0', '0', '0']).slice(0, 4).map((g) => (parseInt(g, 16) || 0).toString(16)).join(':') + '::/64';
+  const h = groups(head); const t = tail === undefined ? [] : groups(tail);
+  const all = (tail === undefined ? h : [...h, ...Array(8 - h.length - t.length).fill('0'), ...t]).map((g) => parseInt(g, 16));
+  if (all.slice(0, 5).every((g) => g === 0) && all[5] === 0xffff) return [all[6] >> 8, all[6] & 255, all[7] >> 8, all[7] & 255].join('.');
+  return all.slice(0, 4).map((g) => g.toString(16)).join(':') + '::/64';
+}
+
+// Depth of nested arrays/objects, without recursion (JSON.parse accepts any depth; JSON.stringify and other
+// recursive code would overflow the stack).
+function tooDeep(value, max) {
+  const stack = [[value, 1]];
+  while (stack.length) {
+    const [v, d] = stack.pop();
+    if (v === null || typeof v !== 'object') continue;
+    if (d > max) return true;
+    for (const x of Object.values(v)) if (x !== null && typeof x === 'object') stack.push([x, d + 1]);
+  }
+  return false;
 }
 
 // Fixed-window counter per key, kept in memory. Windows start in insertion order, so expired entries are
@@ -48,6 +68,8 @@ function createApp({ db = openDb(config.dbPath) } = {}) {
   app.use(['/api/integrity/report', '/api/matches/:id/report', '/api/admin/baselines', '/api/admin/mods'],
     express.json({ limit: '4mb', verify }));
   app.use(express.json({ limit: '64kb', verify }));
+  // No body of this API nests deeper than a few levels.
+  app.use((req, _res, next) => next(tooDeep(req.body, 32) ? new tournaments.HttpError(400, 'JSON nested too deeply') : undefined));
   app.use((req, res, next) => {
     res.set('X-Content-Type-Options', 'nosniff');
     res.set('Referrer-Policy', 'no-referrer');
@@ -61,11 +83,13 @@ function createApp({ db = openDb(config.dbPath) } = {}) {
   const wrap = (fn) => (req, res, next) => {
     try { const out = fn(req, res); if (out !== undefined) res.json(out); } catch (e) { next(e); }
   };
-  // Query values are strings, or arrays/objects when repeated or bracketed: accept plain strings only.
+  // Query values are strings, or arrays/objects when repeated or bracketed (such an object can carry its own
+  // toString): only plain strings are read, anything else counts as absent.
   const str = (v) => (typeof v === 'string' ? v : undefined);
   const int = (v, d, min = 0, max = Number.MAX_SAFE_INTEGER) => {
-    const n = Number(str(v) ?? v);
-    return typeof v !== 'object' && Number.isSafeInteger(n) ? Math.min(Math.max(n, min), max) : d;
+    if (typeof v !== 'string' && typeof v !== 'number') return d;
+    const n = Number(v);
+    return Number.isSafeInteger(n) ? Math.min(Math.max(n, min), max) : d;
   };
   const id = (v) => int(v, -1);
   const allowSignup = rateLimiter(config.registration);
@@ -86,7 +110,7 @@ function createApp({ db = openDb(config.dbPath) } = {}) {
 
   // Registration returns credentials exactly once; the player saves them as credentials.json.
   app.post('/api/players/register', wrap((req, res) => {
-    if (!allowSignup(clientKey(req.ip))) throw new tournaments.HttpError(429, 'too many sign-ups from this address; try again later');
+    if (!allowSignup(clientKey(req.ip) ?? clientKey(req.socket.remoteAddress) ?? 'unknown')) throw new tournaments.HttpError(429, 'too many sign-ups from this address; try again later');
     res.status(201);
     return svc.registerPlayer(db, req.body || {});
   }));
@@ -133,4 +157,4 @@ function createApp({ db = openDb(config.dbPath) } = {}) {
   return app;
 }
 
-module.exports = { createApp, rateLimiter, clientKey };
+module.exports = { createApp, rateLimiter, clientKey, tooDeep };

@@ -114,26 +114,35 @@ function recordSeriesResult(db, seriesId, winnerId) {
 
 // Undo one counted game of a series (an admin voided the match). If it was one of the wins that decided the
 // series, the series reopens: the winner leaves the next round again, or for the final the title is cleared.
-// That is refused once the next round has been played or decided (void those games first).
+// That is refused once games of the next round have been played (void those first). If the next round was
+// decided by walkover without games, the series result stands (a walkover cannot be undone) and only the game
+// is taken off the count. Returns 'reopened', 'kept' or undefined.
 function revertSeriesResult(db, seriesId, winnerId) {
   const s = db.prepare('SELECT * FROM series WHERE id = ?').get(seriesId);
-  if (!s || !winnerId) return;
+  if (!s || !winnerId) return undefined;
   const col = winnerId === s.player_a ? 'wins_a' : winnerId === s.player_b ? 'wins_b' : null;
-  if (!col) return;
+  if (!col) return undefined;
+  let outcome;
   // A series decided by walkover never reaches the win count, so it is not reopened by voiding a game.
   if (s.winner === winnerId && s[col] === Math.ceil(s.best_of / 2)) {
     const t = db.prepare('SELECT * FROM tournaments WHERE id = ?').get(s.tournament_id);
     if (s.round === rounds(t.size)) {
       db.prepare("UPDATE tournaments SET state = 'running', champion = NULL WHERE id = ?").run(t.id);
+      outcome = 'reopened';
     } else {
       const next = db.prepare('SELECT * FROM series WHERE tournament_id = ? AND round = ? AND slot = ?').get(t.id, s.round + 1, Math.floor(s.slot / 2));
       const played = db.prepare("SELECT COUNT(*) c FROM matches WHERE series_id = ? AND state != 'void'").get(next.id).c;
-      if (next.winner || played) throw new HttpError(409, 'the next round of this series has already been played or decided; void its games first');
-      db.prepare(`UPDATE series SET ${s.slot % 2 === 0 ? 'player_a' : 'player_b'} = NULL WHERE id = ?`).run(next.id);
+      if (played) throw new HttpError(409, 'the next round of this series has already been played; void its games first');
+      if (next.winner) outcome = 'kept';
+      else {
+        db.prepare(`UPDATE series SET ${s.slot % 2 === 0 ? 'player_a' : 'player_b'} = NULL WHERE id = ?`).run(next.id);
+        outcome = 'reopened';
+      }
     }
-    db.prepare('UPDATE series SET winner = NULL WHERE id = ?').run(s.id);
+    if (outcome === 'reopened') db.prepare('UPDATE series SET winner = NULL WHERE id = ?').run(s.id);
   }
   db.prepare(`UPDATE series SET ${col} = MAX(0, ${col} - 1) WHERE id = ?`).run(s.id);
+  return outcome;
 }
 
 // Admin walkover: the named player wins the series (no-show, ban, or flagged opponent).

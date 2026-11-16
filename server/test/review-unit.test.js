@@ -16,10 +16,11 @@ const RULES = { timeLimitSec: 600, killTarget: 5, respawn: true, specialWeapons:
 const ctx = { rules: RULES, aircraftStats: AIRCRAFT, playerA: 1, playerB: 2, minDurationSec: 30 };
 const codes = (r) => r.flags.map((f) => f.code);
 
-test('TRUST_PROXY accepts the usual Express values', () => {
-  assert.deepEqual(['', 'false', 'true', '1', '2', 'loopback, 10.0.0.0/8'].map(parseTrustProxy),
-    [false, false, true, 1, 2, ['loopback', '10.0.0.0/8']]);
+test('TRUST_PROXY takes a hop count or proxy addresses, ignores case and stray whitespace, and refuses true', () => {
+  assert.deepEqual(['', 'false', ' FALSE\r', '1', ' 1 ', '1\r', '2', 'loopback, 10.0.0.0/8'].map(parseTrustProxy),
+    [false, false, false, 1, 1, 1, 2, ['loopback', '10.0.0.0/8']]);
   assert.equal(parseTrustProxy(undefined), false);
+  for (const v of ['true', 'True', ' TRUE\r']) assert.throws(() => parseTrustProxy(v), /X-Forwarded-For/);
 });
 
 test('sign-up limiter: IPv4-mapped and IPv6 /64 keys, bounded memory, no full scan per request', () => {
@@ -69,7 +70,9 @@ test('upgrading a database keeps matches in play verifiable and voids exact', ()
     rep.run('m_old', 1, JSON.stringify({ self: { kills: 5, deaths: 3 } })); rep.run('m_old', 2, JSON.stringify({ self: { kills: 2, deaths: 5 } }));
     // Back to the first release's schema.
     for (const [t, c] of [['matches', 'game_version'], ['matches', 'kills_a'], ['matches', 'deaths_a'], ['matches', 'kills_b'],
-      ['matches', 'deaths_b'], ['matches', 'live_at'], ['queue', 'game_version'], ['approved_mods', 'version']]) db.exec(`ALTER TABLE ${t} DROP COLUMN ${c}`);
+      ['matches', 'deaths_b'], ['matches', 'live_at'], ['matches', 'swept_at'], ['queue', 'game_version']]) db.exec(`ALTER TABLE ${t} DROP COLUMN ${c}`);
+    db.exec(`DROP TABLE approved_mods; CREATE TABLE approved_mods (id INTEGER PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL,
+      size INTEGER NOT NULL, sha256 TEXT NOT NULL, category TEXT NOT NULL DEFAULT 'cosmetic', UNIQUE (path, sha256))`);
     db.close();
 
     db = openDb(file);
