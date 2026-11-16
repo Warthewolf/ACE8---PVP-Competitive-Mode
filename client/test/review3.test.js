@@ -64,3 +64,42 @@ test('rvng approve --exclude leaves another mod\'s folder out of a loader approv
     assert.throws(() => cmdApprove({ game, path: ue, name: 'UE4SS', exclude: 'Mods/ProjectRVGN', out }), /--exclude matched no files: .*projectrvgn/);
   } finally { console.log = log; fs.rmSync(game, { recursive: true }); }
 });
+
+// Fifth review.
+test('bridge: if the server was unreachable at start, later ticks keep asking until an open match is shown', async () => {
+  const game = tree({ 'ACE8/Content/Paks/a.pak': 'x' });
+  try {
+    let down = true;
+    const match = { id: 'm_9', state: 'pending', role: 'host' };
+    const call = async (m, p) => {
+      if (down) throw httpError(503, 'server unavailable');
+      if (p === '/api/queue/status') return { state: 'matched', match };
+      return {};
+    };
+    const bridge = createBridge({ game, call });
+    const state = () => JSON.parse(fs.readFileSync(path.join(bridge.dir, 'state.json'), 'utf8'));
+    await bridge.resync('Companion connected').catch(() => bridge.setState('idle', { message: 'Companion connected (server unreachable)' }));
+    await assert.rejects(bridge.tick(), /unavailable/);
+    down = false;
+    await bridge.tick();
+    assert.deepEqual([state().state, state().match.id], ['matched', 'm_9']);
+  } finally { fs.rmSync(game, { recursive: true }); }
+});
+
+test('rvng approve: one build from several paths, with its roots; a second approval never silently overwrites the first', () => {
+  const ue = 'ACE8/Binaries/Win64/ue4ss';
+  const game = tree({ [`${ue}/UE4SS.dll`]: 'dll', [`${ue}/Mods/mods.txt`]: 'ProjectRVNG : 1', [`${ue}/Mods/ProjectRVNG/Scripts/main.lua`]: 'lua',
+    'ACE8/Binaries/Win64/dwmapi.dll': 'proxy' });
+  const cwd = process.cwd(); const log = console.log; console.log = () => {};
+  try {
+    process.chdir(game);
+    const r = cmdApprove({ game, path: `${ue},ACE8/Binaries/Win64/dwmapi.dll`, exclude: 'Mods/ProjectRVNG', name: 'UE4SS', version: '3.0.2', category: 'required' });
+    assert.deepEqual(r.roots, [ue, 'ACE8/Binaries/Win64/dwmapi.dll']);
+    assert.deepEqual(r.mods.map((m) => m.path).sort(), ['ACE8/Binaries/Win64/dwmapi.dll', `${ue}/Mods/mods.txt`, `${ue}/UE4SS.dll`]);
+    assert.deepEqual(JSON.parse(fs.readFileSync(r.out, 'utf8')).roots, r.roots);
+    // The same approval again is fine; another part of the same build into the same default file is not.
+    cmdApprove({ game, path: `${ue},ACE8/Binaries/Win64/dwmapi.dll`, exclude: 'Mods/ProjectRVNG', name: 'UE4SS', version: '3.0.2', category: 'required' });
+    assert.throws(() => cmdApprove({ game, path: 'ACE8/Binaries/Win64/dwmapi.dll', name: 'UE4SS', version: '3.0.2', category: 'required' }),
+      /already holds an approval of .*ue4ss/);
+  } finally { process.chdir(cwd); console.log = log; fs.rmSync(game, { recursive: true }); }
+});

@@ -533,8 +533,8 @@ function addOneMod(db, m) {
   // build require that mod's files too, and one of the two could then never be updated.
   const other = db.prepare("SELECT id, name, version FROM approved_mods WHERE path = ? AND name != ? AND category != 'retired' LIMIT 1").get(p, name);
   if (other) {
-    throw new HttpError(409, `${p} is already pinned by the mod "${other.name}" version "${other.version}" (id ${other.id}). Approve each mod's files `
-      + `separately (rvng approve --exclude); if that build should not contain this file, retire it (POST /api/admin/mods/retire) and upload it again without the file`);
+    throw new HttpError(409, `${p} is already pinned by the mod "${other.name}" version "${other.version}" (id ${other.id}). Each mod's files are `
+      + `approved separately: approve and upload that build again with rvng approve --exclude, which drops this file from it, then upload this one`);
   }
   // Approving a build again with a different file: the earlier pinned file stays known as a retired row, so a
   // pilot who installed it is told to update instead of being flagged for a tampered mod.
@@ -548,11 +548,42 @@ function addOneMod(db, m) {
     .run(name, p, size, sha, category, version);
 }
 
-// Body is one mod file, or { mods: [...] } for a whole folder (see `rvng approve`).
+// Body is one mod file, or { mods: [...], roots: [...] } from `rvng approve`: every file of one build under the
+// approved files and folders (roots). Such an upload is the whole build there: files of that build under the
+// roots that it no longer lists are retired (still known, so their pilots are told to update, never flagged).
+// Files of the build outside the roots are untouched, so a build can be approved in several parts.
 function addApprovedMods(db, body = {}) {
   const list = Array.isArray(body.mods) ? body.mods : [body];
   if (!list.length || list.length > 5000) throw new HttpError(400, 'mods must hold 1-5000 entries');
-  tx(db, () => { for (const m of list) addOneMod(db, m); });
+  let roots = null;
+  if (body.roots !== undefined) {
+    if (!Array.isArray(body.mods) || !Array.isArray(body.roots) || !body.roots.length || body.roots.length > 64
+      || body.roots.some((r) => typeof r !== 'string' || r.length > 1024)) throw new HttpError(400, 'roots must list the approved files and folders');
+    roots = body.roots.map(canonPath);
+    if (roots.some((r) => !r || r.split('/').some((seg) => seg === '.' || seg === '..'))) throw new HttpError(400, 'roots must be paths under the game root');
+  }
+  const under = (p) => roots.some((r) => p === r || p.startsWith(r + '/'));
+  tx(db, () => {
+    if (roots) {
+      if (list.some((m) => !isPlainObject(m) || typeof m.path !== 'string' || !under(canonPath(m.path)))) {
+        throw new HttpError(400, 'every file must be an object whose path is under one of the roots');
+      }
+      const builds = new Map();
+      for (const m of list) {
+        const k = JSON.stringify([m.name, m.version === undefined ? '' : m.version]);
+        if (!builds.has(k)) builds.set(k, new Set());
+        builds.get(k).add(canonPath(m.path));
+      }
+      const rows = db.prepare("SELECT id, path FROM approved_mods WHERE name = ? AND version = ? AND category != 'retired'");
+      const retire = db.prepare("UPDATE approved_mods SET category = 'retired' WHERE id = ?");
+      for (const [k, listed] of builds) {
+        const [name, version] = JSON.parse(k);
+        if (typeof name !== 'string' || typeof version !== 'string') continue; // refused by addOneMod below
+        for (const r of rows.all(name, version)) if (under(r.path) && !listed.has(r.path)) retire.run(r.id);
+      }
+    }
+    for (const m of list) addOneMod(db, m);
+  });
   return listApprovedMods(db);
 }
 

@@ -171,6 +171,9 @@ function migrate(db) {
     if (!cols.includes(col)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${def}`);
   }
   rekeyApprovedMods(db);
+  // A pseudo-build "<version>#<id>" (an earlier file kept known) is never required. One release stored some
+  // as required, which let a one-file install pass; uploads cannot create "#" versions.
+  db.exec("UPDATE approved_mods SET category = 'retired' WHERE category = 'required' AND instr(version, '#') > 0");
   // The backfills below only touch rows that still lack (or contradict) the value, so they also repair
   // databases that an earlier release had already upgraded.
   // Queue entries keep their build: it is the build of the scan they joined with.
@@ -204,17 +207,30 @@ function migrate(db) {
     const want = [int(m.score_a), int(m.score_b), int(m.score_b), int(m.score_a)];
     if ([m.kills_a, m.deaths_a, m.kills_b, m.deaths_b].some((v, i) => v !== want[i])) setKd.run(...want, m.id);
   }
-  // Draws: the first release verified draws but had no draws column, and the column was added without a
-  // backfill. A pilot's draws are exactly their verified matches without a winner.
-  const draws = new Map();
-  for (const m of db.prepare("SELECT player_a, player_b FROM matches WHERE state = 'verified' AND winner IS NULL").all()) {
-    for (const id of [m.player_a, m.player_b]) draws.set(id, (draws.get(id) || 0) + 1);
+  // Career totals: exactly the sum of the pilot's verified matches, now that every verified match records what
+  // it credited. This counts draws from the first release, which had no draws column, and repairs totals that
+  // voids on earlier releases took too much from (they undid scores or logs instead of what was credited).
+  // Ratings are not recomputed (see docs/SECURITY.md).
+  const totals = new Map();
+  const add = (id, k, d, w, l, dr) => {
+    const t = totals.get(id) || { kills: 0, deaths: 0, wins: 0, losses: 0, draws: 0 };
+    t.kills += k; t.deaths += d; t.wins += w; t.losses += l; t.draws += dr;
+    totals.set(id, t);
+  };
+  for (const m of db.prepare("SELECT player_a, player_b, winner, kills_a, deaths_a, kills_b, deaths_b FROM matches WHERE state = 'verified'").all()) {
+    const draw = m.winner == null ? 1 : 0;
+    add(m.player_a, m.kills_a ?? 0, m.deaths_a ?? 0, m.winner === m.player_a ? 1 : 0, m.winner === m.player_b ? 1 : 0, draw);
+    add(m.player_b, m.kills_b ?? 0, m.deaths_b ?? 0, m.winner === m.player_b ? 1 : 0, m.winner === m.player_a ? 1 : 0, draw);
   }
-  const setDraws = db.prepare('UPDATE players SET draws = ? WHERE id = ?');
-  for (const p of db.prepare('SELECT id, draws FROM players').all()) {
-    const n = draws.get(p.id) || 0;
-    if (p.draws !== n) setDraws.run(n, p.id);
-  }
+  const setTotals = db.prepare('UPDATE players SET kills = ?, deaths = ?, wins = ?, losses = ?, draws = ? WHERE id = ?');
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    for (const p of db.prepare('SELECT id, kills, deaths, wins, losses, draws FROM players').all()) {
+      const t = totals.get(p.id) || { kills: 0, deaths: 0, wins: 0, losses: 0, draws: 0 };
+      if (['kills', 'deaths', 'wins', 'losses', 'draws'].some((k) => p[k] !== t[k])) setTotals.run(t.kills, t.deaths, t.wins, t.losses, t.draws, p.id);
+    }
+    db.exec('COMMIT');
+  } catch (e) { db.exec('ROLLBACK'); throw e; }
 }
 
 // Releases before per-build rows keyed approved files by (path, sha256), so a file shared by two builds was

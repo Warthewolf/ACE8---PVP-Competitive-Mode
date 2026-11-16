@@ -81,22 +81,27 @@ test('the "pinned by another mod" check sees every spelling of a path, and its m
     const p = MOD_FILE.path;
     for (const spelling of [`./${p}`, p.toLowerCase(), `.\\${p.replace(/\//g, '\\')}`, `/${p}`, p.replace('/Mods/', '//Mods/')]) {
       await assert.rejects(env.admin('POST', '/api/admin/mods', { mods: [{ name: 'UE4SS', version: '3.0.1', category: 'required', ...MOD_FILE, path: spelling }] }),
-        rejectsWith(409, /already pinned by the mod "Project RVNG" version "" \(id \d+\).*retire it/), spelling);
+        rejectsWith(409, /already pinned by the mod "Project RVNG" version "" \(id \d+\).*--exclude/), spelling);
     }
     await assert.rejects(env.admin('POST', '/api/admin/mods', { name: 'X', ...MOD_FILE, path: 'ACE8/../x.pak' }), rejectsWith(400));
 
-    // A loader build from an older release that holds the competitive mod's files: retire it, upload it again
-    // without them, then the competitive mod can be approved and released.
+    // A loader build from an older release that holds the competitive mod's files: approving the loader folder
+    // again without them retires them from that build, and the proxy DLL approved with it stays required.
     const env2 = env.db; svc.retireMods(env2, { name: 'Project RVNG' });
-    const loader = [{ path: 'ACE8/Binaries/Win64/ue4ss/UE4SS.dll', size: 10, sha256: H('1') }];
-    await env.admin('POST', '/api/admin/mods', { mods: [...loader, MOD_FILE].map((f) => ({ name: 'UE4SS', version: '3.0.2', category: 'required', ...f })) });
+    const ue = 'ACE8/Binaries/Win64/ue4ss';
+    const loader = [{ path: `${ue}/UE4SS.dll`, size: 10, sha256: H('1') }];
+    const dll = { path: 'ACE8/Binaries/Win64/dwmapi.dll', size: 12, sha256: H('a') };
+    const as302 = (files) => files.map((f) => ({ name: 'UE4SS', version: '3.0.2', category: 'required', ...f }));
+    await env.admin('POST', '/api/admin/mods', { mods: as302([...loader, MOD_FILE, dll]) });
     const rvng = { name: 'Project RVNG', version: '1.1', category: 'required', ...MOD_FILE, sha256: H('9') };
     await assert.rejects(env.admin('POST', '/api/admin/mods', { mods: [rvng] }), rejectsWith(409, /version "3.0.2"/));
-    await env.admin('POST', '/api/admin/mods/retire', { name: 'UE4SS', version: '3.0.2' });
-    await env.admin('POST', '/api/admin/mods', { mods: loader.map((f) => ({ name: 'UE4SS', version: '3.0.2', category: 'required', ...f })) });
-    await env.admin('POST', '/api/admin/mods', { mods: [rvng] });
+    await env.admin('POST', '/api/admin/mods', { roots: [ue], mods: as302(loader) });
+    await env.admin('POST', '/api/admin/mods', { roots: [RVNG], mods: [rvng] });
     const pilot = await env.register('Recover1');
-    assert.equal((await scan(pilot, env, { files: [...BASE_FILES, ...loader, { ...MOD_FILE, sha256: H('9') }] })).verdict, 'clean');
+    assert.equal((await scan(pilot, env, { files: [...BASE_FILES, ...loader, dll, { ...MOD_FILE, sha256: H('9') }] })).verdict, 'clean');
+    const noDll = await scan(pilot, env, { files: [...BASE_FILES, ...loader, { ...MOD_FILE, sha256: H('9') }] });
+    assert.ok(noDll.findings.some((f) => f.code === 'missing_required_mod' && f.path === dll.path.toLowerCase()), 'the proxy DLL is still required');
+    await assert.rejects(env.admin('POST', '/api/admin/mods', { roots: ['ACE8/Content'], mods: [rvng] }), rejectsWith(400, /under one of the roots/));
     // Version-less builds from before versions existed are retired by name alone.
     const r = await env.admin('POST', '/api/admin/mods/retire', { name: 'Project RVNG' });
     assert.ok(r.filter((m) => m.name === 'Project RVNG' && m.version === '').every((m) => m.category === 'retired'));

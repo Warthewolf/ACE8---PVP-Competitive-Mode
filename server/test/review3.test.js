@@ -197,7 +197,7 @@ test('upgrade: admin-settled K/D, old approved builds and databases an earlier r
   try {
     let db = openDb(file);
     const ins = db.prepare("INSERT INTO players (name, api_key_hash, api_secret, rating, peak_rating, kills, deaths, wins, losses, created_at) VALUES (?, ?, 's', 1500, 1500, ?, ?, ?, ?, 0)");
-    ins.run('SetA', 'ka', 5, 5, 2, 0); ins.run('SetB', 'kb', 5, 5, 0, 2);
+    ins.run('SetA', 'ka', 5, 3, 2, 0); ins.run('SetB', 'kb', 2, 5, 0, 2); // what the two matches below credited
     svc.putBaseline(db, { gameVersion: '1.0.0', manifest: { files: [] }, aircraft: AIRCRAFT });
     for (const id of [1, 2]) {
       db.prepare("INSERT INTO integrity_reports (player_id, game_version, verdict, findings, mods, manifest_hash, created_at) VALUES (?, '1.0.0', 'clean', '[]', '[]', '', 10)").run(id);
@@ -232,7 +232,7 @@ test('upgrade: admin-settled K/D, old approved builds and databases an earlier r
 
     const p = (id) => db.prepare('SELECT kills, deaths FROM players WHERE id = ?').get(id);
     svc.resolveDispute(db, 'm_admin', { void: true });
-    assert.deepEqual([{ ...p(1) }, { ...p(2) }], [{ kills: 2, deaths: 4 }, { kills: 4, deaths: 2 }], 'the void undoes exactly what was credited');
+    assert.deepEqual([{ ...p(1) }, { ...p(2) }], [{ kills: 2, deaths: 2 }, { kills: 1, deaths: 2 }], 'the void undoes exactly what was credited');
     db.close();
     db = openDb(file); // opening again changes nothing
     assert.deepEqual(kd('m_auto'), { kills_a: 2, deaths_a: 2, kills_b: 1, deaths_b: 2 });

@@ -32,7 +32,7 @@ Every finished hook also needs a matching entry in the baseline aircraft table a
 
 Files are written in `<game root>/ProjectRVNG/bridge/` using write-to-temp-then-rename. The scanner excludes this folder, except for file types the game can load (`.pak`, `.dll`, `.lua`, …).
 
-The companion deletes `lobby.json` and `result.json` only after the server accepts them. A rejection of the content (400, 403, 404, 409, 413) renames the file to `*.failed`; network errors, a 401 from a skewed clock, 429 and 5xx are retried every second. Results are also copied to `bridge/archive/`. A scan refused because it came too soon after the last one (429) is repeated by the companion once the server allows it, with state `waiting` meanwhile. The mod acts only on a `matched` state whose match is `pending` or `live` and that it has not already played.
+If the server cannot be reached when the companion starts (or when it re-checks after a cancel), it keeps asking every second, so an open match is always shown once the server is back. The companion deletes `lobby.json` and `result.json` only after the server accepts them. A rejection of the content (400, 403, 404, 409, 413) renames the file to `*.failed`; network errors, a 401 from a skewed clock, 429 and 5xx are retried every second. Results are also copied to `bridge/archive/`. A scan refused because it came too soon after the last one (429) is repeated by the companion once the server allows it, with state `waiting` meanwhile. The mod acts only on a `matched` state whose match is `pending` or `live` and that it has not already played.
 
 | File | Writer | Content |
 |---|---|---|

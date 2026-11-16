@@ -35,30 +35,32 @@ curl -X PUT "$SERVER/api/admin/baselines" -H "Authorization: Bearer $ADMIN_TOKEN
 # 2. Pin the script loader and the competitive mod, every file, as REQUIRED. This includes UE4SS-settings.ini
 #    (with ModsFolderPath empty and the debug console off), mods.txt and the mod's enabled.txt: any loader
 #    file or script that is not pinned is rejected, and a required mod must match one pinned build exactly.
-#    Logs and crash dumps are skipped (the players' scanner never reports them). Each mod is approved on its
-#    own: the competitive mod lives inside the loader's Mods folder, so leave it out of the loader with
-#    --exclude (the server refuses a file that another mod already pins).
-node client/rvng.js approve --game "C:/.../ACE COMBAT 8" --path ACE8/Binaries/Win64/ue4ss --exclude Mods/ProjectRVNG --name UE4SS --version 3.0.1 --category required
+#    Logs and crash dumps are skipped (the players' scanner never reports them). One approve covers one build:
+#    the loader is its folder plus the proxy DLL next to the game exe. Each mod is approved on its own: the
+#    competitive mod lives inside the loader's Mods folder, so leave it out of the loader with --exclude (the
+#    server refuses a file that another mod already pins).
+node client/rvng.js approve --game "C:/.../ACE COMBAT 8" --path ACE8/Binaries/Win64/ue4ss,ACE8/Binaries/Win64/dwmapi.dll --exclude Mods/ProjectRVNG --name UE4SS --version 3.0.1 --category required
 curl -X POST "$SERVER/api/admin/mods" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'content-type: application/json' --data @mods-UE4SS-3.0.1.json
 node client/rvng.js approve --game "C:/.../ACE COMBAT 8" --path ACE8/Binaries/Win64/ue4ss/Mods/ProjectRVNG --name "Project RVNG" --version 1.0 --category required
-#    Upload that file the same way, and pin the loader's proxy DLL next to the game exe as part of the loader
-#    (--path ACE8/Binaries/Win64/dwmapi.dll --name UE4SS --version 3.0.1).
+#    Upload mods-Project_RVNG-1.0.json the same way.
 # 3. Optional cosmetic mods: --category cosmetic.
 # 4. After a game patch: upload the new baseline, then retire the old build so it can no longer queue:
 curl -X POST "$SERVER/api/admin/baselines/1.0.1/active" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'content-type: application/json' -d '{"active":false}'
-# 5. New release of a required mod: approve it with the SAME --name and a new --version and upload it. Both
-#    builds pass while players update (each build lists all of its files, also those it shares with the other).
-#    Then retire the old build. Pilots who still have it are told to update (outdated_mod) and are not
-#    flagged. To roll back a bad release, retire the new build instead. Do not purge old builds: a purged
-#    build reads as a tampered mod. Approving a build again with a changed file keeps the earlier file known
-#    as retired, but a new --version for every changed release keeps the history readable.
+# 5. New release of a required mod: run the same approve command as in step 2 (for the loader: both paths and
+#    the --exclude) with the SAME --name and a new --version, and upload it. Both builds pass while players
+#    update (each build lists all of its files, also those it shares with the other). Then retire the old
+#    build. Pilots who still have it are told to update (outdated_mod) and are not flagged. To roll back a bad
+#    release, retire the new build instead. Do not purge old builds: a purged build reads as a tampered mod.
+#    Uploading a build again replaces its files under the approved paths: a changed file keeps the earlier one
+#    known as retired, and a file it no longer has is retired. Still, a new --version for every changed release
+#    keeps the history readable.
 curl -X POST "$SERVER/api/admin/mods/retire" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'content-type: application/json' -d '{"name":"Project RVNG","version":"1.0"}'
 ```
 
 Upgrading a server from an earlier release: the earlier releases kept one row per approved file, so a file that two builds shared ended up in only one of them. After the upgrade:
 
-1. Approve and upload every current build once more, as in step 2.
-2. If an upload is refused because another mod already pins a file (a loader approved, under an older release, together with the competitive mod inside it), the message names that build. Retire it, then upload it again with `--exclude Mods/ProjectRVNG`, then upload the competitive mod.
+1. Approve and upload every current build once more, with the step 2 commands and each build's current version, the loader first.
+2. If an upload is refused because another mod already pins a file, the message names that build (a loader approved, under an older release, together with the competitive mod inside it). Approve and upload that build again with the step 2 command and the version the message names: the upload retires the competitive mod's files from it. Then upload the competitive mod.
 3. Builds approved before versions existed have the version `""` (see `GET /api/admin/mods`). Once they are uploaded again under a version, retire the version-less ones: `POST /api/admin/mods/retire` with `{"name":"UE4SS"}` and `{"name":"Project RVNG"}`. Otherwise they keep passing after you retire the versioned build.
 
 Behind a reverse proxy, start the server with `TRUST_PROXY=1` (the number of proxy hops) or the proxy addresses (`TRUST_PROXY="loopback, 10.0.0.0/8"`) so the per-client sign-up limit sees real client addresses. `TRUST_PROXY=true` is refused: with a proxy that appends to `X-Forwarded-For`, every client could pick its own address.
@@ -71,7 +73,7 @@ Public: `GET /api/leaderboard`, `/api/players/:id`, `/api/matches`, `/api/tourna
 
 Player (HMAC-signed): `POST /api/integrity/report`, `/api/queue/join` (`region`: global, na, sa, eu, asia, oce, me, af), `/api/queue/leave`, `GET /api/queue/status`, `GET /api/matches/:id`, `POST /api/matches/:id/lobby`, `/api/matches/:id/report`, `/api/tournaments/:id/register`
 
-Admin (Bearer `ADMIN_TOKEN`): `PUT /api/admin/baselines`, `POST /api/admin/baselines/:version/active`, `GET|POST /api/admin/mods` (`version`; `category`: required, cosmetic or retired), `POST /api/admin/mods/retire` (`{name, version}`), `DELETE /api/admin/mods/:id` (retires; `?purge=1` deletes), `GET /api/admin/integrity`, `POST /api/admin/players/:id/status`, `/api/admin/matches/:id/resolve` (`{winner, scoreHost, scoreGuest}` or `{void:true}`, also for a room the sweep closed; a void also reverts a verified match and reopens an event series it decided), `/api/admin/tournaments`, `/api/admin/tournaments/:id/start`, `/api/admin/series/:id/forfeit` (`{winner: <player id>}` walkover)
+Admin (Bearer `ADMIN_TOKEN`): `PUT /api/admin/baselines`, `POST /api/admin/baselines/:version/active`, `GET|POST /api/admin/mods` (`version`; `category`: required, cosmetic or retired; `roots`: the approved files and folders, as `rvng approve` writes them), `POST /api/admin/mods/retire` (`{name, version}`), `DELETE /api/admin/mods/:id` (retires; `?purge=1` deletes), `GET /api/admin/integrity`, `POST /api/admin/players/:id/status`, `/api/admin/matches/:id/resolve` (`{winner, scoreHost, scoreGuest}` or `{void:true}`, also for a room the sweep closed; a void also reverts a verified match and reopens an event series it decided), `/api/admin/tournaments`, `/api/admin/tournaments/:id/start`, `/api/admin/series/:id/forfeit` (`{winner: <player id>}` walkover)
 
 More: [`docs/GAME_INTEGRATION.md`](docs/GAME_INTEGRATION.md) · [`docs/SECURITY.md`](docs/SECURITY.md)
 

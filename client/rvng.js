@@ -8,9 +8,9 @@
  *   rvng join-event --id N                                 sign up for an open knockout event
  *   rvng run        --game DIR [--region eu] [--no-cache]  bridge daemon used by the in-game mod
  *   rvng baseline   --game DIR --version V [--aircraft stats.json]             (admins) build a clean-install baseline
- *   rvng approve    --game DIR --path REL --name NAME [--version V] [--category required|cosmetic|retired]
- *                   [--exclude SUB[,SUB...]]               (admins) pin a mod file or every file of a folder,
- *                                                          leaving out folders that belong to another mod
+ *   rvng approve    --game DIR --path REL[,REL...] --name NAME [--version V] [--category required|cosmetic|retired]
+ *                   [--exclude SUB[,SUB...]] [--out FILE]  (admins) pin the files and folders of one build of a
+ *                                                          mod, leaving out folders that belong to another mod
  *
  * --no-cache hashes every file instead of reusing hashes from .rvng-cache.json. Use it for event matches.
  *
@@ -119,45 +119,62 @@ function cmdBaseline(a) {
 }
 
 // Admin helper: pins one file, or every file of a folder (a mod, or the UE4SS loader and its settings), as approved.
+// Several --path values (comma-separated) make one build: the loader is its folder plus the proxy DLL next to
+// the game exe. The upload names those roots, and the server retires files of the build under them that the
+// upload no longer lists.
 function cmdApprove(a) {
   const rel = a.path || a.dir;
-  if (!rel || !a.name) throw new Error('--path <file or folder under the game root> and --name required');
+  if (!rel || rel === true || !a.name) throw new Error('--path <file or folder under the game root> and --name required');
   // As the server stores it: forward slashes, no leading "./" or "/", no doubled or trailing slashes.
   const canon = (x) => String(x).replace(/\\/g, '/').replace(/\/{2,}/g, '/').replace(/^(\.?\/)+/, '').replace(/\/+$/, '');
-  const sub = canon(rel);
+  const subs = [...new Set(String(rel).split(',').map((x) => canon(x.trim())).filter(Boolean))];
+  if (!subs.length || subs.some((x) => x === '.' || x.split('/').includes('..'))) throw new Error('--path must name files or folders under the game root');
   const category = a.category || 'cosmetic';
   if (!['required', 'cosmetic', 'retired'].includes(category)) throw new Error('--category must be required, cosmetic or retired');
   const version = a.version === undefined ? '' : String(a.version);
-  // Folders inside this one that belong to another mod (Project RVNG inside the loader's Mods folder), given
-  // relative to --path or to the game root. Each mod's files are approved separately.
+  // Folders inside these that belong to another mod (Project RVNG inside the loader's Mods folder), given
+  // relative to a --path or to the game root. Each mod's files are approved separately.
   if (a.exclude === true) throw new Error('--exclude needs a folder, for example --exclude Mods/ProjectRVNG');
   const excludes = [].concat(a.exclude ?? []).flatMap((x) => String(x).split(',')).map((x) => canon(x.trim())).filter(Boolean)
-    .map((x) => (x.toLowerCase().startsWith(sub.toLowerCase() + '/') ? x : `${sub}/${x}`).toLowerCase());
-  const full = path.join(a.game, sub);
-  const st = fs.lstatSync(full);
-  if (st.isSymbolicLink()) throw new Error(`links cannot be approved: ${sub}`);
-  const all = st.isFile()
-    ? [{ path: '', size: st.size, sha256: hashFile(full) }]
-    : scan(full, { useCache: false, excludes: [] });
-  const links = all.filter((f) => f.size < 0);
-  if (links.length) throw new Error(`links cannot be approved: ${links.map((f) => f.path).join(', ')}`);
+    .map((x) => [x, ...subs.map((sub) => `${sub}/${x}`)].map((y) => y.toLowerCase()));
+  const listed = [];
+  for (const sub of subs) {
+    const full = path.join(a.game, sub);
+    const st = fs.lstatSync(full);
+    if (st.isSymbolicLink()) throw new Error(`links cannot be approved: ${sub}`);
+    const all = st.isFile()
+      ? [{ path: '', size: st.size, sha256: hashFile(full) }]
+      : scan(full, { useCache: false, excludes: [] });
+    const links = all.filter((f) => f.size < 0);
+    if (links.length) throw new Error(`links cannot be approved: ${links.map((f) => `${sub}/${f.path}`).join(', ')}`);
+    listed.push(...all.map((f) => ({ ...f, path: f.path ? `${sub}/${f.path}` : sub })));
+  }
   const inside = (f, x) => f.path.toLowerCase() === x || f.path.toLowerCase().startsWith(x + '/');
-  const listed = all.map((f) => ({ ...f, path: f.path ? `${sub}/${f.path}` : sub }));
+  const hit = (f, forms) => forms.some((x) => inside(f, x));
   // An exclude that matches nothing is a typo: the other mod's files would be pinned into this one.
-  const unused = excludes.filter((x) => !listed.some((f) => inside(f, x)));
-  if (unused.length) throw new Error(`--exclude matched no files: ${unused.join(', ')}`);
-  const files = listed.filter((f) => !excludes.some((x) => inside(f, x)));
+  const unused = excludes.filter((forms) => !listed.some((f) => hit(f, forms)));
+  if (unused.length) throw new Error(`--exclude matched no files: ${unused.map((forms) => forms[0]).join(', ')}`);
+  const files = listed.filter((f) => !excludes.some((forms) => hit(f, forms)));
   // Files the players' scanner never reports (logs, crash dumps) cannot be pinned: a pinned file that is never
   // reported would reject everyone, and UE4SS rewrites its log on every launch anyway.
   const skipped = files.filter((f) => excluded(f.path, DEFAULT_EXCLUDES));
   const mods = files.filter((f) => !excluded(f.path, DEFAULT_EXCLUDES))
     .map((f) => ({ name: a.name, version, path: f.path, size: f.size, sha256: f.sha256, category }));
   if (skipped.length) console.warn(`skipped ${skipped.length} file(s) the scanner never reports: ${skipped.map((f) => f.path).join(', ')}`);
-  if (!mods.length) throw new Error(`nothing to approve under ${sub}`);
+  if (!mods.length) throw new Error(`nothing to approve under ${subs.join(', ')}`);
   const out = a.out || `mods-${String(a.name).replace(/[^A-Za-z0-9_-]/g, '_')}${version ? '-' + version.replace(/[^A-Za-z0-9_.-]/g, '_') : ''}.json`;
-  writeJson(out, { mods });
+  // Two approvals of one build under different paths would write the same default file, and uploading only the
+  // last one would leave the first part out. Upload each before the next, or approve all paths at once.
+  if (!a.out && fs.existsSync(out)) {
+    const prev = (() => { try { return JSON.parse(fs.readFileSync(out, 'utf8')).roots; } catch { return null; } })();
+    if (JSON.stringify(prev) !== JSON.stringify(subs)) {
+      throw new Error(`${out} already holds an approval of ${Array.isArray(prev) ? prev.join(', ') : 'other files'}: upload it and delete it first, `
+        + 'approve all paths of the build in one --path list, or pass --out');
+    }
+  }
+  writeJson(out, { roots: subs, mods });
   console.log(`Wrote ${out}: ${mods.length} files (${category}${version ? ', version ' + version : ''}). Upload with POST /api/admin/mods.`);
-  return { out, mods, skipped: skipped.map((f) => f.path) };
+  return { out, mods, roots: subs, skipped: skipped.map((f) => f.path) };
 }
 
 /**
@@ -179,8 +196,12 @@ function createBridge({ creds, game, region, noCache = false, call = (m, p, b) =
     else if (q.state === 'queued') setState('queued', { message: message || `Searching... ${q.waitingSec}s` });
     else setState(q.state, { message: message || 'Ready' });
   };
-  // Ask the server where this pilot stands: after a restart, a cancel, or a refused join.
-  const resync = async (message) => show(await call('GET', '/api/queue/status'), message);
+  // Ask the server where this pilot stands: after a restart, a cancel, or a refused join. If that fails, every
+  // tick asks again until it succeeds, so an open match is never hidden behind a stale 'idle'.
+  let unsynced = false;
+  const resync = async (message) => {
+    try { show(await call('GET', '/api/queue/status'), message); unsynced = false; } catch (e) { unsynced = true; throw e; }
+  };
   // After a failed tick: keep what the mod shows, with the error. A transient state ('scanning', or 'waiting'
   // with no repeat still pending) goes back to where the server has this pilot.
   const fail = (e) => {
@@ -240,6 +261,7 @@ function createBridge({ creds, game, region, noCache = false, call = (m, p, b) =
   }
 
   async function tick() {
+    if (unsynced) await resync('Reconnected');
     const reqF = file('request.json');
     let req = readJson(reqF);
     if (req) { fs.rmSync(reqF, { force: true }); retryQueue = null; } // one-shot UI actions; a new one replaces a pending retry
