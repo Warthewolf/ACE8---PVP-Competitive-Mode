@@ -10,7 +10,7 @@ const crypto = require('node:crypto');
 // Never part of the integrity manifest: user data, logs, caches, and our own bridge folder.
 const DEFAULT_EXCLUDES = [
   /(^|\/)saved\//i, /\.log$/i, /(^|\/)crashes?\//i, /\.dmp$/i, /(^|\/)shadercache\//i,
-  /(^|\/)ace8competitive\/bridge\//i, /(^|\/)\.ace8pvp-cache\.json$/i,
+  /(^|\/)projectrvng\/bridge\//i, /(^|\/)\.rvng-cache\.json$/i,
 ];
 
 function walk(root, rel = '', out = []) {
@@ -35,7 +35,7 @@ function hashFile(file) {
 }
 
 function scan(root, { excludes = DEFAULT_EXCLUDES, cacheFile, onProgress } = {}) {
-  const cachePath = cacheFile || path.join(root, '.ace8pvp-cache.json');
+  const cachePath = cacheFile || path.join(root, '.rvng-cache.json');
   let cache = {};
   try { cache = JSON.parse(fs.readFileSync(cachePath, 'utf8')); } catch { /* first run */ }
   const next = {};

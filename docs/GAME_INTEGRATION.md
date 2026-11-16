@@ -8,7 +8,7 @@
 
 So the competitive mode has to drive the game's existing private/custom-room or deathmatch flow with 2 players and our rules. Only the PC version can be modded.
 
-## What the mod needs (all placeholders in `mod/ACE8Competitive/Scripts/main.lua`)
+## What the mod needs (all placeholders in `mod/ProjectRVNG/Scripts/main.lua`)
 
 The mod targets [UE4SS](https://github.com/UE4SS-RE/RE-UE4SS), the usual Lua/C++ scripting framework for UE4/UE5 games. Once UE4SS is injected into AC8, use its Live View and object dump to find:
 
@@ -26,7 +26,7 @@ Every finished hook also needs a matching entry in the baseline aircraft table a
 
 ## Bridge protocol (mod ⇄ companion)
 
-Files are written in `<game root>/ACE8Competitive/bridge/` using write-to-temp-then-rename. The scanner excludes this folder.
+Files are written in `<game root>/ProjectRVNG/bridge/` using write-to-temp-then-rename. The scanner excludes this folder.
 
 | File | Writer | Content |
 |---|---|---|

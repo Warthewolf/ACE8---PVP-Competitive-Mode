@@ -5,7 +5,7 @@ const { evaluate } = require('../src/integrity');
 const { BASE_FILES, MOD_FILE, AIRCRAFT, H } = require('./helpers');
 
 const baseline = { manifest: { files: BASE_FILES }, aircraft: AIRCRAFT };
-const approved = [{ name: 'ACE8 Competitive', ...MOD_FILE, category: 'required' },
+const approved = [{ name: 'Project RVNG', ...MOD_FILE, category: 'required' },
   { name: 'HUD colors', path: 'ACE8/Content/Paks/~mods/hud_P.pak', size: 77, sha256: H('d'), category: 'cosmetic' }];
 const rt = { aircraft: AIRCRAFT };
 const codes = (r) => r.findings.map((f) => f.code);
@@ -13,7 +13,7 @@ const codes = (r) => r.findings.map((f) => f.code);
 test('clean install with required mod passes', () => {
   const r = evaluate({ gameVersion: '1.0.0', files: [...BASE_FILES, MOD_FILE], runtime: rt }, baseline, approved);
   assert.equal(r.verdict, 'clean');
-  assert.deepEqual(r.mods.map((m) => m.name), ['ACE8 Competitive']);
+  assert.deepEqual(r.mods.map((m) => m.name), ['Project RVNG']);
 });
 
 test('approved cosmetic mod is listed and allowed', () => {

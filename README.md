@@ -1,12 +1,12 @@
-# ACE8 PvP Competitive Mode
+# Project RVNG
 
-A community 1v1 ranked ladder and knockout tournament system for **modded ACE COMBAT 8: Wings of Theve** multiplayer (PC/Steam).
+**Project RVNG** is a community 1v1 ranked ladder and knockout tournament system for **modded ACE COMBAT 8: Wings of Theve** multiplayer (PC/Steam).
 
 | Part | Path | Status |
 |---|---|---|
 | Website + API server (leaderboards, matches, brackets, integrity) | `server/` | Working, tested |
 | Companion app (integrity scanner, signed API client, bridge to the mod) | `client/` | Working, tested against the server |
-| In-game mod (main-menu queue entry, private room, match logging) | `mod/ACE8Competitive/` | **Template.** Game hook names must be found by reverse engineering (see `docs/GAME_INTEGRATION.md`) |
+| In-game mod (main-menu queue entry, private room, match logging) | `mod/ProjectRVNG/` | **Template.** Game hook names must be found by reverse engineering (see `docs/GAME_INTEGRATION.md`) |
 
 ## How a match works
 
@@ -30,14 +30,14 @@ Admin setup for each game version:
 
 ```bash
 # On a clean, unmodded install:
-node client/ace8pvp.js baseline --game "C:/.../ACE COMBAT 8" --version 1.0.2 --aircraft aircraft-stats.json
+node client/rvng.js baseline --game "C:/.../ACE COMBAT 8" --version 1.0.2 --aircraft aircraft-stats.json
 curl -X PUT $SERVER/api/admin/baselines -H "Authorization: Bearer $ADMIN_TOKEN" -H 'content-type: application/json' --data @baseline-1.0.2.json
 # Pin the competitive mod itself as required (and any allowed cosmetic mods):
 curl -X POST $SERVER/api/admin/mods -H "Authorization: Bearer $ADMIN_TOKEN" -H 'content-type: application/json' \
-  -d '{"name":"ACE8 Competitive","path":"<rel path>","size":1234,"sha256":"<hash>","category":"required"}'
+  -d '{"name":"Project RVNG","path":"<rel path>","size":1234,"sha256":"<hash>","category":"required"}'
 ```
 
-Players: sign up on the website (or `ace8pvp register`), save `credentials.json`, then run `node client/ace8pvp.js run --game "<install dir>"` alongside the game.
+Players: sign up on the website (or `rvng register`), save `credentials.json`, then run `node client/rvng.js run --game "<install dir>"` alongside the game.
 
 ## API summary
 

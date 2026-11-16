@@ -3,7 +3,7 @@
 // Central configuration. Everything can be overridden by environment variables.
 module.exports = {
   port: Number(process.env.PORT || 8080),
-  dbPath: process.env.DB_PATH || 'ace8pvp.sqlite',
+  dbPath: process.env.DB_PATH || 'rvng.sqlite',
   // Admin bearer token for baseline uploads, tournament management, dispute resolution.
   adminToken: process.env.ADMIN_TOKEN || '',
 

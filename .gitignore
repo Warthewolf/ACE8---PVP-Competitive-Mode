@@ -3,4 +3,4 @@ node_modules/
 *.sqlite-shm
 *.sqlite-wal
 credentials.json
-.ace8pvp-cache.json
+.rvng-cache.json

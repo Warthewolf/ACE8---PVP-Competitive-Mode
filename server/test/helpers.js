@@ -9,7 +9,7 @@ const BASE_FILES = [
   { path: 'ACE8/Binaries/Win64/ACE8-Win64-Shipping.exe', size: 1000, sha256: H('a') },
   { path: 'ACE8/Content/Paks/pakchunk0-Windows.pak', size: 5000, sha256: H('b') },
 ];
-const MOD_FILE = { path: 'ACE8/Binaries/Win64/ue4ss/Mods/ACE8Competitive/Scripts/main.lua', size: 42, sha256: H('c') };
+const MOD_FILE = { path: 'ACE8/Binaries/Win64/ue4ss/Mods/ProjectRVNG/Scripts/main.lua', size: 42, sha256: H('c') };
 const AIRCRAFT = { f22a: { maxSpeed: 2400, turnRate: 30, hp: 100 }, su57: { maxSpeed: 2450, turnRate: 32, hp: 100 } };
 
 async function setup() {
@@ -22,7 +22,7 @@ async function setup() {
     const d = await res.json(); if (!res.ok) throw Object.assign(new Error(d.error), { status: res.status }); return d;
   };
   await admin('PUT', '/api/admin/baselines', { gameVersion: '1.0.0', manifest: { files: BASE_FILES }, aircraft: AIRCRAFT });
-  await admin('POST', '/api/admin/mods', { name: 'ACE8 Competitive', ...MOD_FILE, category: 'required' });
+  await admin('POST', '/api/admin/mods', { name: 'Project RVNG', ...MOD_FILE, category: 'required' });
 
   const register = async (name) => {
     const r = await api(url, null, 'POST', '/api/players/register', { name });

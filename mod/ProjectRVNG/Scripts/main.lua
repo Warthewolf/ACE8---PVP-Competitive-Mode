@@ -1,8 +1,8 @@
 --[[
-  ACE8 Competitive - in-game mod (UE4SS Lua)
+  Project RVNG - in-game mod (UE4SS Lua)
 
-  Talks to the companion app (client/ace8pvp.js run) through JSON files in
-  <game root>/ACE8Competitive/bridge/. See docs/GAME_INTEGRATION.md.
+  Talks to the companion app (client/rvng.js run) through JSON files in
+  <game root>/ProjectRVNG/bridge/. See docs/GAME_INTEGRATION.md.
 
   IMPORTANT: ACE COMBAT 8 has no public modding API. Every name in HOOKS below is a
   placeholder that must be replaced with the real class/function paths found by
@@ -13,7 +13,7 @@
 local Json = require("json")
 
 -- Path of the game root as seen from UE4SS's working directory (Binaries/Win64).
-local BRIDGE = "../../../ACE8Competitive/bridge/"
+local BRIDGE = "../../../ProjectRVNG/bridge/"
 
 -- ===== Fill these in from a UE4SS object dump =====================================
 local HOOKS = {
@@ -83,7 +83,7 @@ end
 local function requestQueue()
   writeRuntime()
   writeJson("request.json", { action = "queue" })
-  print("[ACE8Competitive] queue requested")
+  print("[ProjectRVNG] queue requested")
 end
 RegisterKeyBind(Key.F8, requestQueue)
 RegisterKeyBind(Key.F9, function() writeJson("request.json", { action = "cancel" }) end)
@@ -170,4 +170,4 @@ LoopAsync(1000, function()
   return false -- keep looping
 end)
 
-print("[ACE8Competitive] loaded")
+print("[ProjectRVNG] loaded")

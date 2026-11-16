@@ -1,15 +1,15 @@
 #!/usr/bin/env node
 'use strict';
 /**
- * ACE8 PvP companion.
+ * Project RVNG companion.
  *
- *   ace8pvp register --server URL --name NAME            create an account, writes credentials.json
- *   ace8pvp scan     --game DIR [--no-cache]             integrity scan, prints the server verdict
- *   ace8pvp baseline --game DIR --version V [--aircraft stats.json]   (admins) build a clean-install baseline
- *   ace8pvp run      --game DIR [--region eu]            bridge daemon used by the in-game mod
+ *   rvng register --server URL --name NAME            create an account, writes credentials.json
+ *   rvng scan     --game DIR [--no-cache]             integrity scan, prints the server verdict
+ *   rvng baseline --game DIR --version V [--aircraft stats.json]   (admins) build a clean-install baseline
+ *   rvng run      --game DIR [--region eu]            bridge daemon used by the in-game mod
  *
  * The in-game mod (UE4SS Lua) cannot speak signed HTTPS, so it exchanges small JSON files with this
- * daemon in <game>/ACE8Competitive/bridge/ :
+ * daemon in <game>/ProjectRVNG/bridge/ :
  *   mod -> daemon : request.json  { action: "queue" | "cancel", region? }
  *                   runtime.json  { gameVersion, aircraft: {...}, loadedModules: [...] }
  *                   lobby.json    { matchId, lobbyCode }        (host only, after creating the room)
@@ -38,7 +38,7 @@ function args(argv) {
 
 const credPath = (a) => a.credentials || path.join(process.cwd(), 'credentials.json');
 const loadCreds = (a) => JSON.parse(fs.readFileSync(credPath(a), 'utf8'));
-const bridgeDir = (game) => path.join(game, 'ACE8Competitive', 'bridge');
+const bridgeDir = (game) => path.join(game, 'ProjectRVNG', 'bridge');
 const readJson = (f) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; } };
 function writeJson(f, data) {
   fs.mkdirSync(path.dirname(f), { recursive: true });
@@ -48,7 +48,7 @@ function writeJson(f, data) {
 const take = (f) => { const d = readJson(f); if (d) fs.rmSync(f, { force: true }); return d; };
 
 async function buildReport(game, opts = {}) {
-  const files = scan(game, { cacheFile: opts.noCache ? path.join(require('node:os').tmpdir(), `ace8pvp-${process.pid}.json`) : undefined });
+  const files = scan(game, { cacheFile: opts.noCache ? path.join(require('node:os').tmpdir(), `rvng-${process.pid}.json`) : undefined });
   const runtime = readJson(path.join(bridgeDir(game), 'runtime.json')) || {};
   return {
     scannerVersion: VERSION,
@@ -76,9 +76,9 @@ async function cmdScan(a) {
 
 function cmdBaseline(a) {
   if (!a.version) throw new Error('--version required');
-  const files = scan(a.game, { cacheFile: path.join(require('node:os').tmpdir(), 'ace8pvp-baseline.json') })
+  const files = scan(a.game, { cacheFile: path.join(require('node:os').tmpdir(), 'rvng-baseline.json') })
     // Mods are registered separately as approved mods, never baked into the baseline.
-    .filter((f) => !/(^|\/)(~mods|logicmods|ue4ss|ace8competitive)\//i.test(f.path));
+    .filter((f) => !/(^|\/)(~mods|logicmods|ue4ss|projectrvng)\//i.test(f.path));
   const aircraft = a.aircraft ? JSON.parse(fs.readFileSync(a.aircraft, 'utf8')) : {};
   const out = a.out || `baseline-${a.version}.json`;
   writeJson(out, { gameVersion: a.version, manifest: { files }, aircraft });

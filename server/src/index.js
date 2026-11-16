@@ -10,6 +10,6 @@ const db = app.get('db');
 setInterval(() => { try { svc.runMatchmaker(db); svc.sweepStaleMatches(db); } catch (e) { console.error(e); } }, 3000).unref();
 
 app.listen(config.port, () => {
-  console.log(`ACE8 PvP server listening on :${config.port}`);
+  console.log(`Project RVNG server listening on :${config.port}`);
   if (!config.adminToken) console.warn('ADMIN_TOKEN is not set: admin endpoints are disabled.');
 });
