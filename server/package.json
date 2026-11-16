@@ -1,0 +1,15 @@
+{
+  "name": "ace8-pvp-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Competitive 1v1 PvP backend + website for modded ACE COMBAT 8 multiplayer",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning src/index.js",
+    "test": "node --disable-warning=ExperimentalWarning --test test/*.test.js"
+  },
+  "engines": { "node": ">=22.13" },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}

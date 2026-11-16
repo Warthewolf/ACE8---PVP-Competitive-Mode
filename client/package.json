@@ -1,0 +1,9 @@
+{
+  "name": "ace8pvp-client",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Companion app: integrity scanner + bridge between the in-game mod and the competitive server",
+  "bin": { "ace8pvp": "ace8pvp.js" },
+  "engines": { "node": ">=22" },
+  "scripts": { "test": "node --test test/*.test.js" }
+}

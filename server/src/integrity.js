@@ -1,0 +1,181 @@
+'use strict';
+/**
+ * Integrity evaluation.
+ *
+ * The client scanner (client/scan.js) and the in-game mod produce a report:
+ * {
+ *   gameVersion: "1.0.2",
+ *   scannerVersion: "0.1.0",
+ *   files:   [{ path: "ACE8/Content/Paks/pakchunk0-Windows.pak", size: 123, sha256: "..." }, ...],
+ *   runtime: {
+ *     loadedModules: ["d3d11.dll", ...],            // optional: DLLs loaded in the game process
+ *     aircraft: { "<aircraftId>": { maxSpeed: 2400, ... } }  // stats read live from the game
+ *   }
+ * }
+ *
+ * The server compares it with the clean baseline for that game version and the approved-mod list.
+ * Paths are normalised to forward slashes, relative to the game install root.
+ */
+const crypto = require('node:crypto');
+
+const SEVERITY = { info: 0, low: 1, high: 2, critical: 3 };
+
+// Unknown files in these locations are treated as mods.
+const PAK_EXT = /\.(pak|ucas|utoc|sig)$/i;
+const CODE_EXT = /\.(dll|asi|exe)$/i;
+const SCRIPT_EXT = /\.(lua|py|js)$/i;
+// DLL names commonly used as proxy loaders for injection.
+const PROXY_DLLS = new Set([
+  'dxgi.dll', 'd3d11.dll', 'd3d12.dll', 'dinput8.dll', 'version.dll', 'winmm.dll',
+  'xinput1_3.dll', 'xinput1_4.dll', 'xinput9_1_0.dll', 'dsound.dll', 'winhttp.dll',
+]);
+// System modules that are always legitimately loaded; anything else outside the baseline is reported.
+const SYSTEM_MODULE_ALLOW = /^(ntdll|kernel32|kernelbase|user32|gdi32|advapi32|ws2_32|d3d1[12]|dxgi|xinput1_4|steam_api64|steamclient64|gameoverlayrenderer64|nvwgf2umx|amdxx64|amdxc64|vulkan-1)\.dll$/i;
+
+// Relative tolerance before a runtime aircraft stat counts as modified.
+const STAT_TOLERANCE = 0.005;
+
+const norm = (p) => String(p).replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
+
+function classifyUnknown(path) {
+  const base = path.split('/').pop();
+  if (PAK_EXT.test(path) || /\/~mods\//.test(path) || /\/logicmods\//.test(path)) {
+    return { code: 'unapproved_pak_mod', severity: 'critical' };
+  }
+  if (CODE_EXT.test(path)) {
+    if (PROXY_DLLS.has(base)) return { code: 'proxy_dll_injection', severity: 'critical' };
+    return { code: 'unapproved_binary', severity: 'critical' };
+  }
+  if (/\/(ue4ss|ue5ss|mods)\//.test(path) && SCRIPT_EXT.test(path)) {
+    return { code: 'unapproved_script_mod', severity: 'critical' };
+  }
+  return { code: 'unknown_file', severity: 'low' };
+}
+
+function compareAircraft(reported, baseline) {
+  const findings = [];
+  for (const [id, stats] of Object.entries(reported || {})) {
+    const ref = baseline[id];
+    if (!ref) {
+      findings.push({ code: 'unknown_aircraft', severity: 'high', aircraft: id });
+      continue;
+    }
+    for (const [stat, refVal] of Object.entries(ref)) {
+      if (typeof refVal !== 'number') continue;
+      const got = stats[stat];
+      if (typeof got !== 'number' || !Number.isFinite(got)) {
+        findings.push({ code: 'aircraft_stat_missing', severity: 'high', aircraft: id, stat });
+        continue;
+      }
+      const diff = refVal === 0 ? Math.abs(got) : Math.abs(got - refVal) / Math.abs(refVal);
+      if (diff > STAT_TOLERANCE) {
+        findings.push({
+          code: 'aircraft_stat_modified', severity: 'critical', aircraft: id, stat,
+          expected: refVal, actual: got,
+        });
+      }
+    }
+  }
+  return findings;
+}
+
+/**
+ * @param report    client report (see top of file)
+ * @param baseline  { manifest: {files:[...]}, aircraft: {...} } or null
+ * @param approved  rows from approved_mods
+ * @returns { verdict, findings, mods, manifestHash }
+ */
+function evaluate(report, baseline, approved) {
+  const findings = [];
+  const mods = [];
+
+  if (!report || !Array.isArray(report.files)) {
+    return { verdict: 'rejected', findings: [{ code: 'malformed_report', severity: 'critical' }], mods, manifestHash: '' };
+  }
+  if (!baseline) {
+    return {
+      verdict: 'rejected',
+      findings: [{ code: 'unsupported_game_version', severity: 'critical', gameVersion: report.gameVersion }],
+      mods, manifestHash: '',
+    };
+  }
+
+  const reported = new Map();
+  for (const f of report.files) {
+    if (!f || typeof f.path !== 'string') continue;
+    reported.set(norm(f.path), { size: Number(f.size), sha256: String(f.sha256 || '').toLowerCase() });
+  }
+
+  // 1. Every baseline file must exist with identical size and hash.
+  const baseFiles = new Map(baseline.manifest.files.map((f) => [norm(f.path), f]));
+  for (const [path, ref] of baseFiles) {
+    const got = reported.get(path);
+    if (!got) {
+      findings.push({ code: 'missing_file', severity: 'high', path });
+    } else if (got.size !== Number(ref.size)) {
+      findings.push({ code: 'size_mismatch', severity: 'critical', path, expected: Number(ref.size), actual: got.size });
+    } else if (got.sha256 !== String(ref.sha256).toLowerCase()) {
+      findings.push({ code: 'hash_mismatch', severity: 'critical', path });
+    }
+  }
+
+  // 2. Every extra file must be an approved mod, otherwise it is classified.
+  const approvedByPath = new Map();
+  for (const m of approved) {
+    const k = norm(m.path);
+    if (!approvedByPath.has(k)) approvedByPath.set(k, []);
+    approvedByPath.get(k).push(m);
+  }
+  for (const [path, got] of reported) {
+    if (baseFiles.has(path)) continue;
+    const candidates = approvedByPath.get(path) || [];
+    const match = candidates.find((m) => m.sha256.toLowerCase() === got.sha256 && Number(m.size) === got.size);
+    if (match) {
+      mods.push({ name: match.name, path, size: got.size, approved: true, category: match.category });
+      continue;
+    }
+    const cls = classifyUnknown(path);
+    if (candidates.length) {
+      // Known mod path but the file differs from the approved build -> tampered mod.
+      findings.push({ code: 'approved_mod_tampered', severity: 'critical', path, size: got.size });
+      mods.push({ name: candidates[0].name, path, size: got.size, approved: false });
+    } else {
+      findings.push({ ...cls, path, size: got.size });
+      if (cls.code !== 'unknown_file') mods.push({ name: path.split('/').pop(), path, size: got.size, approved: false });
+    }
+  }
+
+  // 3. Required mods (the competitive mod itself) must be present.
+  for (const m of approved.filter((x) => x.category === 'required')) {
+    if (!mods.some((x) => x.approved && x.path === norm(m.path))) {
+      findings.push({ code: 'missing_required_mod', severity: 'critical', name: m.name, path: norm(m.path) });
+    }
+  }
+
+  // 4. Runtime checks from inside the game process.
+  const rt = report.runtime || {};
+  if (Array.isArray(rt.loadedModules)) {
+    const allowedBinaries = new Set(
+      [...baseFiles.keys(), ...mods.filter((m) => m.approved).map((m) => m.path)]
+        .filter((p) => CODE_EXT.test(p)).map((p) => p.split('/').pop()),
+    );
+    for (const mod of rt.loadedModules) {
+      const name = norm(mod).split('/').pop();
+      if (allowedBinaries.has(name) || SYSTEM_MODULE_ALLOW.test(name)) continue;
+      findings.push({ code: 'unexpected_loaded_module', severity: 'high', module: name });
+    }
+  }
+  if (rt.aircraft) findings.push(...compareAircraft(rt.aircraft, baseline.aircraft || {}));
+  else findings.push({ code: 'runtime_stats_missing', severity: 'high' });
+
+  const worst = findings.reduce((m, f) => Math.max(m, SEVERITY[f.severity] ?? 0), 0);
+  const verdict = worst >= SEVERITY.high ? 'rejected' : 'clean';
+
+  const manifestHash = crypto.createHash('sha256')
+    .update([...reported.entries()].sort(([a], [b]) => (a < b ? -1 : 1)).map(([p, f]) => `${p}:${f.size}:${f.sha256}`).join('\n'))
+    .digest('hex');
+
+  return { verdict, findings, mods, manifestHash };
+}
+
+module.exports = { evaluate, compareAircraft, classifyUnknown, norm, STAT_TOLERANCE };
