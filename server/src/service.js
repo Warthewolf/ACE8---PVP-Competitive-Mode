@@ -531,10 +531,17 @@ function addOneMod(db, m) {
   const sha = hash.toLowerCase();
   // A file belongs to one mod. A loader folder approved with another mod inside it would make the loader's
   // build require that mod's files too, and one of the two could then never be updated.
-  const other = db.prepare("SELECT id, name, version FROM approved_mods WHERE path = ? AND name != ? AND category != 'retired' LIMIT 1").get(p, name);
-  if (other) {
-    throw new HttpError(409, `${p} is already pinned by the mod "${other.name}" version "${other.version}" (id ${other.id}). Each mod's files are `
-      + `approved separately: approve and upload that build again with rvng approve --exclude, which drops this file from it, then upload this one`);
+  // The message covers both ways this happens: an older approval of the other mod swept this mod's files in
+  // (retire them there, one row at a time, without approving that build again), or this upload holds the other
+  // mod's folder (leave it out of this approval).
+  const others = db.prepare(`SELECT id, name, version FROM approved_mods WHERE path = ? AND name != ? AND category != 'retired'
+    ORDER BY id LIMIT 10`).all(p, name);
+  if (others.length) {
+    const who = others.map((o) => `"${o.name}" version "${o.version}" (id ${o.id})`).join(', ');
+    const ids = others.map((o) => `DELETE /api/admin/mods/${o.id}`).join(', ');
+    throw new HttpError(409, `${p} is already pinned by ${who}. A file belongs to one mod. If it is part of "${name}" (an older approval `
+      + `swept it into the other build), retire it from there with ${ids}, then upload this again. If it belongs to the other mod, leave its `
+      + 'folder out of this approval: add it to rvng approve --exclude');
   }
   // Approving a build again with a different file: the earlier pinned file stays known as a retired row, so a
   // pilot who installed it is told to update instead of being flagged for a tampered mod.

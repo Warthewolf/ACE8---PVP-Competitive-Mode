@@ -78,11 +78,16 @@ test('bridge: if the server was unreachable at start, later ticks keep asking un
     };
     const bridge = createBridge({ game, call });
     const state = () => JSON.parse(fs.readFileSync(path.join(bridge.dir, 'state.json'), 'utf8'));
-    await bridge.resync('Companion connected').catch(() => bridge.setState('idle', { message: 'Companion connected (server unreachable)' }));
-    await assert.rejects(bridge.tick(), /unavailable/);
-    down = false;
-    await bridge.tick();
-    assert.deepEqual([state().state, state().match.id], ['matched', 'm_9']);
+    let now = Date.now(); const realNow = Date.now; Date.now = () => now; // retries back off (sixth review)
+    try {
+      await bridge.resync('Companion connected').catch(() => bridge.setState('idle', { message: 'Companion connected (server unreachable)' }));
+      now += 2000;
+      await assert.rejects(bridge.tick(), /unavailable/);
+      down = false;
+      now += 4000;
+      await bridge.tick();
+      assert.deepEqual([state().state, state().match.id], ['matched', 'm_9']);
+    } finally { Date.now = realNow; }
   } finally { fs.rmSync(game, { recursive: true }); }
 });
 

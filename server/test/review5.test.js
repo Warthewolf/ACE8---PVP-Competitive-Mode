@@ -26,11 +26,12 @@ function tempDb(fn) {
 
 test('a required pseudo-build stored by an earlier upgrade is retired when the database is opened', () => tempDb((file) => {
   let db = openDb(file);
-  const ins = db.prepare('INSERT INTO approved_mods (name, path, size, sha256, category, version) VALUES (?, ?, ?, ?, ?, ?)');
+  const ins = db.prepare('INSERT INTO approved_mods (id, name, path, size, sha256, category, version) VALUES (?, ?, ?, ?, ?, ?, ?)');
   const main = f(`${RVNG}/scripts/main.lua`, 42, '4'); const enabled = f(`${RVNG}/enabled.txt`, 0, '3');
-  ins.run('Project RVNG', main.path.toLowerCase(), 40, H('1'), 'required', '1.0'); // the stale file took the real slot
-  ins.run('Project RVNG', enabled.path.toLowerCase(), 0, H('3'), 'required', '1.0');
-  ins.run('Project RVNG', main.path.toLowerCase(), 42, H('4'), 'required', '1.0#12'); // the current file as a pseudo-build
+  ins.run(10, 'Project RVNG', main.path.toLowerCase(), 40, H('1'), 'required', '1.0'); // the stale file took the real slot
+  ins.run(11, 'Project RVNG', enabled.path.toLowerCase(), 0, H('3'), 'required', '1.0');
+  // The current file as a pseudo-build: releases name it after its own row id.
+  ins.run(12, 'Project RVNG', main.path.toLowerCase(), 42, H('4'), 'required', '1.0#12');
   db.close();
   db = openDb(file);
   const rows = svc.listApprovedMods(db);

@@ -38,16 +38,18 @@ curl -X PUT "$SERVER/api/admin/baselines" -H "Authorization: Bearer $ADMIN_TOKEN
 #    Logs and crash dumps are skipped (the players' scanner never reports them). One approve covers one build:
 #    the loader is its folder plus the proxy DLL next to the game exe. Each mod is approved on its own: the
 #    competitive mod lives inside the loader's Mods folder, so leave it out of the loader with --exclude (the
-#    server refuses a file that another mod already pins).
+#    server refuses a file that another mod already pins). Exclude every Lua mod you approve on its own, e.g.
+#    --exclude Mods/ProjectRVNG,Mods/CockpitColors once a cosmetic mod from step 3 lives there too.
 node client/rvng.js approve --game "C:/.../ACE COMBAT 8" --path ACE8/Binaries/Win64/ue4ss,ACE8/Binaries/Win64/dwmapi.dll --exclude Mods/ProjectRVNG --name UE4SS --version 3.0.1 --category required
 curl -X POST "$SERVER/api/admin/mods" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'content-type: application/json' --data @mods-UE4SS-3.0.1.json
 node client/rvng.js approve --game "C:/.../ACE COMBAT 8" --path ACE8/Binaries/Win64/ue4ss/Mods/ProjectRVNG --name "Project RVNG" --version 1.0 --category required
 #    Upload mods-Project_RVNG-1.0.json the same way.
-# 3. Optional cosmetic mods: --category cosmetic.
+# 3. Optional cosmetic mods: --category cosmetic. A Lua mod in the loader's Mods folder is its own build: add its
+#    folder to the loader's --exclude list (step 2) from then on.
 # 4. After a game patch: upload the new baseline, then retire the old build so it can no longer queue:
 curl -X POST "$SERVER/api/admin/baselines/1.0.1/active" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'content-type: application/json' -d '{"active":false}'
 # 5. New release of a required mod: run the same approve command as in step 2 (for the loader: both paths and
-#    the --exclude) with the SAME --name and a new --version, and upload it. Both builds pass while players
+#    every --exclude) with the SAME --name and a new --version, and upload it. Both builds pass while players
 #    update (each build lists all of its files, also those it shares with the other). Then retire the old
 #    build. Pilots who still have it are told to update (outdated_mod) and are not flagged. To roll back a bad
 #    release, retire the new build instead. Do not purge old builds: a purged build reads as a tampered mod.
@@ -59,13 +61,13 @@ curl -X POST "$SERVER/api/admin/mods/retire" -H "Authorization: Bearer $ADMIN_TO
 
 Upgrading a server from an earlier release: the earlier releases kept one row per approved file, so a file that two builds shared ended up in only one of them. After the upgrade:
 
-1. Approve and upload every current build once more, with the step 2 commands and each build's current version, the loader first.
-2. If an upload is refused because another mod already pins a file, the message names that build (a loader approved, under an older release, together with the competitive mod inside it). Approve and upload that build again with the step 2 command and the version the message names: the upload retires the competitive mod's files from it. Then upload the competitive mod.
+1. Approve and upload every current build once more, with the step 2 commands and each build's current version, the loader first. `rvng approve` replaces the `mods-*.json` files an earlier release left in the folder when they hold the same paths.
+2. If an upload is refused because another mod already pins a file, the message names that build and the row ids. When the file belongs to the build you are uploading (a loader approved, under an older release, together with the competitive mod inside it), retire it from the other build with the `DELETE /api/admin/mods/<id>` the message names, then upload again. Do not approve the other build again from your install for this: your install may hold a different release of it. When the file belongs to the other mod (a cosmetic Lua mod inside the loader's Mods folder), add that mod's folder to `--exclude` instead.
 3. Builds approved before versions existed have the version `""` (see `GET /api/admin/mods`). Once they are uploaded again under a version, retire the version-less ones: `POST /api/admin/mods/retire` with `{"name":"UE4SS"}` and `{"name":"Project RVNG"}`. Otherwise they keep passing after you retire the versioned build.
 
 Behind a reverse proxy, start the server with `TRUST_PROXY=1` (the number of proxy hops) or the proxy addresses (`TRUST_PROXY="loopback, 10.0.0.0/8"`) so the per-client sign-up limit sees real client addresses. `TRUST_PROXY=true` is refused: with a proxy that appends to `X-Forwarded-For`, every client could pick its own address.
 
-Players: sign up on the website (or `rvng register`), save `credentials.json`, then run `node client/rvng.js run --game "<install dir>"` alongside the game. To enter an open event: `node client/rvng.js join-event --id <event number>`. For event matches add `--no-cache` to `run` so every file is re-hashed.
+Players: sign up on the website (or `rvng register`), save `credentials.json` in the folder you run the companion from (or in `client/`, next to `rvng.js`; or pass `--credentials <file>`), then run `node client/rvng.js run --game "<install dir>"` alongside the game. To enter an open event: `node client/rvng.js join-event --id <event number>`. For event matches add `--no-cache` to `run` so every file is re-hashed.
 
 ## API summary
 

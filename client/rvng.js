@@ -39,16 +39,27 @@ function args(argv) {
     const a = argv[i];
     if (a.startsWith('--')) {
       const k = a.slice(2);
-      const v = argv[i + 1] && !argv[i + 1].startsWith('--') ? argv[++i] : true;
+      // An empty value ("") is a value: `--version ""` is the version-less build, not the flag alone.
+      const v = i + 1 < argv.length && !argv[i + 1].startsWith('--') ? argv[++i] : true;
       out[k] = v;
     } else out._.push(a);
   }
   return out;
 }
 
+// credentials.json: --credentials, else the folder the command runs from, else next to this script (the website
+// says to save it in one of those two).
 const credPath = (a) => a.credentials || path.join(process.cwd(), 'credentials.json');
+function findCreds(a) {
+  if (a.credentials) return a.credentials;
+  const here = [path.join(process.cwd(), 'credentials.json'), path.join(__dirname, 'credentials.json')];
+  const p = here.find((f) => fs.existsSync(f));
+  if (!p) throw new Error(`credentials.json not found in ${[...new Set(here.map(path.dirname))].join(' or ')}: sign up on the website `
+    + 'or run rvng register, then save it there or pass --credentials <file>');
+  return p;
+}
 function loadCreds(a) {
-  const p = credPath(a);
+  const p = findCreds(a);
   if (process.platform !== 'win32') {
     try {
       if ((fs.statSync(p).mode & 0o077) !== 0) console.warn(`warning: ${p} is readable by other users; run: chmod 600 "${p}"`);
@@ -124,7 +135,8 @@ function cmdBaseline(a) {
 // upload no longer lists.
 function cmdApprove(a) {
   const rel = a.path || a.dir;
-  if (!rel || rel === true || !a.name) throw new Error('--path <file or folder under the game root> and --name required');
+  if (!rel || rel === true || !a.name || a.name === true) throw new Error('--path <file or folder under the game root> and --name required');
+  for (const k of ['version', 'category', 'out']) if (a[k] === true) throw new Error(`--${k} needs a value (use --version "" for a version-less build)`);
   // As the server stores it: forward slashes, no leading "./" or "/", no doubled or trailing slashes.
   const canon = (x) => String(x).replace(/\\/g, '/').replace(/\/{2,}/g, '/').replace(/^(\.?\/)+/, '').replace(/\/+$/, '');
   const subs = [...new Set(String(rel).split(',').map((x) => canon(x.trim())).filter(Boolean))];
@@ -164,11 +176,19 @@ function cmdApprove(a) {
   if (!mods.length) throw new Error(`nothing to approve under ${subs.join(', ')}`);
   const out = a.out || `mods-${String(a.name).replace(/[^A-Za-z0-9_-]/g, '_')}${version ? '-' + version.replace(/[^A-Za-z0-9_.-]/g, '_') : ''}.json`;
   // Two approvals of one build under different paths would write the same default file, and uploading only the
-  // last one would leave the first part out. Upload each before the next, or approve all paths at once.
+  // last one would leave the first part out. Upload each before the next, or approve all paths at once. A file
+  // whose paths all lie under this approval's paths (the same approval again, or one written by an earlier
+  // release, which has no roots) is replaced: nothing it held is lost.
   if (!a.out && fs.existsSync(out)) {
-    const prev = (() => { try { return JSON.parse(fs.readFileSync(out, 'utf8')).roots; } catch { return null; } })();
-    if (JSON.stringify(prev) !== JSON.stringify(subs)) {
-      throw new Error(`${out} already holds an approval of ${Array.isArray(prev) ? prev.join(', ') : 'other files'}: upload it and delete it first, `
+    const prev = (() => { try { return JSON.parse(fs.readFileSync(out, 'utf8')); } catch { return null; } })();
+    const held = Array.isArray(prev?.roots) ? prev.roots : Array.isArray(prev?.mods) ? prev.mods.map((m) => m?.path) : [prev?.path];
+    const outside = held.filter((x) => typeof x !== 'string' || !subs.some((r) => {
+      const [h, rr] = [canon(x).toLowerCase(), r.toLowerCase()];
+      return h === rr || h.startsWith(rr + '/');
+    }));
+    if (!held.length || outside.length) {
+      const what = Array.isArray(prev?.roots) ? prev.roots.join(', ') : `${outside.length || 'unreadable'} file(s) outside ${subs.join(', ')}`;
+      throw new Error(`${out} already holds an approval of ${what}: upload it and delete it first, `
         + 'approve all paths of the build in one --path list, or pass --out');
     }
   }
@@ -196,11 +216,17 @@ function createBridge({ creds, game, region, noCache = false, call = (m, p, b) =
     else if (q.state === 'queued') setState('queued', { message: message || `Searching... ${q.waitingSec}s` });
     else setState(q.state, { message: message || 'Ready' });
   };
-  // Ask the server where this pilot stands: after a restart, a cancel, or a refused join. If that fails, every
-  // tick asks again until it succeeds, so an open match is never hidden behind a stale 'idle'.
-  let unsynced = false;
+  // Ask the server where this pilot stands: after a restart, a cancel, or a refused join. If that fails, later
+  // ticks ask again until it succeeds, so an open match is never hidden behind a stale 'idle'. The retries back
+  // off (2 s, doubling, at most a minute): a long outage, a banned account or stale credentials must not mean a
+  // request and an error line every second.
+  let unsynced = null; // { at, delay } while the last attempt failed
   const resync = async (message) => {
-    try { show(await call('GET', '/api/queue/status'), message); unsynced = false; } catch (e) { unsynced = true; throw e; }
+    try { show(await call('GET', '/api/queue/status'), message); unsynced = null; } catch (e) {
+      const delay = unsynced ? Math.min(unsynced.delay * 2, 60_000) : 2000;
+      unsynced = { at: Date.now() + delay, delay };
+      throw e;
+    }
   };
   // After a failed tick: keep what the mod shows, with the error. A transient state ('scanning', or 'waiting'
   // with no repeat still pending) goes back to where the server has this pilot.
@@ -261,7 +287,7 @@ function createBridge({ creds, game, region, noCache = false, call = (m, p, b) =
   }
 
   async function tick() {
-    if (unsynced) await resync('Reconnected');
+    if (unsynced && Date.now() >= unsynced.at) await resync('Reconnected');
     const reqF = file('request.json');
     let req = readJson(reqF);
     if (req) { fs.rmSync(reqF, { force: true }); retryQueue = null; } // one-shot UI actions; a new one replaces a pending retry
@@ -290,8 +316,16 @@ function createBridge({ creds, game, region, noCache = false, call = (m, p, b) =
       const r = await submit('result.json', (d) => call('POST', `/api/matches/${encodeURIComponent(d.matchId)}/report`, d),
         (e) => e.status === 409 && /already submitted/.test(e.message));
       if (r) {
-        current = { state: 'reported' };
-        setState('reported', { match: r.res, message: r.res ? `Result submitted (${r.res.state})` : 'Result already submitted' });
+        const sent = r.res ? `Result submitted (${r.res.state})` : 'Result already submitted';
+        // A late log of an earlier match, sent in the same tick that queued or matched the pilot again: the new
+        // match stays on screen (the mod acts only on 'matched'), so its room is still created or joined.
+        if (['queued', 'matched'].includes(current.state) && current.match?.id !== String(r.data.matchId)) {
+          const now = current.state === 'matched' ? `Match ${current.match.id} (${current.match.state})` : 'Searching for opponent';
+          setState(current.state, { ...(current.match ? { match: current.match } : {}), message: `${sent} for ${String(r.data.matchId)}; ${now}` });
+        } else {
+          current = { state: 'reported' };
+          setState('reported', { match: r.res, message: sent });
+        }
       }
     }
   }

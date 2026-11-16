@@ -169,7 +169,8 @@ function evaluate(report, baseline, approved) {
       // earlier file of build 1.0).
       const live = new Set(candidates.filter((m) => m.category !== 'retired').map((m) => m.name));
       const old = [...matching].sort((a, b) => (live.has(b.name) - live.has(a.name)) || ((b.id ?? 0) - (a.id ?? 0)))[0];
-      findings.push({ code: 'outdated_mod', severity: 'high', name: old.name, version: String(old.version || '').replace(/#\d+$/, ''), path });
+      const v = String(old.version || ''); const own = `#${old.id}`;
+      findings.push({ code: 'outdated_mod', severity: 'high', name: old.name, version: old.id != null && v.endsWith(own) ? v.slice(0, -own.length) : v, path });
       mods.push({ name: old.name, path, size: got.size, approved: false, outdated: true });
       continue;
     }

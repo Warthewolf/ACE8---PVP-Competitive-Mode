@@ -239,7 +239,7 @@ document.addEventListener('submit', async (e) => {
     if (!r.ok) throw new Error(d.error);
     form.dataset.done = '1';
     const creds = { server: location.origin, apiKey: d.apiKey, apiSecret: d.apiSecret, playerId: d.id, name: d.name };
-    out.innerHTML = `<p><b>Welcome, ${esc(d.name)}.</b> Save this as <code>credentials.json</code> next to the companion app. It is shown only once.</p>
+    out.innerHTML = `<p><b>Welcome, ${esc(d.name)}.</b> Save this as <code>credentials.json</code> in the folder you run the companion app from (or next to <code>rvng.js</code>). It is shown only once.</p>
       <pre class="secret">${esc(JSON.stringify(creds, null, 2))}</pre>`;
   } catch (err) {
     out.innerHTML = `<p class="error">${esc(err.message)}</p>`;

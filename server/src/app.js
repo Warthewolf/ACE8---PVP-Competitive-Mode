@@ -70,9 +70,10 @@ function createApp({ db = openDb(config.dbPath) } = {}) {
   // integrity reports, match logs or manifests may send large bodies.
   // No body of this API nests deeper than a few levels; deeper ones are refused before they are parsed.
   // Bodies must be UTF-8 (body-parser would also decode UTF-7 or UTF-16, which the byte scan cannot read).
-  const verify = (req, _res, buf) => {
-    const charset = (/;\s*charset\s*=\s*"?([^";\s]+)/i.exec(req.headers['content-type'] || '') || [])[1];
-    if (charset && !['utf-8', 'utf8'].includes(charset.toLowerCase())) {
+  // `encoding` is the charset body-parser decodes this body with, read by its own header parser: reading the
+  // header here again could pick a different parameter (a repeated charset, one inside a quoted value).
+  const verify = (req, _res, buf, encoding) => {
+    if (String(encoding || 'utf-8').toLowerCase() !== 'utf-8') {
       throw Object.assign(new Error('request bodies must be UTF-8'), { status: 415, type: 'charset.unsupported' });
     }
     if (jsonTooDeep(buf, 32)) throw Object.assign(new Error('JSON nested too deeply'), { status: 400, type: 'entity.too.deep' });
