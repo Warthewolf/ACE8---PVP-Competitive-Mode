@@ -27,15 +27,19 @@ function clientKey(ip) {
   return all.slice(0, 4).map((g) => g.toString(16)).join(':') + '::/64';
 }
 
-// Depth of nested arrays/objects, without recursion (JSON.parse accepts any depth; JSON.stringify and other
-// recursive code would overflow the stack).
-function tooDeep(value, max) {
-  const stack = [[value, 1]];
-  while (stack.length) {
-    const [v, d] = stack.pop();
-    if (v === null || typeof v !== 'object') continue;
-    if (d > max) return true;
-    for (const x of Object.values(v)) if (x !== null && typeof x === 'object') stack.push([x, d + 1]);
+// Nesting depth of a JSON text, counted on the raw bytes before parsing: one pass, brackets inside strings
+// ignored. JSON.parse accepts any depth, but JSON.stringify and other recursive code would overflow the stack,
+// and walking a parsed 4 MB body again would cost as much as parsing it.
+function jsonTooDeep(buf, max) {
+  let depth = 0; let inString = false;
+  for (let i = 0; i < buf.length; i++) {
+    const c = buf[i];
+    if (inString) {
+      if (c === 0x5c) i++; // backslash: skip the escaped byte
+      else if (c === 0x22) inString = false;
+    } else if (c === 0x22) inString = true;
+    else if (c === 0x5b || c === 0x7b) { if (++depth > max) return true; } // [ {
+    else if (c === 0x5d || c === 0x7d) depth--; // ] }
   }
   return false;
 }
@@ -64,12 +68,14 @@ function createApp({ db = openDb(config.dbPath) } = {}) {
 
   // Keep the raw body: request signatures are computed over the exact bytes sent. Only routes that carry
   // integrity reports, match logs or manifests may send large bodies.
-  const verify = (req, _res, buf) => { req.rawBody = buf.toString('utf8'); };
+  // No body of this API nests deeper than a few levels; deeper ones are refused before they are parsed.
+  const verify = (req, _res, buf) => {
+    if (jsonTooDeep(buf, 32)) throw Object.assign(new Error('JSON nested too deeply'), { status: 400, type: 'entity.too.deep' });
+    req.rawBody = buf.toString('utf8');
+  };
   app.use(['/api/integrity/report', '/api/matches/:id/report', '/api/admin/baselines', '/api/admin/mods'],
     express.json({ limit: '4mb', verify }));
   app.use(express.json({ limit: '64kb', verify }));
-  // No body of this API nests deeper than a few levels.
-  app.use((req, _res, next) => next(tooDeep(req.body, 32) ? new tournaments.HttpError(400, 'JSON nested too deeply') : undefined));
   app.use((req, res, next) => {
     res.set('X-Content-Type-Options', 'nosniff');
     res.set('Referrer-Policy', 'no-referrer');
@@ -157,4 +163,4 @@ function createApp({ db = openDb(config.dbPath) } = {}) {
   return app;
 }
 
-module.exports = { createApp, rateLimiter, clientKey, tooDeep };
+module.exports = { createApp, rateLimiter, clientKey, jsonTooDeep };

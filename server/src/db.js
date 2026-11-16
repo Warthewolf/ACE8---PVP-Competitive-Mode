@@ -1,5 +1,6 @@
 'use strict';
 const { DatabaseSync } = require('node:sqlite');
+const { canonPath } = require('./integrity');
 
 const SCHEMA = `
 PRAGMA journal_mode = WAL;
@@ -170,8 +171,8 @@ function migrate(db) {
     if (!cols.includes(col)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${def}`);
   }
   rekeyApprovedMods(db);
-  // The backfills below only touch rows that still lack the value, so they also repair databases that an
-  // earlier release had already upgraded without them.
+  // The backfills below only touch rows that still lack (or contradict) the value, so they also repair
+  // databases that an earlier release had already upgraded.
   // Queue entries keep their build: it is the build of the scan they joined with.
   db.exec(`UPDATE queue SET game_version = COALESCE((SELECT game_version FROM integrity_reports r WHERE r.id = queue.integrity_id), '')
     WHERE game_version = ''`);
@@ -195,25 +196,50 @@ function migrate(db) {
     if (Array.isArray(flags) && !flags.length && ra?.self && rb?.self) setKd.run(int(ra.self.kills), int(ra.self.deaths), int(rb.self.kills), int(rb.self.deaths), m.id);
     else setKd.run(int(m.score_a), int(m.score_b), int(m.score_b), int(m.score_a), m.id);
   }
+  // A verified match that carries a dispute flag was settled by an admin, and every release credited such a
+  // settle from the scores. One earlier upgrade filled these from the logs instead: put the scores back.
+  for (const m of db.prepare("SELECT * FROM matches WHERE state = 'verified' AND flags != '[]'").all()) {
+    const flags = parse(m.flags);
+    if (!Array.isArray(flags) || !flags.some((f) => !['no_reports', 'missing_opponent_report'].includes(f?.code))) continue;
+    const want = [int(m.score_a), int(m.score_b), int(m.score_b), int(m.score_a)];
+    if ([m.kills_a, m.deaths_a, m.kills_b, m.deaths_b].some((v, i) => v !== want[i])) setKd.run(...want, m.id);
+  }
+  // Draws: the first release verified draws but had no draws column, and the column was added without a
+  // backfill. A pilot's draws are exactly their verified matches without a winner.
+  const draws = new Map();
+  for (const m of db.prepare("SELECT player_a, player_b FROM matches WHERE state = 'verified' AND winner IS NULL").all()) {
+    for (const id of [m.player_a, m.player_b]) draws.set(id, (draws.get(id) || 0) + 1);
+  }
+  const setDraws = db.prepare('UPDATE players SET draws = ? WHERE id = ?');
+  for (const p of db.prepare('SELECT id, draws FROM players').all()) {
+    const n = draws.get(p.id) || 0;
+    if (p.draws !== n) setDraws.run(n, p.id);
+  }
 }
 
 // Releases before per-build rows keyed approved files by (path, sha256), so a file shared by two builds was
-// moved to whichever build was uploaded last. Rebuild the table with one row per (name, version, path).
-// Rows that collide under the new key (same file path pinned twice for one build) keep their own pseudo-build
-// "<version>#<id>". Builds that already lost shared files must be uploaded again.
+// moved to whichever build was uploaded last, and stored paths kept whatever spelling the admin typed. Rebuild
+// the table with one row per (name, version, path) and paths in the form the scan compares.
+// Rows that land on the same (name, version, path) slot: the slot goes to the row that counts most (required,
+// then cosmetic, then retired; then the newest). Each other row keeps its file known as a pseudo-build
+// "<version>#<id>", and a required one is retired there, so a pseudo-build is never a required build.
+// Builds that had already lost shared files must be uploaded again (see README).
 function rekeyApprovedMods(db) {
   const keys = db.prepare("PRAGMA index_list('approved_mods')").all().filter((i) => i.unique)
     .map((i) => db.prepare(`PRAGMA index_info('${i.name.replace(/'/g, "''")}')`).all().map((c) => c.name).join(','));
-  if (keys.includes('name,version,path')) return;
+  const rows = db.prepare('SELECT * FROM approved_mods').all();
+  if (keys.includes('name,version,path') && rows.every((r) => canonPath(r.path) === r.path)) return;
+  const rank = { required: 2, cosmetic: 1, retired: 0 };
+  rows.sort((a, b) => (rank[b.category] ?? 0) - (rank[a.category] ?? 0) || b.id - a.id);
   db.exec('BEGIN IMMEDIATE');
   try {
-    const rows = db.prepare('SELECT * FROM approved_mods ORDER BY id').all();
     db.exec('DROP TABLE approved_mods');
     db.exec(SCHEMA.slice(SCHEMA.indexOf('CREATE TABLE IF NOT EXISTS approved_mods'), SCHEMA.indexOf('CREATE TABLE IF NOT EXISTS integrity_reports')));
     const ins = db.prepare('INSERT OR IGNORE INTO approved_mods (id, name, path, size, sha256, category, version) VALUES (?, ?, ?, ?, ?, ?, ?)');
     for (const r of rows) {
-      if (!ins.run(r.id, r.name, r.path, r.size, r.sha256, r.category, r.version).changes) {
-        ins.run(r.id, r.name, r.path, r.size, r.sha256, r.category, `${r.version}#${r.id}`);
+      const p = canonPath(r.path);
+      if (!ins.run(r.id, r.name, p, r.size, r.sha256, r.category, r.version).changes) {
+        ins.run(r.id, r.name, p, r.size, r.sha256, r.category === 'required' ? 'retired' : r.category, `${r.version}#${r.id}`);
       }
     }
     db.exec('COMMIT');

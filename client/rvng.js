@@ -122,15 +122,16 @@ function cmdBaseline(a) {
 function cmdApprove(a) {
   const rel = a.path || a.dir;
   if (!rel || !a.name) throw new Error('--path <file or folder under the game root> and --name required');
-  const sub = String(rel).replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+  // As the server stores it: forward slashes, no leading "./" or "/", no doubled or trailing slashes.
+  const canon = (x) => String(x).replace(/\\/g, '/').replace(/\/{2,}/g, '/').replace(/^(\.?\/)+/, '').replace(/\/+$/, '');
+  const sub = canon(rel);
   const category = a.category || 'cosmetic';
   if (!['required', 'cosmetic', 'retired'].includes(category)) throw new Error('--category must be required, cosmetic or retired');
   const version = a.version === undefined ? '' : String(a.version);
   // Folders inside this one that belong to another mod (Project RVNG inside the loader's Mods folder), given
   // relative to --path or to the game root. Each mod's files are approved separately.
   if (a.exclude === true) throw new Error('--exclude needs a folder, for example --exclude Mods/ProjectRVNG');
-  const excludes = [].concat(a.exclude ?? []).flatMap((x) => String(x).split(','))
-    .map((x) => x.trim().replace(/\\/g, '/').replace(/^\/+|\/+$/g, '')).filter(Boolean)
+  const excludes = [].concat(a.exclude ?? []).flatMap((x) => String(x).split(',')).map((x) => canon(x.trim())).filter(Boolean)
     .map((x) => (x.toLowerCase().startsWith(sub.toLowerCase() + '/') ? x : `${sub}/${x}`).toLowerCase());
   const full = path.join(a.game, sub);
   const st = fs.lstatSync(full);
@@ -140,10 +141,14 @@ function cmdApprove(a) {
     : scan(full, { useCache: false, excludes: [] });
   const links = all.filter((f) => f.size < 0);
   if (links.length) throw new Error(`links cannot be approved: ${links.map((f) => f.path).join(', ')}`);
+  const inside = (f, x) => f.path.toLowerCase() === x || f.path.toLowerCase().startsWith(x + '/');
+  const listed = all.map((f) => ({ ...f, path: f.path ? `${sub}/${f.path}` : sub }));
+  // An exclude that matches nothing is a typo: the other mod's files would be pinned into this one.
+  const unused = excludes.filter((x) => !listed.some((f) => inside(f, x)));
+  if (unused.length) throw new Error(`--exclude matched no files: ${unused.join(', ')}`);
+  const files = listed.filter((f) => !excludes.some((x) => inside(f, x)));
   // Files the players' scanner never reports (logs, crash dumps) cannot be pinned: a pinned file that is never
   // reported would reject everyone, and UE4SS rewrites its log on every launch anyway.
-  const files = all.map((f) => ({ ...f, path: f.path ? `${sub}/${f.path}` : sub }))
-    .filter((f) => !excludes.some((x) => f.path.toLowerCase() === x || f.path.toLowerCase().startsWith(x + '/')));
   const skipped = files.filter((f) => excluded(f.path, DEFAULT_EXCLUDES));
   const mods = files.filter((f) => !excluded(f.path, DEFAULT_EXCLUDES))
     .map((f) => ({ name: a.name, version, path: f.path, size: f.size, sha256: f.sha256, category }));
@@ -180,8 +185,8 @@ function createBridge({ creds, game, region, noCache = false, call = (m, p, b) =
   // with no repeat still pending) goes back to where the server has this pilot.
   const fail = (e) => {
     const transient = last.state === 'scanning' || (last.state === 'waiting' && !retryQueue);
-    if (transient) setState(current.state, { ...(current.match ? { match: current.match } : {}), message: last.message, error: e.message });
-    else setState(last.state, { ...last, error: e.message });
+    if (transient) show(current); // with that state's own message, not the stale "Scanning again in ..."
+    setState(last.state, { ...last, error: e.message });
   };
 
   // Rejections of the content itself. Everything else (network errors, 401 from a skewed clock, 408, 429,

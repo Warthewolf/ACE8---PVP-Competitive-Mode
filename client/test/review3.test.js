@@ -41,6 +41,7 @@ test('bridge: cancelling during a scan back-off while the server is down does no
     await assert.rejects(bridge.tick(), /unavailable/);
     bridge.fail(httpError(503, 'server unavailable'));
     assert.equal(state().state, 'idle', 'nothing is pending any more');
+    assert.equal(state().message, 'Ready', 'no stale "Scanning again in ..."');
     assert.match(state().error, /unavailable/);
   } finally { fs.rmSync(game, { recursive: true }); }
 });
@@ -57,5 +58,9 @@ test('rvng approve --exclude leaves another mod\'s folder out of a loader approv
     const full = cmdApprove({ game, path: ue, name: 'UE4SS', exclude: `${ue}/mods/projectrvng,Mods/ProjectRVNGExtra`, out }).mods;
     assert.deepEqual(full.map((m) => m.path).sort(), [`${ue}/Mods/mods.txt`, `${ue}/UE4SS-settings.ini`, `${ue}/UE4SS.dll`], 'game-root paths and lists work too');
     assert.throws(() => cmdApprove({ game, path: ue, name: 'UE4SS', exclude: true, out }), /--exclude needs a folder/);
+    // PowerShell tab completion gives .\ACE8\...\ue4ss\ ; an exclude given from the game root still applies.
+    const tab = cmdApprove({ game, path: `.\\${ue.replace(/\//g, '\\')}\\`, name: 'UE4SS', exclude: `${ue}/Mods/ProjectRVNG,Mods/ProjectRVNGExtra`, out }).mods;
+    assert.deepEqual(tab.map((m) => m.path).sort(), [`${ue}/Mods/mods.txt`, `${ue}/UE4SS-settings.ini`, `${ue}/UE4SS.dll`]);
+    assert.throws(() => cmdApprove({ game, path: ue, name: 'UE4SS', exclude: 'Mods/ProjectRVGN', out }), /--exclude matched no files: .*projectrvgn/);
   } finally { console.log = log; fs.rmSync(game, { recursive: true }); }
 });

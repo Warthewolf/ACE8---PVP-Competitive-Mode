@@ -46,6 +46,10 @@ const STAT_TOLERANCE = 0.005;
 // such as the Kelvin sign (U+212A) into "k", letting a second, unloaded copy of a file share its key.
 const norm = (p) => String(p).replace(/\\/g, '/').replace(/^\.\//, '').replace(/[A-Z]/g, (c) => c.toLowerCase());
 
+// How approved mod paths are stored: like norm(), and also without leading "/" or "./", doubled or trailing
+// slashes, so every way an admin can type a path names the same file.
+const canonPath = (p) => norm(String(p).replace(/\\/g, '/').replace(/\/{2,}/g, '/').replace(/^(\.?\/)+/, '').replace(/\/+$/, ''));
+
 const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const isFileRecord = (f) => Number.isSafeInteger(f.size) && f.size >= 0 && /^[0-9a-f]{64}$/.test(f.sha256);
 
@@ -236,4 +240,4 @@ function evaluate(report, baseline, approved) {
   return { verdict, findings, mods, manifestHash };
 }
 
-module.exports = { evaluate, compareAircraft, classifyUnknown, norm, isPlainObject, STAT_TOLERANCE, SEVERITY };
+module.exports = { evaluate, compareAircraft, classifyUnknown, norm, canonPath, isPlainObject, STAT_TOLERANCE, SEVERITY };

@@ -511,6 +511,7 @@ function setBaselineActive(db, gameVersion, active) {
 }
 
 const MOD_CATEGORIES = ['required', 'cosmetic', 'retired'];
+const { canonPath } = integrity;
 
 function addOneMod(db, m) {
   if (!isPlainObject(m)) throw new HttpError(400, 'each mod must be an object');
@@ -520,15 +521,31 @@ function addOneMod(db, m) {
     throw new HttpError(400, 'name, path, size, sha256 required');
   }
   if (!MOD_CATEGORIES.includes(category)) throw new HttpError(400, 'category must be required, cosmetic or retired');
-  if (typeof version !== 'string' || version.length > 64) throw new HttpError(400, 'version must be a string of up to 64 characters');
+  if (typeof version !== 'string' || version.length > 64 || version.includes('#')) {
+    throw new HttpError(400, 'version must be a string of up to 64 characters without #');
+  }
+  // Stored the way the scan compares paths (forward slashes, ASCII lower case), so two spellings of one file
+  // are one file here too.
+  const p = canonPath(path);
+  if (!p || p.split('/').some((seg) => seg === '.' || seg === '..')) throw new HttpError(400, 'path must name a file under the game root');
+  const sha = hash.toLowerCase();
   // A file belongs to one mod. A loader folder approved with another mod inside it would make the loader's
   // build require that mod's files too, and one of the two could then never be updated.
-  const other = db.prepare("SELECT name FROM approved_mods WHERE path = ? AND name != ? AND category != 'retired' LIMIT 1").get(path, name);
-  if (other) throw new HttpError(409, `${path} is already pinned by the mod "${other.name}": approve each mod's files separately (rvng approve --exclude)`);
+  const other = db.prepare("SELECT id, name, version FROM approved_mods WHERE path = ? AND name != ? AND category != 'retired' LIMIT 1").get(p, name);
+  if (other) {
+    throw new HttpError(409, `${p} is already pinned by the mod "${other.name}" version "${other.version}" (id ${other.id}). Approve each mod's files `
+      + `separately (rvng approve --exclude); if that build should not contain this file, retire it (POST /api/admin/mods/retire) and upload it again without the file`);
+  }
+  // Approving a build again with a different file: the earlier pinned file stays known as a retired row, so a
+  // pilot who installed it is told to update instead of being flagged for a tampered mod.
+  const cur = db.prepare('SELECT * FROM approved_mods WHERE name = ? AND version = ? AND path = ?').get(name, version, p);
+  if (cur && (cur.sha256 !== sha || Number(cur.size) !== size)) {
+    db.prepare("UPDATE approved_mods SET version = ?, category = 'retired' WHERE id = ?").run(`${version}#${cur.id}`, cur.id);
+  }
   // Each build keeps its own row for every file, also for files it shares with another build.
   db.prepare(`INSERT INTO approved_mods (name, path, size, sha256, category, version) VALUES (?, ?, ?, ?, ?, ?)
-    ON CONFLICT (name, version, path) DO UPDATE SET size = excluded.size, sha256 = excluded.sha256, category = excluded.category`)
-    .run(name, path, size, hash.toLowerCase(), category, version);
+    ON CONFLICT (name, version, path) DO UPDATE SET category = excluded.category`)
+    .run(name, p, size, sha, category, version);
 }
 
 // Body is one mod file, or { mods: [...] } for a whole folder (see `rvng approve`).

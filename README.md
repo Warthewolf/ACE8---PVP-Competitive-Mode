@@ -50,11 +50,16 @@ curl -X POST "$SERVER/api/admin/baselines/1.0.1/active" -H "Authorization: Beare
 #    builds pass while players update (each build lists all of its files, also those it shares with the other).
 #    Then retire the old build. Pilots who still have it are told to update (outdated_mod) and are not
 #    flagged. To roll back a bad release, retire the new build instead. Do not purge old builds: a purged
-#    build reads as a tampered mod.
+#    build reads as a tampered mod. Approving a build again with a changed file keeps the earlier file known
+#    as retired, but a new --version for every changed release keeps the history readable.
 curl -X POST "$SERVER/api/admin/mods/retire" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'content-type: application/json' -d '{"name":"Project RVNG","version":"1.0"}'
 ```
 
-Upgrading a server from an earlier release: the earlier releases kept one row per approved file, so a file that two builds shared ended up in only one of them. After the upgrade, approve and upload every current build once more.
+Upgrading a server from an earlier release: the earlier releases kept one row per approved file, so a file that two builds shared ended up in only one of them. After the upgrade:
+
+1. Approve and upload every current build once more, as in step 2.
+2. If an upload is refused because another mod already pins a file (a loader approved, under an older release, together with the competitive mod inside it), the message names that build. Retire it, then upload it again with `--exclude Mods/ProjectRVNG`, then upload the competitive mod.
+3. Builds approved before versions existed have the version `""` (see `GET /api/admin/mods`). Once they are uploaded again under a version, retire the version-less ones: `POST /api/admin/mods/retire` with `{"name":"UE4SS"}` and `{"name":"Project RVNG"}`. Otherwise they keep passing after you retire the versioned build.
 
 Behind a reverse proxy, start the server with `TRUST_PROXY=1` (the number of proxy hops) or the proxy addresses (`TRUST_PROXY="loopback, 10.0.0.0/8"`) so the per-client sign-up limit sees real client addresses. `TRUST_PROXY=true` is refused: with a proxy that appends to `X-Forwarded-For`, every client could pick its own address.
 

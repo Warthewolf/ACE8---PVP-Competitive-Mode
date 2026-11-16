@@ -8,7 +8,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { setup, log, mirror, queuePair, pub, BASE_FILES, MOD_FILE, AIRCRAFT, H, config } = require('./helpers');
 const { openDb } = require('../src/db');
-const { clientKey, tooDeep } = require('../src/app');
+const { clientKey, jsonTooDeep } = require('../src/app');
 const { signedHeaders } = require('../../client/lib/sign');
 const svc = require('../src/service');
 
@@ -108,7 +108,7 @@ test('mod builds keep their own files: shared files, add-only releases, rollback
     await assert.rejects(env.admin('POST', '/api/admin/mods', { mods: [{ name: 'UE4SS', version: '3.0.4', category: 'required', ...MOD_FILE }] }),
       rejectsWith(409, /already pinned by the mod "Project RVNG".*--exclude/));
     const rows = await env.admin('GET', '/api/admin/mods');
-    assert.equal(rows.filter((m) => m.path === ini.path).length, 3, 'each build lists the shared file');
+    assert.equal(rows.filter((m) => m.path === ini.path.toLowerCase()).length, 3, 'each build lists the shared file');
   } finally { await env.close(); }
 });
 
@@ -226,9 +226,9 @@ test('upgrade: admin-settled K/D, old approved builds and databases an earlier r
     assert.deepEqual(kd('m_auto'), { kills_a: 2, deaths_a: 2, kills_b: 1, deaths_b: 2 }, 'what the logs credited');
     assert.equal(db.prepare("SELECT game_version FROM matches WHERE id = 'm_open'").get().game_version, '1.0.0');
     const hud = db.prepare("SELECT size, version FROM approved_mods WHERE name = 'HUD' ORDER BY id").all().map((r) => ({ ...r }));
-    assert.deepEqual(hud, [{ size: 7, version: '' }, { size: 8, version: '#2' }], 'both approved files are kept');
+    assert.deepEqual(hud, [{ size: 7, version: '#1' }, { size: 8, version: '' }], 'both approved files are kept, the newest in the build');
     svc.addApprovedMods(db, { mods: [{ name: 'Project RVNG', version: '1.1', category: 'required', ...MOD_FILE }] });
-    assert.equal(db.prepare('SELECT COUNT(*) c FROM approved_mods WHERE path = ?').get(MOD_FILE.path).c, 2, 'a second build can list the same file');
+    assert.equal(db.prepare('SELECT COUNT(*) c FROM approved_mods WHERE path = ?').get(MOD_FILE.path.toLowerCase()).c, 2, 'a second build can list the same file');
 
     const p = (id) => db.prepare('SELECT kills, deaths FROM players WHERE id = ?').get(id);
     svc.resolveDispute(db, 'm_admin', { void: true });
@@ -247,8 +247,8 @@ test('client keys: IPv6 prefixes with a compressed zero run, IPv4-mapped forms, 
   assert.equal(clientKey('::ffff:c633:6407'), '198.51.100.7');
   assert.equal(clientKey('64:ff9b::1.2.3.4'), '64:ff9b:0:0::/64');
   for (const junk of ['x'.repeat(5000), '1.2.3.4, 5.6.7.8', '', undefined]) assert.equal(clientKey(junk), null);
-  assert.equal(tooDeep({ a: [1, { b: 2 }] }, 3), false);
-  assert.equal(tooDeep({ a: [1, { b: [] }] }, 3), true);
+  const deep = (t) => jsonTooDeep(Buffer.from(t), 3);
+  assert.deepEqual(['{"a":[1,{"b":2}]}', '{"a":[1,{"b":[]}]}', '{"a":"[[[[{{{{\\"[[[["}', '["\\\\",[[[]]]]'].map(deep), [false, true, false, true]);
 });
 
 test('behind a proxy, a forwarded value that is not an address falls back to the connection address', async () => {
