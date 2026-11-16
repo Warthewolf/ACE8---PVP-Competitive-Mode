@@ -81,7 +81,7 @@ test('the "pinned by another mod" check sees every spelling of a path, and its m
     const p = MOD_FILE.path;
     for (const spelling of [`./${p}`, p.toLowerCase(), `.\\${p.replace(/\//g, '\\')}`, `/${p}`, p.replace('/Mods/', '//Mods/')]) {
       await assert.rejects(env.admin('POST', '/api/admin/mods', { mods: [{ name: 'UE4SS', version: '3.0.1', category: 'required', ...MOD_FILE, path: spelling }] }),
-        rejectsWith(409, /already pinned by "Project RVNG" version "" \(id (\d+)\).*DELETE \/api\/admin\/mods\/\1\b.*--exclude/), spelling);
+        rejectsWith(409, /a file is already pinned by another mod: .* by "Project RVNG" version "" \(id (\d+)\).*"ids":\[\1\].*--exclude/), spelling);
     }
     await assert.rejects(env.admin('POST', '/api/admin/mods', { name: 'X', ...MOD_FILE, path: 'ACE8/../x.pak' }), rejectsWith(400));
 

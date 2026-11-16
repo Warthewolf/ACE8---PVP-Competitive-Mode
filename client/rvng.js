@@ -136,7 +136,9 @@ function cmdBaseline(a) {
 function cmdApprove(a) {
   const rel = a.path || a.dir;
   if (!rel || rel === true || !a.name || a.name === true) throw new Error('--path <file or folder under the game root> and --name required');
-  for (const k of ['version', 'category', 'out']) if (a[k] === true) throw new Error(`--${k} needs a value (use --version "" for a version-less build)`);
+  for (const k of ['version', 'category', 'out']) {
+    if (a[k] === true) throw new Error(`--${k} needs a value${k === 'version' ? ' (use --version "" for a version-less build)' : ''}`);
+  }
   // As the server stores it: forward slashes, no leading "./" or "/", no doubled or trailing slashes.
   const canon = (x) => String(x).replace(/\\/g, '/').replace(/\/{2,}/g, '/').replace(/^(\.?\/)+/, '').replace(/\/+$/, '');
   const subs = [...new Set(String(rel).split(',').map((x) => canon(x.trim())).filter(Boolean))];
@@ -182,12 +184,15 @@ function cmdApprove(a) {
   if (!a.out && fs.existsSync(out)) {
     const prev = (() => { try { return JSON.parse(fs.readFileSync(out, 'utf8')); } catch { return null; } })();
     const held = Array.isArray(prev?.roots) ? prev.roots : Array.isArray(prev?.mods) ? prev.mods.map((m) => m?.path) : [prev?.path];
-    const outside = held.filter((x) => typeof x !== 'string' || !subs.some((r) => {
+    if (!held.length || held.some((x) => typeof x !== 'string' || !x)) {
+      throw new Error(`${out} exists but is not an approval this tool can read: delete it, or pass --out`);
+    }
+    const outside = held.filter((x) => !subs.some((r) => {
       const [h, rr] = [canon(x).toLowerCase(), r.toLowerCase()];
       return h === rr || h.startsWith(rr + '/');
     }));
-    if (!held.length || outside.length) {
-      const what = Array.isArray(prev?.roots) ? prev.roots.join(', ') : `${outside.length || 'unreadable'} file(s) outside ${subs.join(', ')}`;
+    if (outside.length) {
+      const what = Array.isArray(prev.roots) ? prev.roots.join(', ') : `${outside.length} file(s) outside ${subs.join(', ')}`;
       throw new Error(`${out} already holds an approval of ${what}: upload it and delete it first, `
         + 'approve all paths of the build in one --path list, or pass --out');
     }
@@ -286,8 +291,33 @@ function createBridge({ creds, game, region, noCache = false, call = (m, p, b) =
     }
   }
 
+  // The finished match's log. A late log of an earlier match while another match is on screen leaves that match
+  // on screen (the mod acts only on 'matched'), so its room is still created or joined.
+  async function sendResult() {
+    const result = readJson(file('result.json'));
+    if (!result) return;
+    const safeId = String(result.matchId || 'unknown').replace(/[^A-Za-z0-9_-]/g, '');
+    writeJson(path.join(dir, 'archive', `${safeId}.json`), result); // keep a copy before sending
+    const r = await submit('result.json', (d) => call('POST', `/api/matches/${encodeURIComponent(d.matchId)}/report`, d),
+      (e) => e.status === 409 && /already submitted/.test(e.message));
+    if (!r) return;
+    const sent = r.res ? `Result submitted (${r.res.state})` : 'Result already submitted';
+    if (['queued', 'matched'].includes(current.state) && current.match?.id !== String(r.data.matchId)) {
+      const now = current.state === 'matched' ? `Match ${current.match.id} (${current.match.state})` : 'Searching for opponent';
+      setState(current.state, { ...(current.match ? { match: current.match } : {}), message: `${sent} for ${String(r.data.matchId)}; ${now}` });
+    } else {
+      current = { state: 'reported' };
+      setState('reported', { match: r.res, message: sent });
+    }
+  }
+
   async function tick() {
     if (unsynced && Date.now() >= unsynced.at) await resync('Reconnected');
+    // A pending log goes before a new queue request: it can settle a match the server holds open, which decides
+    // where the pilot is queued (a game a late log settles reopens the event series for its next game), and a
+    // rejected scan in this tick must stay on screen. A log that cannot be sent now does not hold up the queue.
+    let resultError = null;
+    await sendResult().catch((e) => { resultError = e; });
     const reqF = file('request.json');
     let req = readJson(reqF);
     if (req) { fs.rmSync(reqF, { force: true }); retryQueue = null; } // one-shot UI actions; a new one replaces a pending retry
@@ -308,26 +338,7 @@ function createBridge({ creds, game, region, noCache = false, call = (m, p, b) =
     // A 409 on the lobby means the room was already posted (the earlier response was lost).
     await submit('lobby.json', (l) => call('POST', `/api/matches/${encodeURIComponent(l.matchId)}/lobby`, { lobbyCode: l.lobbyCode }),
       (e) => e.status === 409);
-
-    const result = readJson(file('result.json'));
-    if (result) {
-      const safeId = String(result.matchId || 'unknown').replace(/[^A-Za-z0-9_-]/g, '');
-      writeJson(path.join(dir, 'archive', `${safeId}.json`), result); // keep a copy before sending
-      const r = await submit('result.json', (d) => call('POST', `/api/matches/${encodeURIComponent(d.matchId)}/report`, d),
-        (e) => e.status === 409 && /already submitted/.test(e.message));
-      if (r) {
-        const sent = r.res ? `Result submitted (${r.res.state})` : 'Result already submitted';
-        // A late log of an earlier match, sent in the same tick that queued or matched the pilot again: the new
-        // match stays on screen (the mod acts only on 'matched'), so its room is still created or joined.
-        if (['queued', 'matched'].includes(current.state) && current.match?.id !== String(r.data.matchId)) {
-          const now = current.state === 'matched' ? `Match ${current.match.id} (${current.match.state})` : 'Searching for opponent';
-          setState(current.state, { ...(current.match ? { match: current.match } : {}), message: `${sent} for ${String(r.data.matchId)}; ${now}` });
-        } else {
-          current = { state: 'reported' };
-          setState('reported', { match: r.res, message: sent });
-        }
-      }
-    }
+    if (resultError) throw resultError;
   }
 
   return { dir, tick, resync, fail, setState, current: () => current, last: () => last };

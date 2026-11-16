@@ -80,15 +80,15 @@ test('the 409 names every build that pins the file, and retiring those rows by i
     const rvng = { roots: [RVNG], mods: [{ name: 'Project RVNG', version: '1.1', category: 'required', ...MOD_FILE }] };
     const err = await env.admin('POST', '/api/admin/mods', rvng).catch((e) => e);
     assert.equal(err.status, 409);
-    for (const id of ids) assert.match(err.message, new RegExp(`DELETE /api/admin/mods/${id}\\b`));
+    assert.ok(err.message.includes(`POST /api/admin/mods/retire {"ids":[${ids.join(',')}]}`), err.message);
     assert.match(err.message, /version "" .*version "3\.0\.1"/);
-    assert.match(err.message, /If it belongs to the other mod, leave its folder out of this approval: add it to rvng approve --exclude/);
-    for (const id of ids) await env.admin('DELETE', `/api/admin/mods/${id}`);
+    assert.match(err.message, /If they belong to the other mod, leave its folder out of this approval: add it to rvng approve --exclude/);
+    await env.admin('POST', '/api/admin/mods/retire', { ids });
     await env.admin('POST', '/api/admin/mods', rvng);
     const pilot = await env.register('Swept001');
     assert.equal((await scan(pilot, env, { files: [...BASE_FILES, loader, MOD_FILE] })).verdict, 'clean', 'the loader builds no longer require the file');
     await assert.rejects(env.admin('POST', '/api/admin/mods', { mods: [{ name: 'UE4SS', version: '3.0.2', category: 'required', ...MOD_FILE }] }),
-      rejectsWith(409, /pinned by "Project RVNG" version "1\.1"/));
+      rejectsWith(409, /by "Project RVNG" version "1\.1"/));
   } finally { await env.close(); }
 });
 

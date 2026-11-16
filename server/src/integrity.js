@@ -144,7 +144,10 @@ function evaluate(report, baseline, approved) {
 
   // 2. Every extra file must be an approved mod, otherwise it is classified.
   const approvedByPath = new Map();
+  const buildRows = new Map(); // rows per (name, version): a "<version>#<id>" pseudo-build is a single row
   for (const m of approved) {
+    const b = JSON.stringify([m.name, String(m.version ?? '')]);
+    buildRows.set(b, (buildRows.get(b) || 0) + 1);
     const k = norm(m.path);
     if (!approvedByPath.has(k)) approvedByPath.set(k, []);
     approvedByPath.get(k).push(m);
@@ -170,7 +173,8 @@ function evaluate(report, baseline, approved) {
       const live = new Set(candidates.filter((m) => m.category !== 'retired').map((m) => m.name));
       const old = [...matching].sort((a, b) => (live.has(b.name) - live.has(a.name)) || ((b.id ?? 0) - (a.id ?? 0)))[0];
       const v = String(old.version || ''); const own = `#${old.id}`;
-      findings.push({ code: 'outdated_mod', severity: 'high', name: old.name, version: old.id != null && v.endsWith(own) ? v.slice(0, -own.length) : v, path });
+      const pseudo = old.id != null && v.endsWith(own) && buildRows.get(JSON.stringify([old.name, String(old.version ?? '')])) === 1;
+      findings.push({ code: 'outdated_mod', severity: 'high', name: old.name, version: pseudo ? v.slice(0, -own.length) : v, path });
       mods.push({ name: old.name, path, size: got.size, approved: false, outdated: true });
       continue;
     }

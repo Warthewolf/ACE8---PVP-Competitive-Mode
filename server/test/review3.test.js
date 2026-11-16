@@ -106,7 +106,7 @@ test('mod builds keep their own files: shared files, add-only releases, rollback
 
     // A loader folder approved together with the competitive mod inside it is refused.
     await assert.rejects(env.admin('POST', '/api/admin/mods', { mods: [{ name: 'UE4SS', version: '3.0.4', category: 'required', ...MOD_FILE }] }),
-      rejectsWith(409, /already pinned by "Project RVNG".*--exclude/));
+      rejectsWith(409, /already pinned by another mod: .* by "Project RVNG".*--exclude/));
     const rows = await env.admin('GET', '/api/admin/mods');
     assert.equal(rows.filter((m) => m.path === ini.path.toLowerCase()).length, 3, 'each build lists the shared file');
   } finally { await env.close(); }

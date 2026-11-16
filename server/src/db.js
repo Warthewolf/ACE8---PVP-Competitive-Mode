@@ -171,11 +171,13 @@ function migrate(db) {
     if (!cols.includes(col)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${def}`);
   }
   rekeyApprovedMods(db);
-  // A pseudo-build "<version>#<id>" (an earlier file kept known, named after its own row id) is never required.
-  // One release stored some as required, which let a one-file install pass. Uploads can no longer create "#"
-  // versions, but releases before that accepted them: a real build named "1.0#2" is left alone.
+  // A pseudo-build "<version>#<id>" (an earlier file kept known) is never required. It is always one row, named
+  // after its own row id. One release stored some as required, which let a one-file install pass. Uploads can no
+  // longer create "#" versions, but releases before that accepted them: a real build such as "1.0#2" or "1.0#5"
+  // has several rows (even when one of them is row 5) and is left alone.
   db.exec(`UPDATE approved_mods SET category = 'retired' WHERE category = 'required'
-    AND substr(version, -length('#' || id)) = '#' || id`);
+    AND substr(version, -length('#' || id)) = '#' || id
+    AND NOT EXISTS (SELECT 1 FROM approved_mods o WHERE o.name = approved_mods.name AND o.version = approved_mods.version AND o.id != approved_mods.id)`);
   // The backfills below only touch rows that still lack (or contradict) the value, so they also repair
   // databases that an earlier release had already upgraded.
   // Queue entries keep their build: it is the build of the scan they joined with.

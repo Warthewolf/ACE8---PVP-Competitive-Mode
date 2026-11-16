@@ -513,6 +513,20 @@ function setBaselineActive(db, gameVersion, active) {
 const MOD_CATEGORIES = ['required', 'cosmetic', 'retired'];
 const { canonPath } = integrity;
 
+// A file belongs to one mod. Refusing an upload names every file of it that another mod pins, and both ways out:
+// an older approval of the other mod swept this mod's files in (retire those rows, all in one call, then upload
+// again), or this upload holds the other mod's folder (leave it out of this approval).
+function pinnedConflict(name, rows) {
+  const ids = [...new Set(rows.map((o) => o.id))].sort((a, b) => a - b);
+  const shown = rows.slice(0, 10).map((o) => `${o.path} by "${o.name}" version "${o.version}" (id ${o.id})`).join('; ')
+    + (rows.length > 10 ? `; and ${rows.length - 10} more` : '');
+  return new HttpError(409, `${rows.length === 1 ? 'a file is' : `${rows.length} files are`} already pinned by another mod: ${shown}. `
+    + `A file belongs to one mod. If these are part of "${name}" (an older approval swept them into the other build), retire them there `
+    + `in one call, POST /api/admin/mods/retire {"ids":[${ids.join(',')}]}, then upload this again right away (pilots who scan in between `
+    + 'are told to update, never flagged). If they belong to the other mod, leave its folder out of this approval: add it to rvng approve --exclude');
+}
+const PINNED_SQL = `SELECT id, name, version, path FROM approved_mods WHERE path = ? AND name != ? AND category != 'retired' ORDER BY id`;
+
 function addOneMod(db, m) {
   if (!isPlainObject(m)) throw new HttpError(400, 'each mod must be an object');
   const { name, path, size, sha256: hash, category = 'cosmetic', version = '' } = m;
@@ -530,19 +544,10 @@ function addOneMod(db, m) {
   if (!p || p.split('/').some((seg) => seg === '.' || seg === '..')) throw new HttpError(400, 'path must name a file under the game root');
   const sha = hash.toLowerCase();
   // A file belongs to one mod. A loader folder approved with another mod inside it would make the loader's
-  // build require that mod's files too, and one of the two could then never be updated.
-  // The message covers both ways this happens: an older approval of the other mod swept this mod's files in
-  // (retire them there, one row at a time, without approving that build again), or this upload holds the other
-  // mod's folder (leave it out of this approval).
-  const others = db.prepare(`SELECT id, name, version FROM approved_mods WHERE path = ? AND name != ? AND category != 'retired'
-    ORDER BY id LIMIT 10`).all(p, name);
-  if (others.length) {
-    const who = others.map((o) => `"${o.name}" version "${o.version}" (id ${o.id})`).join(', ');
-    const ids = others.map((o) => `DELETE /api/admin/mods/${o.id}`).join(', ');
-    throw new HttpError(409, `${p} is already pinned by ${who}. A file belongs to one mod. If it is part of "${name}" (an older approval `
-      + `swept it into the other build), retire it from there with ${ids}, then upload this again. If it belongs to the other mod, leave its `
-      + 'folder out of this approval: add it to rvng approve --exclude');
-  }
+  // build require that mod's files too, and one of the two could then never be updated. (addApprovedMods checks
+  // the whole upload first; this catches two names for one path within an upload.)
+  const others = db.prepare(PINNED_SQL).all(p, name);
+  if (others.length) throw pinnedConflict(name, others);
   // Approving a build again with a different file: the earlier pinned file stays known as a retired row, so a
   // pilot who installed it is told to update instead of being flagged for a tampered mod.
   const cur = db.prepare('SELECT * FROM approved_mods WHERE name = ? AND version = ? AND path = ?').get(name, version, p);
@@ -571,6 +576,14 @@ function addApprovedMods(db, body = {}) {
   }
   const under = (p) => roots.some((r) => p === r || p.startsWith(r + '/'));
   tx(db, () => {
+    const pinned = db.prepare(PINNED_SQL);
+    const clash = []; let who = null;
+    for (const m of list) {
+      if (!isPlainObject(m) || typeof m.path !== 'string' || typeof m.name !== 'string') continue; // refused by addOneMod
+      const rows = pinned.all(canonPath(m.path), m.name);
+      if (rows.length) { clash.push(...rows); who ??= m.name; }
+    }
+    if (clash.length) throw pinnedConflict(who, clash);
     if (roots) {
       if (list.some((m) => !isPlainObject(m) || typeof m.path !== 'string' || !under(canonPath(m.path)))) {
         throw new HttpError(400, 'every file must be an object whose path is under one of the roots');
@@ -608,8 +621,20 @@ function removeApprovedMod(db, id, { purge = false } = {}) {
 }
 
 // Retire every file of one build of a mod (for example the previous release of Project RVNG or UE4SS). Files
-// the build shares with another build stay approved through that build's rows.
-function retireMods(db, { name, version = '' } = {}) {
+// the build shares with another build stay approved through that build's rows. `ids` retires those rows (the
+// files an older approval swept into another mod's build, as the upload's 409 lists them), all or none.
+function retireMods(db, { name, version = '', ids } = {}) {
+  if (ids !== undefined) {
+    if (!Array.isArray(ids) || !ids.length || ids.length > 5000 || ids.some((i) => !Number.isSafeInteger(i) || i < 1)) {
+      throw new HttpError(400, 'ids must list 1-5000 approved file ids');
+    }
+    return tx(db, () => {
+      const st = db.prepare("UPDATE approved_mods SET category = 'retired' WHERE id = ?");
+      const missing = ids.filter((i) => !st.run(i).changes);
+      if (missing.length) throw new HttpError(404, `approved files not found: ${missing.slice(0, 20).join(', ')}`);
+      return listApprovedMods(db);
+    });
+  }
   if (typeof name !== 'string' || !name || typeof version !== 'string') throw new HttpError(400, 'name (and optional version) required');
   const r = db.prepare("UPDATE approved_mods SET category = 'retired' WHERE name = ? AND version = ?").run(name, version);
   if (!r.changes) throw new HttpError(404, 'no approved files for that name and version');
