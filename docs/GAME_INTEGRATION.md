@@ -10,28 +10,34 @@ So the competitive mode has to drive the game's existing private/custom-room or 
 
 ## What the mod needs (all placeholders in `mod/ProjectRVNG/Scripts/main.lua`)
 
+Every game-specific call goes through the `GAME` adapter table at the top of `main.lua`, and every hook path is in `HOOKS`. The rest of the mod (bridge files, per-match join/retry logic, logging, stat sampling) is tested with stubs in `mod/test/`.
+
 The mod targets [UE4SS](https://github.com/UE4SS-RE/RE-UE4SS), the usual Lua/C++ scripting framework for UE4/UE5 games. Once UE4SS is injected into AC8, use its Live View and object dump to find:
 
 | Need | Placeholder | Notes |
 |---|---|---|
 | Main-menu entry | `HOOKS.MainMenuConstruct` | Add a "COMPETITIVE 1v1" button that calls `requestQueue()`. F8/F9 keybinds work until then. |
-| Create / join private room | `CreatePrivateRoom`, `JoinPrivateRoom` | Host creates the room and writes `lobby.json`; guest joins by code. Apply `match.rules` (time limit, kill target, 2 slots, special weapons). |
-| Match start / end | `MatchStart`, `MatchEnd` | Opens and closes the match log and maps the end reason. |
-| Kills / deaths / weapons | `AircraftDestroyed`, `WeaponFired`, `DamageApplied` | Plus `isLocal(pawn)` to tell the local pilot from the opponent. |
-| Aircraft flight parameters | `AIRCRAFT_PARAM_CLASS`, `STAT_PROPS` | Read live for the stat-tamper check. The same values (from a clean game) go into the admin baseline `aircraft` table. |
-| Aircraft speed sampling | `LoopAsync` TODO | Fills `telemetry.selfMaxSpeed` / `opponentMaxSpeed`. |
-| Game build string | `GAME_VERSION` | Must match the baseline `gameVersion`. |
+| Create / join private room | `GAME.createRoom(rules)`, `GAME.joinRoom(code)` | Host creates the room (retried every 5 s until it returns an id) and writes `lobby.json`; the guest joins each match's room once. Apply `match.rules` (time limit, kill target, 2 slots, special weapons). |
+| Match start / end | `HOOKS.MatchStart`, `HOOKS.MatchEnd`, `GAME.endReason(ctx)` | Opens and closes the match log. The end reason must be the real one: the server checks it against the rules and the opponent's log. |
+| Kills / deaths | `HOOKS.AircraftDestroyed`, `HOOKS.DamageApplied` | Kills are credited to the last pilot who damaged the victim. Crashes are deaths without a kill. `GAME.isLocal` / `GAME.isOpponent` tell the two pilots from AI. |
+| Weapons | `HOOKS.WeaponFired`, `GAME.weaponKind` | `gun` / `missile` / `special`. Unknown kinds are logged as special (fail closed). |
+| Surrender / disconnect | `HOOKS.PlayerLeft` | Logs a `disconnect` event. A leaver only loses when both logs record it. |
+| Aircraft flight parameters | `AIRCRAFT_PARAM_CLASS`, `STAT_PROPS` | Read live at queue time, at match start and every second during the match. The same values (from a clean game) go into the admin baseline `aircraft` table, for every aircraft. |
+| Aircraft ids and speeds | `GAME.aircraftIds()`, `GAME.speeds()` | Ids must match the baseline's aircraft table. Speeds fill `telemetry.selfMaxSpeed` / `opponentMaxSpeed`. |
+| Game build string | `GAME_VERSION` | Must match the baseline `gameVersion` the player scanned clean on. |
 
 Every finished hook also needs a matching entry in the baseline aircraft table and a test match between two PCs.
 
 ## Bridge protocol (mod ⇄ companion)
 
-Files are written in `<game root>/ProjectRVNG/bridge/` using write-to-temp-then-rename. The scanner excludes this folder.
+Files are written in `<game root>/ProjectRVNG/bridge/` using write-to-temp-then-rename. The scanner excludes this folder, except for file types the game can load (`.pak`, `.dll`, `.lua`, …).
+
+The companion deletes `lobby.json` and `result.json` only after the server accepts them. A permanent rejection renames the file to `*.failed`. Results are also copied to `bridge/archive/`. The mod acts only on a `matched` state whose match is `pending` or `live` and that it has not already played.
 
 | File | Writer | Content |
 |---|---|---|
 | `request.json` | mod | `{ "action": "queue" \| "cancel", "region"? }` |
 | `runtime.json` | mod | `{ gameVersion, aircraft: { id: { maxSpeed, turnRate, hp, ... } }, loadedModules? }` |
 | `lobby.json` | mod (host) | `{ matchId, lobbyCode }` |
-| `result.json` | mod | Match log, see `server/src/matchlog.js` |
+| `result.json` | mod | Match log, see `server/src/matchlog.js`. `events` is always a JSON array (`Json.array()`); `runtime.aircraft` holds the sampled stats. |
 | `state.json` | companion | `{ state: idle\|scanning\|queued\|matched\|rejected\|reported, message, match: { id, role, lobbyCode, rules, host, guest } }` |

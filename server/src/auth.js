@@ -31,6 +31,7 @@ function requirePlayer(db) {
   const findByKey = db.prepare('SELECT * FROM players WHERE api_key_hash = ?');
   const insertNonce = db.prepare('INSERT OR IGNORE INTO nonces (player_id, nonce, seen_at) VALUES (?, ?, ?)');
   const purge = db.prepare('DELETE FROM nonces WHERE seen_at < ?');
+  let lastPurge = 0;
 
   return (req, res, next) => {
     const key = req.get('x-player-key');
@@ -48,10 +49,12 @@ function requirePlayer(db) {
     const player = findByKey.get(sha256(key));
     if (!player) return res.status(401).json({ error: 'unknown key' });
 
-    const expected = sign(player.api_secret, req.method, req.originalUrl.split('?')[0], ts, nonce, req.rawBody);
+    // The signed path includes the query string, so no request parameter can be changed in transit.
+    const expected = sign(player.api_secret, req.method, req.originalUrl, ts, nonce, req.rawBody);
     if (!safeEqualHex(sig, expected)) return res.status(401).json({ error: 'bad signature' });
 
-    purge.run(now - 2 * config.signatureMaxSkewMs);
+    // Nonces older than twice the skew window can never be replayed; purge them (indexed) at most once a second.
+    if (now - lastPurge > 1000) { purge.run(now - 2 * config.signatureMaxSkewMs); lastPurge = now; }
     const r = insertNonce.run(player.id, nonce, now);
     if (r.changes === 0) return res.status(401).json({ error: 'replayed request' });
 

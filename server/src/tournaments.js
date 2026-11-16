@@ -16,7 +16,7 @@ function seedOrder(n) {
   return order;
 }
 
-const isPow2 = (n) => n >= 2 && (n & (n - 1)) === 0;
+const isPow2 = (n) => Number.isInteger(n) && n >= 2 && (n & (n - 1)) === 0;
 const rounds = (size) => Math.log2(size);
 
 function create(db, { name, size, bestOf = 3, finalBestOf = 5, rules }) {
@@ -28,13 +28,16 @@ function create(db, { name, size, bestOf = 3, finalBestOf = 5, rules }) {
   return get(db, Number(r.lastInsertRowid));
 }
 
-function register(db, tournamentId, playerId) {
+function register(db, tournamentId, player) {
   const t = db.prepare('SELECT * FROM tournaments WHERE id = ?').get(tournamentId);
   if (!t) throw new HttpError(404, 'tournament not found');
   if (t.state !== 'registration') throw new HttpError(409, 'registration closed');
-  const count = db.prepare('SELECT COUNT(*) c FROM tournament_entrants WHERE tournament_id = ?').get(tournamentId).c;
+  if (player.status !== 'active') throw new HttpError(403, `account is ${player.status}; event entry disabled`);
+  // Only active entrants hold a slot: flagged or banned sign-ups are dropped at start.
+  const count = db.prepare(`SELECT COUNT(*) c FROM tournament_entrants e JOIN players p ON p.id = e.player_id
+    WHERE e.tournament_id = ? AND p.status = 'active' AND p.id != ?`).get(tournamentId, player.id).c;
   if (count >= t.size) throw new HttpError(409, 'tournament full');
-  db.prepare('INSERT OR IGNORE INTO tournament_entrants (tournament_id, player_id) VALUES (?, ?)').run(tournamentId, playerId);
+  db.prepare('INSERT OR IGNORE INTO tournament_entrants (tournament_id, player_id) VALUES (?, ?)').run(tournamentId, player.id);
 }
 
 function start(db, tournamentId) {
@@ -43,8 +46,12 @@ function start(db, tournamentId) {
     if (!t) throw new HttpError(404, 'tournament not found');
     if (t.state !== 'registration') throw new HttpError(409, 'already started');
     const entrants = db.prepare(`SELECT p.id, p.rating FROM tournament_entrants e JOIN players p ON p.id = e.player_id
-      WHERE e.tournament_id = ? AND p.status != 'banned' ORDER BY p.rating DESC, p.id ASC`).all(tournamentId);
-    if (entrants.length < 2) throw new HttpError(409, 'need at least 2 entrants');
+      WHERE e.tournament_id = ? AND p.status = 'active' ORDER BY p.rating DESC, p.id ASC`).all(tournamentId);
+    if (entrants.length < 2) throw new HttpError(409, 'need at least 2 active entrants');
+    // Shrink to the smallest bracket that holds everyone, so every first-round slot has at least one
+    // pilot and byes only happen in round 1 (an empty slot would block the next round forever).
+    const size = Math.max(2, 2 ** Math.ceil(Math.log2(entrants.length)));
+    if (size !== t.size) { db.prepare('UPDATE tournaments SET size = ? WHERE id = ?').run(size, t.id); t.size = size; }
 
     const setSeed = db.prepare('UPDATE tournament_entrants SET seed = ? WHERE tournament_id = ? AND player_id = ?');
     entrants.forEach((p, i) => setSeed.run(i + 1, tournamentId, p.id));
@@ -102,11 +109,42 @@ function recordSeriesResult(db, seriesId, winnerId) {
   else if (updated.wins_b >= need) finishSeries(db, t, updated, updated.player_b);
 }
 
-// The open series (both players known, no winner) a player is currently due to play.
-function pendingSeriesFor(db, playerId) {
-  return db.prepare(`SELECT s.* FROM series s JOIN tournaments t ON t.id = s.tournament_id
-    WHERE t.state = 'running' AND s.winner IS NULL AND s.player_a IS NOT NULL AND s.player_b IS NOT NULL
-      AND (s.player_a = ? OR s.player_b = ?) ORDER BY s.round ASC LIMIT 1`).get(playerId, playerId);
+// Undo one counted game of an undecided series (an admin voided the match). A decided series is final.
+function revertSeriesResult(db, seriesId, winnerId) {
+  const s = db.prepare('SELECT * FROM series WHERE id = ?').get(seriesId);
+  if (!s || !winnerId) return;
+  if (s.winner) throw new HttpError(409, 'the series this match belongs to is already decided; it cannot be voided');
+  const col = winnerId === s.player_a ? 'wins_a' : winnerId === s.player_b ? 'wins_b' : null;
+  if (col) db.prepare(`UPDATE series SET ${col} = MAX(0, ${col} - 1) WHERE id = ?`).run(s.id);
+}
+
+// Admin walkover: the named player wins the series (no-show, ban, or flagged opponent).
+function forfeit(db, seriesId, winnerId) {
+  return tx(db, () => {
+    const s = db.prepare('SELECT * FROM series WHERE id = ?').get(seriesId);
+    if (!s) throw new HttpError(404, 'series not found');
+    const t = db.prepare('SELECT * FROM tournaments WHERE id = ?').get(s.tournament_id);
+    if (t.state !== 'running' || s.winner) throw new HttpError(409, 'series is closed');
+    if (!s.player_a || !s.player_b || (winnerId !== s.player_a && winnerId !== s.player_b)) {
+      throw new HttpError(400, 'winner must be one of the two series players');
+    }
+    const open = db.prepare(`SELECT COUNT(*) c FROM matches WHERE series_id = ? AND state IN ('pending', 'live', 'awaiting_reports', 'disputed')`).get(s.id).c;
+    if (open) throw new HttpError(409, 'resolve or void the open match of this series first');
+    finishSeries(db, t, s, winnerId);
+    return get(db, t.id);
+  });
+}
+
+// Every open series (both players known, no winner) a player is due to play, earliest round first.
+// A series with an unsettled match (including a disputed one) gets no rematch until an admin rules on it,
+// otherwise the loser could dispute a lost game and replay it.
+const OPEN_SERIES_SQL = `SELECT s.* FROM series s JOIN tournaments t ON t.id = s.tournament_id
+  WHERE t.state = 'running' AND s.winner IS NULL AND s.player_a IS NOT NULL AND s.player_b IS NOT NULL
+    AND (s.player_a = ? OR s.player_b = ?)
+    AND NOT EXISTS (SELECT 1 FROM matches m WHERE m.series_id = s.id AND m.state IN ('pending', 'live', 'awaiting_reports', 'disputed'))
+  ORDER BY s.round ASC, s.id ASC`;
+function openSeriesFor(db, playerId) {
+  return db.prepare(OPEN_SERIES_SQL).all(playerId, playerId);
 }
 
 function get(db, id) {
@@ -121,9 +159,11 @@ function get(db, id) {
 }
 
 function list(db) {
-  return db.prepare(`SELECT t.id, t.name, t.state, t.size, t.created_at, p.name champion_name,
+  return db.prepare(`SELECT t.id, t.name, t.state, t.size, t.created_at, t.champion, p.name champion_name,
     (SELECT COUNT(*) FROM tournament_entrants e WHERE e.tournament_id = t.id) entrants
     FROM tournaments t LEFT JOIN players p ON p.id = t.champion ORDER BY t.id DESC`).all();
 }
 
-module.exports = { HttpError, seedOrder, create, register, start, recordSeriesResult, pendingSeriesFor, get, list };
+module.exports = {
+  HttpError, seedOrder, create, register, start, recordSeriesResult, revertSeriesResult, forfeit, openSeriesFor, OPEN_SERIES_SQL, get, list,
+};

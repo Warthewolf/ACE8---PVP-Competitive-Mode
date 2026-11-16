@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS players (
   losses        INTEGER NOT NULL DEFAULT 0,
   kills         INTEGER NOT NULL DEFAULT 0,
   deaths        INTEGER NOT NULL DEFAULT 0,
+  draws         INTEGER NOT NULL DEFAULT 0,
   status        TEXT NOT NULL DEFAULT 'active', -- active | flagged | banned
   created_at    INTEGER NOT NULL
 );
@@ -67,6 +68,7 @@ CREATE TABLE IF NOT EXISTS queue (
   rating        REAL NOT NULL,
   region        TEXT NOT NULL,
   integrity_id  INTEGER NOT NULL REFERENCES integrity_reports(id),
+  game_version  TEXT NOT NULL DEFAULT '',   -- build the player scanned clean on; only equal builds are paired
   joined_at     INTEGER NOT NULL
 );
 
@@ -75,6 +77,7 @@ CREATE TABLE IF NOT EXISTS matches (
   player_a      INTEGER NOT NULL REFERENCES players(id), -- host
   player_b      INTEGER NOT NULL REFERENCES players(id),
   rules         TEXT NOT NULL,
+  game_version  TEXT NOT NULL DEFAULT '',   -- from both players' clean scans, never from the match logs
   lobby_code    TEXT,
   state         TEXT NOT NULL,  -- pending | live | awaiting_reports | verified | disputed | void
   winner        INTEGER REFERENCES players(id),
@@ -84,7 +87,13 @@ CREATE TABLE IF NOT EXISTS matches (
   rating_delta_b REAL,
   series_id     INTEGER REFERENCES series(id),
   flags         TEXT NOT NULL DEFAULT '[]',
+  -- kills/deaths credited to each player when the result was applied (so a void can undo them)
+  kills_a       INTEGER,
+  deaths_a      INTEGER,
+  kills_b       INTEGER,
+  deaths_b      INTEGER,
   created_at    INTEGER NOT NULL,
+  live_at       INTEGER,                  -- when the host posted the room code
   verified_at   INTEGER
 );
 
@@ -131,12 +140,37 @@ CREATE TABLE IF NOT EXISTS series (
 );
 
 CREATE INDEX IF NOT EXISTS idx_players_rating ON players(rating DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_players_key ON players(api_key_hash);
+CREATE INDEX IF NOT EXISTS idx_nonces_seen ON nonces(seen_at);
 CREATE INDEX IF NOT EXISTS idx_matches_state ON matches(state);
+CREATE INDEX IF NOT EXISTS idx_matches_series ON matches(series_id);
+CREATE INDEX IF NOT EXISTS idx_integrity_player ON integrity_reports(player_id, id);
 `;
+
+// Columns added after the first release. CREATE TABLE IF NOT EXISTS does not add them to older databases.
+const ADDED_COLUMNS = [
+  ['players', 'draws', 'INTEGER NOT NULL DEFAULT 0'],
+  ['queue', 'game_version', "TEXT NOT NULL DEFAULT ''"],
+  ['matches', 'game_version', "TEXT NOT NULL DEFAULT ''"],
+  ['matches', 'kills_a', 'INTEGER'], ['matches', 'deaths_a', 'INTEGER'],
+  ['matches', 'kills_b', 'INTEGER'], ['matches', 'deaths_b', 'INTEGER'],
+  ['matches', 'live_at', 'INTEGER'],
+];
+
+function migrate(db) {
+  for (const [table, col, def] of ADDED_COLUMNS) {
+    const cols = db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
+    if (!cols.includes(col)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${def}`);
+  }
+}
 
 function openDb(path) {
   const db = new DatabaseSync(path);
-  db.exec(SCHEMA);
+  // Tables first (without the indexes that may reference new columns), then columns, then indexes.
+  const [tables, indexes] = SCHEMA.split('CREATE INDEX IF NOT EXISTS idx_players_rating');
+  db.exec(tables);
+  migrate(db);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_players_rating' + indexes);
   return db;
 }
 

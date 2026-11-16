@@ -10,45 +10,67 @@
  *   endReason: "kill_target" | "time_limit" | "disconnect" | "surrender",
  *   self:     { aircraftId: "f22a", kills: 5, deaths: 3 },
  *   opponent: { aircraftId: "su57", kills: 3, deaths: 5 },
- *   events: [ { t: 12.4, type: "missile_fired"|"hit"|"kill"|"death"|"respawn", actor: "self"|"opponent", weapon: "MSL", damage: 40 } ],
- *   telemetry: { selfMaxSpeed: 2410, opponentMaxSpeed: 2380 }   // km/h, observed
+ *   events: [ { t: 12.4, type: "missile_fired"|"special_fired"|"hit"|"kill"|"death"|"disconnect"|..., actor: "self"|"opponent" } ],
+ *   telemetry: { selfMaxSpeed: 2410, opponentMaxSpeed: 2380 },  // km/h, observed
+ *   runtime:   { aircraft: { "<aircraftId>": { maxSpeed, turnRate, hp, ... } } }  // live stats sampled during the match
  * }
  *
  * Neither player can control the other player's log, so every number is cross-checked
- * against the opponent's view of the same match.
+ * against the opponent's view of the same match. The game build (and so the reference
+ * stats) comes from both players' clean integrity scans, never from the logs.
  */
+
+const { compareAircraft, isPlainObject, SEVERITY } = require('./integrity');
 
 const EVENT_TYPES = new Set(['missile_fired', 'gun_fired', 'special_fired', 'hit', 'kill', 'death', 'respawn', 'flare', 'disconnect']);
 const END_REASONS = new Set(['kill_target', 'time_limit', 'disconnect', 'surrender']);
 const SPEED_TOLERANCE = 1.05; // observed speed may exceed baseline max by 5% (dives, lag interpolation)
 const DURATION_TOLERANCE_SEC = 15;
+const MAX_DURATION_SEC = 24 * 3600;
+const MAX_SPEED = 100000; // km/h; anything above is a malformed value, not an observation
 
 const isInt = (n) => Number.isInteger(n) && n >= 0;
+const isNum = (n) => typeof n === 'number' && Number.isFinite(n);
 
 function validateShape(r) {
   const errs = [];
-  if (!r || typeof r !== 'object') return ['report must be an object'];
-  if (typeof r.durationSec !== 'number' || r.durationSec < 0) errs.push('durationSec');
+  if (!isPlainObject(r)) return ['report must be an object'];
+  // Older mod builds encode an empty events list as {}.
+  if (isPlainObject(r.events) && Object.keys(r.events).length === 0) r.events = [];
+  if (!isNum(r.durationSec) || r.durationSec < 0 || r.durationSec > MAX_DURATION_SEC) errs.push('durationSec');
   if (!END_REASONS.has(r.endReason)) errs.push('endReason');
+  if (r.gameVersion !== undefined && typeof r.gameVersion !== 'string') errs.push('gameVersion');
   for (const side of ['self', 'opponent']) {
     const s = r[side];
-    if (!s || typeof s.aircraftId !== 'string' || !isInt(s.kills) || !isInt(s.deaths)) errs.push(side);
+    if (!isPlainObject(s) || typeof s.aircraftId !== 'string' || s.aircraftId.length > 64 || !isInt(s.kills) || !isInt(s.deaths)) errs.push(side);
   }
   if (!Array.isArray(r.events) || r.events.length > 20000) errs.push('events');
-  else if (r.events.some((e) => !e || !EVENT_TYPES.has(e.type) || !['self', 'opponent'].includes(e.actor) || typeof e.t !== 'number')) {
+  else if (r.events.some((e) => !isPlainObject(e) || !EVENT_TYPES.has(e.type) || !['self', 'opponent'].includes(e.actor) || !isNum(e.t))) {
     errs.push('events[]');
   }
+  if (r.telemetry !== undefined) {
+    if (!isPlainObject(r.telemetry)) errs.push('telemetry');
+    else {
+      for (const k of ['selfMaxSpeed', 'opponentMaxSpeed']) {
+        const v = r.telemetry[k];
+        if (v !== undefined && !(isNum(v) && v >= 0 && v <= MAX_SPEED)) errs.push(`telemetry.${k}`);
+      }
+    }
+  }
+  if (r.runtime !== undefined && !isPlainObject(r.runtime)) errs.push('runtime');
   return errs;
 }
 
 /**
  * Reconcile the two reports (A = host, B = guest).
+ * @param ctx { rules, aircraftStats, playerA, playerB, minDurationSec }
  * @returns { ok, scoreA, scoreB, outcome: 'a'|'b'|'draw', flags: [{code, player?, ...}] }
  */
 function reconcile(repA, repB, ctx) {
-  const { rules, aircraftStats = {}, playerA, playerB } = ctx;
+  const { rules, aircraftStats = {}, playerA, playerB, minDurationSec = 0 } = ctx;
   const flags = [];
   const flag = (code, extra = {}) => flags.push({ code, ...extra });
+  const sides = [[repA, repB, playerA], [repB, repA, playerB]]; // [report, other report, author]
 
   // Score agreement: A's kills as seen by A must equal A's kills as seen by B.
   if (repA.self.kills !== repB.opponent.kills || repA.opponent.kills !== repB.self.kills) {
@@ -61,14 +83,31 @@ function reconcile(repA, repB, ctx) {
     flag('aircraft_mismatch');
   }
   if (Math.abs(repA.durationSec - repB.durationSec) > DURATION_TOLERANCE_SEC) flag('duration_mismatch');
+  if (Math.min(repA.durationSec, repB.durationSec) < minDurationSec) flag('too_short');
+
+  // How the match ended: both pilots must agree, and the end must fit the room rules, so the side that is
+  // ahead cannot close the room early or run it with a lower kill target.
+  if (repA.endReason !== repB.endReason) flag('end_reason_mismatch', { a: repA.endReason, b: repB.endReason });
+  for (const [rep, , pid] of sides) {
+    const top = Math.max(rep.self.kills, rep.opponent.kills);
+    if (rep.endReason === 'kill_target' && (!rules.killTarget || top < rules.killTarget)) {
+      flag('premature_end', { player: pid, endReason: rep.endReason, top });
+    }
+    if (rep.endReason === 'time_limit' && (!rules.timeLimitSec || rep.durationSec < rules.timeLimitSec - DURATION_TOLERANCE_SEC)) {
+      flag('premature_end', { player: pid, endReason: rep.endReason, durationSec: rep.durationSec });
+    }
+  }
 
   // Rules.
   const bans = new Set(rules.aircraftBans || []);
-  for (const [rep, pid] of [[repA, playerA], [repB, playerB]]) {
+  for (const [rep, other, pid] of sides) {
     if (bans.has(rep.self.aircraftId)) flag('banned_aircraft', { player: pid, aircraft: rep.self.aircraftId });
     if (rules.killTarget && rep.self.kills > rules.killTarget) flag('kills_exceed_target', { player: pid });
     if (rules.timeLimitSec && rep.durationSec > rules.timeLimitSec + DURATION_TOLERANCE_SEC) flag('duration_exceeds_limit');
-    if (!rules.specialWeapons && rep.events.some((e) => e.actor === 'self' && e.type === 'special_fired')) {
+    // A ban is checked in both logs: the offender can strip their own events but not the opponent's.
+    if (rules.specialWeapons === false && (
+      rep.events.some((e) => e.actor === 'self' && e.type === 'special_fired')
+      || other.events.some((e) => e.actor === 'opponent' && e.type === 'special_fired'))) {
       flag('special_weapon_used', { player: pid });
     }
     // Kill events in the log must account for the claimed kills.
@@ -76,11 +115,26 @@ function reconcile(repA, repB, ctx) {
     if (killEvents !== rep.self.kills) flag('kill_events_inconsistent', { player: pid, claimed: rep.self.kills, events: killEvents });
   }
 
+  // Live flight parameters the author's own game reported during the match (sampled by the mod), for the
+  // aircraft the author flew. Only self-incriminating: nobody can put values into another pilot's log.
+  for (const [rep, , pid] of sides) {
+    const id = rep.self.aircraftId;
+    const ac = rep.runtime && rep.runtime.aircraft;
+    if (!isPlainObject(ac) || !Object.hasOwn(ac, id)) { flag('runtime_stats_missing', { player: pid, aircraft: id }); continue; }
+    for (const f of compareAircraft({ [id]: ac[id] }, aircraftStats)) {
+      if (SEVERITY[f.severity] < SEVERITY.high) continue;
+      flag(f.code === 'aircraft_stat_modified' ? 'aircraft_stat_modified' : 'runtime_stats_invalid',
+        { player: pid, aircraft: id, stat: f.stat, expected: f.expected, actual: f.actual });
+    }
+  }
+
   // Physics plausibility using the opponent's observation (the suspect cannot edit it).
   for (const [observer, suspect, pid] of [[repB, repA, playerA], [repA, repB, playerB]]) {
-    const ref = aircraftStats[suspect.self.aircraftId];
+    const id = suspect.self.aircraftId;
+    const ref = Object.hasOwn(aircraftStats, id) ? aircraftStats[id] : null;
+    if (!ref || !isNum(ref.maxSpeed)) { flag('unknown_reference', { player: pid, aircraft: id }); continue; }
     const seen = observer.telemetry && observer.telemetry.opponentMaxSpeed;
-    if (ref && typeof ref.maxSpeed === 'number' && typeof seen === 'number' && seen > ref.maxSpeed * SPEED_TOLERANCE) {
+    if (isNum(seen) && seen > ref.maxSpeed * SPEED_TOLERANCE) {
       flag('speed_anomaly', { player: pid, observed: seen, max: ref.maxSpeed });
     }
   }
@@ -88,16 +142,22 @@ function reconcile(repA, repB, ctx) {
   const scoreA = repA.self.kills;
   const scoreB = repA.opponent.kills;
   let outcome = scoreA > scoreB ? 'a' : scoreB > scoreA ? 'b' : 'draw';
-  // A surrender/disconnect by one side is a loss for that side, whatever the score.
-  const leaver = (rep, side) => rep.events.some((e) => e.type === 'disconnect' && e.actor === side);
-  if (repA.endReason === 'disconnect' || repB.endReason === 'disconnect' || repA.endReason === 'surrender' || repB.endReason === 'surrender') {
-    const aLeft = leaver(repA, 'self') || leaver(repB, 'opponent');
-    const bLeft = leaver(repB, 'self') || leaver(repA, 'opponent');
-    if (aLeft && !bLeft) outcome = 'b';
-    else if (bLeft && !aLeft) outcome = 'a';
+
+  // A surrender/disconnect is a loss for the pilot who left, whatever the score, but only when both logs
+  // name the same single leaver: the leaver's own log ("self") and the opponent's log ("opponent").
+  // Anything else (a one-sided claim, both sides blaming each other) goes to an admin.
+  const left = (rep, side) => rep.events.some((e) => e.type === 'disconnect' && e.actor === side);
+  const aSelf = left(repA, 'self'); const aSeen = left(repB, 'opponent');
+  const bSelf = left(repB, 'self'); const bSeen = left(repA, 'opponent');
+  const early = [repA.endReason, repB.endReason].some((r) => r === 'disconnect' || r === 'surrender');
+  if (early || aSelf || aSeen || bSelf || bSeen) {
+    const aLeft = aSelf && aSeen; const bLeft = bSelf && bSeen;
+    if (aSelf !== aSeen || bSelf !== bSeen || aLeft === bLeft) {
+      flag('end_mismatch', { a: repA.endReason, b: repB.endReason });
+    } else outcome = aLeft ? 'b' : 'a';
   }
 
   return { ok: flags.length === 0, scoreA, scoreB, outcome, flags };
 }
 
-module.exports = { validateShape, reconcile, SPEED_TOLERANCE };
+module.exports = { validateShape, reconcile, SPEED_TOLERANCE, DURATION_TOLERANCE_SEC };

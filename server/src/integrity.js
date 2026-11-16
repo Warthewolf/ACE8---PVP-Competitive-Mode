@@ -24,10 +24,16 @@ const SEVERITY = { info: 0, low: 1, high: 2, critical: 3 };
 const PAK_EXT = /\.(pak|ucas|utoc|sig)$/i;
 const CODE_EXT = /\.(dll|asi|exe)$/i;
 const SCRIPT_EXT = /\.(lua|py|js)$/i;
+// Mod folders: matched as the folder itself (a link/junction entry) or anything below it.
+const MOD_DIR = /(^|\/)(~mods|logicmods)(\/|$)/;
+// The script loader's own tree, and its config files wherever they are (they can relocate the mods folder).
+const LOADER_DIR = /(^|\/)(ue4ss|ue5ss)(\/|$)/;
+const LOADER_CONFIG = /(^|\/)(ue4ss-settings\.ini|mods\.txt|mods\.json|enabled\.txt)$/;
+const CONFIG_EXT = /\.ini$/i;
 // DLL names commonly used as proxy loaders for injection.
 const PROXY_DLLS = new Set([
-  'dxgi.dll', 'd3d11.dll', 'd3d12.dll', 'dinput8.dll', 'version.dll', 'winmm.dll',
-  'xinput1_3.dll', 'xinput1_4.dll', 'xinput9_1_0.dll', 'dsound.dll', 'winhttp.dll',
+  'dxgi.dll', 'd3d9.dll', 'd3d11.dll', 'd3d12.dll', 'dinput8.dll', 'version.dll', 'winmm.dll', 'dwmapi.dll',
+  'xinput1_3.dll', 'xinput1_4.dll', 'xinput9_1_0.dll', 'dsound.dll', 'winhttp.dll', 'opengl32.dll',
 ]);
 // System modules that are always legitimately loaded; anything else outside the baseline is reported.
 const SYSTEM_MODULE_ALLOW = /^(ntdll|kernel32|kernelbase|user32|gdi32|advapi32|ws2_32|d3d1[12]|dxgi|xinput1_4|steam_api64|steamclient64|gameoverlayrenderer64|nvwgf2umx|amdxx64|amdxc64|vulkan-1)\.dll$/i;
@@ -35,29 +41,39 @@ const SYSTEM_MODULE_ALLOW = /^(ntdll|kernel32|kernelbase|user32|gdi32|advapi32|w
 // Relative tolerance before a runtime aircraft stat counts as modified.
 const STAT_TOLERANCE = 0.005;
 
-const norm = (p) => String(p).replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
+// Forward slashes, no leading "./", ASCII-only lowercase. Full Unicode lowercasing would fold look-alikes
+// such as the Kelvin sign (U+212A) into "k", letting a second, unloaded copy of a file share its key.
+const norm = (p) => String(p).replace(/\\/g, '/').replace(/^\.\//, '').replace(/[A-Z]/g, (c) => c.toLowerCase());
+
+const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+const isFileRecord = (f) => Number.isSafeInteger(f.size) && f.size >= 0 && /^[0-9a-f]{64}$/.test(f.sha256);
 
 function classifyUnknown(path) {
   const base = path.split('/').pop();
-  if (PAK_EXT.test(path) || /\/~mods\//.test(path) || /\/logicmods\//.test(path)) {
+  if (PAK_EXT.test(path) || MOD_DIR.test(path)) {
     return { code: 'unapproved_pak_mod', severity: 'critical' };
   }
   if (CODE_EXT.test(path)) {
     if (PROXY_DLLS.has(base)) return { code: 'proxy_dll_injection', severity: 'critical' };
     return { code: 'unapproved_binary', severity: 'critical' };
   }
-  if (/\/(ue4ss|ue5ss|mods)\//.test(path) && SCRIPT_EXT.test(path)) {
-    return { code: 'unapproved_script_mod', severity: 'critical' };
-  }
+  // A script is a mod wherever it sits: the loader's mods folder can be moved with one config line.
+  if (SCRIPT_EXT.test(path)) return { code: 'unapproved_script_mod', severity: 'critical' };
+  if (LOADER_DIR.test(path) || LOADER_CONFIG.test(path)) return { code: 'unapproved_loader_file', severity: 'critical' };
+  if (CONFIG_EXT.test(path)) return { code: 'unapproved_config', severity: 'high' };
   return { code: 'unknown_file', severity: 'low' };
 }
 
 function compareAircraft(reported, baseline) {
   const findings = [];
   for (const [id, stats] of Object.entries(reported || {})) {
-    const ref = baseline[id];
-    if (!ref) {
+    const ref = Object.hasOwn(baseline, id) ? baseline[id] : null;
+    if (!isPlainObject(ref)) {
       findings.push({ code: 'unknown_aircraft', severity: 'high', aircraft: id });
+      continue;
+    }
+    if (!isPlainObject(stats)) {
+      findings.push({ code: 'aircraft_stat_missing', severity: 'high', aircraft: id });
       continue;
     }
     for (const [stat, refVal] of Object.entries(ref)) {
@@ -103,7 +119,10 @@ function evaluate(report, baseline, approved) {
   const reported = new Map();
   for (const f of report.files) {
     if (!f || typeof f.path !== 'string') continue;
-    reported.set(norm(f.path), { size: Number(f.size), sha256: String(f.sha256 || '').toLowerCase() });
+    const k = norm(f.path);
+    // Two entries for one path: a clean twin could otherwise overwrite the file the game really loads.
+    if (reported.has(k)) { findings.push({ code: 'duplicate_path', severity: 'critical', path: k }); continue; }
+    reported.set(k, { size: Number(f.size), sha256: String(f.sha256 || '').toLowerCase() });
   }
 
   // 1. Every baseline file must exist with identical size and hash.
@@ -128,6 +147,12 @@ function evaluate(report, baseline, approved) {
   }
   for (const [path, got] of reported) {
     if (baseFiles.has(path)) continue;
+    // Symlinks/junctions (size -1) and other malformed records can point a mod folder anywhere.
+    if (!isFileRecord(got)) {
+      findings.push({ code: 'link_in_install', severity: 'critical', path, size: got.size });
+      mods.push({ name: path.split('/').pop(), path, size: got.size, approved: false });
+      continue;
+    }
     const candidates = approvedByPath.get(path) || [];
     const match = candidates.find((m) => m.sha256.toLowerCase() === got.sha256 && Number(m.size) === got.size);
     if (match) {
@@ -145,9 +170,11 @@ function evaluate(report, baseline, approved) {
     }
   }
 
-  // 3. Required mods (the competitive mod itself) must be present.
+  // 3. Required files (the competitive mod, the loader and its settings) must be present in exactly the
+  //    approved build. An older approved version at the same path does not satisfy a newer required one.
   for (const m of approved.filter((x) => x.category === 'required')) {
-    if (!mods.some((x) => x.approved && x.path === norm(m.path))) {
+    const got = reported.get(norm(m.path));
+    if (!got || got.sha256 !== String(m.sha256).toLowerCase() || got.size !== Number(m.size)) {
       findings.push({ code: 'missing_required_mod', severity: 'critical', name: m.name, path: norm(m.path) });
     }
   }
@@ -159,14 +186,15 @@ function evaluate(report, baseline, approved) {
       [...baseFiles.keys(), ...mods.filter((m) => m.approved).map((m) => m.path)]
         .filter((p) => CODE_EXT.test(p)).map((p) => p.split('/').pop()),
     );
-    for (const mod of rt.loadedModules) {
-      const name = norm(mod).split('/').pop();
+    for (const mod of new Set(rt.loadedModules.map((x) => norm(x)))) {
+      const name = mod.split('/').pop();
       if (allowedBinaries.has(name) || SYSTEM_MODULE_ALLOW.test(name)) continue;
       findings.push({ code: 'unexpected_loaded_module', severity: 'high', module: name });
     }
   }
-  if (rt.aircraft) findings.push(...compareAircraft(rt.aircraft, baseline.aircraft || {}));
-  else findings.push({ code: 'runtime_stats_missing', severity: 'high' });
+  if (isPlainObject(rt.aircraft) && Object.keys(rt.aircraft).length) {
+    findings.push(...compareAircraft(rt.aircraft, baseline.aircraft || {}));
+  } else findings.push({ code: 'runtime_stats_missing', severity: 'high' });
 
   const worst = findings.reduce((m, f) => Math.max(m, SEVERITY[f.severity] ?? 0), 0);
   const verdict = worst >= SEVERITY.high ? 'rejected' : 'clean';
@@ -178,4 +206,4 @@ function evaluate(report, baseline, approved) {
   return { verdict, findings, mods, manifestHash };
 }
 
-module.exports = { evaluate, compareAircraft, classifyUnknown, norm, STAT_TOLERANCE };
+module.exports = { evaluate, compareAircraft, classifyUnknown, norm, isPlainObject, STAT_TOLERANCE, SEVERITY };

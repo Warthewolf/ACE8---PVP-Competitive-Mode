@@ -11,34 +11,43 @@ const { HttpError } = tournaments;
 
 const now = () => Date.now();
 const json = (s, d) => { try { return JSON.parse(s); } catch { return d; } };
+const clampInt = (v, d, min, max) => { const n = Number(v); return Number.isSafeInteger(n) ? Math.min(Math.max(n, min), max) : d; };
+const { isPlainObject } = integrity;
 
 // ---------- players ----------
-function registerPlayer(db, { name, platformId }) {
-  if (typeof name !== 'string' || !/^[A-Za-z0-9_\- ]{3,24}$/.test(name)) {
-    throw new HttpError(400, 'name must be 3-24 chars: letters, digits, space, _ or -');
+// 3-24 characters; letters, digits, space, _ or -; no space at either end.
+const NAME_RE = /^[A-Za-z0-9_-][A-Za-z0-9_\- ]{1,22}[A-Za-z0-9_-]$/;
+
+function registerPlayer(db, { name } = {}) {
+  const n = typeof name === 'string' ? name.trim() : '';
+  if (!NAME_RE.test(n)) {
+    throw new HttpError(400, 'name must be 3-24 chars: letters, digits, space, _ or - (no space at either end)');
   }
+  // A platform id (SteamID64) is not accepted from the client: it cannot be verified yet, and an unverified
+  // unique id would let anyone reserve someone else's. See docs/SECURITY.md.
   const { apiKey, apiSecret } = newCredentials();
   try {
-    const r = db.prepare(`INSERT INTO players (name, platform_id, api_key_hash, api_secret, rating, peak_rating, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)`).run(name.trim(), platformId || null, sha256(apiKey), apiSecret,
-      config.rating.initial, config.rating.initial, now());
-    return { id: Number(r.lastInsertRowid), name: name.trim(), apiKey, apiSecret };
+    const r = db.prepare(`INSERT INTO players (name, api_key_hash, api_secret, rating, peak_rating, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)`).run(n, sha256(apiKey), apiSecret, config.rating.initial, config.rating.initial, now());
+    return { id: Number(r.lastInsertRowid), name: n, apiKey, apiSecret };
   } catch (e) {
-    if (/UNIQUE/.test(e.message)) throw new HttpError(409, 'name or platform id already registered');
+    if (/UNIQUE/.test(e.message)) throw new HttpError(409, 'callsign already registered');
     throw e;
   }
 }
 
 const publicPlayer = (p) => p && ({
   id: p.id, name: p.name, rating: Math.round(p.rating), peakRating: Math.round(p.peak_rating),
-  tier: tierFor(p.rating), wins: p.wins, losses: p.losses, kills: p.kills, deaths: p.deaths,
+  tier: tierFor(p.rating), wins: p.wins, losses: p.losses, draws: p.draws || 0, kills: p.kills, deaths: p.deaths,
   kd: p.deaths ? +(p.kills / p.deaths).toFixed(2) : p.kills, status: p.status,
 });
 
 function leaderboard(db, { limit = 100, offset = 0 } = {}) {
-  const rows = db.prepare(`SELECT * FROM players WHERE status = 'active' AND (wins + losses) > 0
-    ORDER BY rating DESC, wins DESC LIMIT ? OFFSET ?`).all(Math.min(limit, 500), offset);
-  return rows.map((p, i) => ({ rank: offset + i + 1, ...publicPlayer(p) }));
+  const lim = clampInt(limit, 100, 1, 500);
+  const off = clampInt(offset, 0, 0, 1e6);
+  const rows = db.prepare(`SELECT * FROM players WHERE status = 'active' AND (wins + losses + draws) > 0
+    ORDER BY rating DESC, wins DESC, id ASC LIMIT ? OFFSET ?`).all(lim, off);
+  return rows.map((p, i) => ({ rank: off + i + 1, ...publicPlayer(p) }));
 }
 
 function playerProfile(db, id) {
@@ -47,49 +56,93 @@ function playerProfile(db, id) {
   const matches = recentMatches(db, { playerId: id, limit: 20 });
   const lastScan = db.prepare(`SELECT verdict, mods, created_at FROM integrity_reports WHERE player_id = ?
     ORDER BY id DESC LIMIT 1`).get(id);
+  const mods = lastScan ? json(lastScan.mods, []) : [];
   return {
     ...publicPlayer(p),
-    integrity: lastScan ? { verdict: lastScan.verdict, mods: json(lastScan.mods, []), at: lastScan.created_at } : null,
+    integrity: lastScan ? { verdict: lastScan.verdict, mods: mods.slice(0, 50), modsTotal: mods.length, at: lastScan.created_at } : null,
     matches,
   };
 }
 
 // ---------- integrity ----------
-function activeBaseline(db, version) {
-  const b = db.prepare('SELECT * FROM baselines WHERE game_version = ? AND active = 1').get(String(version || ''));
+function baselineFor(db, version, { activeOnly = true } = {}) {
+  const b = db.prepare(`SELECT * FROM baselines WHERE game_version = ? ${activeOnly ? 'AND active = 1' : ''}`).get(String(version || ''));
   return b ? { ...b, manifest: json(b.manifest, { files: [] }), aircraft: json(b.aircraft, {}) } : null;
 }
 
+// Keep the first `n` entries and a per-code count of everything, so a huge report cannot bloat storage.
+function capFindings(findings, n) {
+  if (findings.length <= n) return findings;
+  const counts = {};
+  for (const f of findings) counts[f.code] = (counts[f.code] || 0) + 1;
+  return [...findings.slice(0, n), { code: 'findings_truncated', severity: 'info', total: findings.length, counts }];
+}
+
+// Tampered aircraft data or injected code in a player's own report puts the account under review.
+const SELF_INCRIMINATING = ['aircraft_stat_modified', 'proxy_dll_injection', 'approved_mod_tampered'];
+
 function submitIntegrity(db, player, report) {
-  const baseline = activeBaseline(db, report && report.gameVersion);
+  const c = config.integrity;
+  if (!isPlainObject(report)) throw new HttpError(400, 'report must be an object');
+  const rt = isPlainObject(report.runtime) ? report.runtime : {};
+  if ((Array.isArray(report.files) && report.files.length > c.maxFiles)
+    || (Array.isArray(rt.loadedModules) && rt.loadedModules.length > c.maxLoadedModules)
+    || (isPlainObject(rt.aircraft) && Object.keys(rt.aircraft).length > c.maxAircraft)) {
+    throw new HttpError(413, 'integrity report too large');
+  }
+  const last = db.prepare('SELECT created_at FROM integrity_reports WHERE player_id = ? ORDER BY id DESC LIMIT 1').get(player.id);
+  if (last && now() - last.created_at < c.minIntervalMs) {
+    throw new HttpError(429, `wait ${Math.ceil((c.minIntervalMs - (now() - last.created_at)) / 1000)}s before scanning again`);
+  }
+
+  const gameVersion = typeof report.gameVersion === 'string' ? report.gameVersion.slice(0, 32) : '';
+  const baseline = baselineFor(db, gameVersion);
   const approved = db.prepare('SELECT * FROM approved_mods').all();
   const result = integrity.evaluate(report, baseline, approved);
   const token = result.verdict === 'clean' ? 'it_' + crypto.randomBytes(24).toString('base64url') : null;
   const expires = token ? now() + config.integrityTokenTtlMs : null;
-  db.prepare(`INSERT INTO integrity_reports (player_id, game_version, verdict, findings, mods, manifest_hash, token, expires_at, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(player.id, String(report?.gameVersion || ''), result.verdict,
-    JSON.stringify(result.findings), JSON.stringify(result.mods), result.manifestHash, token, expires, now());
+  const findings = capFindings(result.findings, c.storedFindings);
+  const mods = result.mods.slice(0, c.storedFindings);
 
-  // Tampered aircraft data or injected code puts the account under review.
-  const severe = result.findings.some((f) => ['aircraft_stat_modified', 'proxy_dll_injection', 'approved_mod_tampered'].includes(f.code));
-  if (severe && player.status === 'active') db.prepare("UPDATE players SET status = 'flagged' WHERE id = ?").run(player.id);
+  tx(db, () => {
+    db.prepare(`INSERT INTO integrity_reports (player_id, game_version, verdict, findings, mods, manifest_hash, token, expires_at, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(player.id, gameVersion, result.verdict,
+      JSON.stringify(findings), JSON.stringify(mods), result.manifestHash, token, expires, now());
 
-  return { verdict: result.verdict, findings: result.findings, mods: result.mods, integrityToken: token, expiresAt: expires };
+    const severe = result.findings.some((f) => SELF_INCRIMINATING.includes(f.code));
+    if (severe && player.status === 'active') db.prepare("UPDATE players SET status = 'flagged' WHERE id = ?").run(player.id);
+    // A failed re-scan ends the current queue session.
+    if (result.verdict !== 'clean' || severe) db.prepare('DELETE FROM queue WHERE player_id = ?').run(player.id);
+
+    // Retention: keep the latest reports and any report a queue entry still points at.
+    db.prepare(`DELETE FROM integrity_reports WHERE player_id = ?
+      AND id NOT IN (SELECT id FROM integrity_reports WHERE player_id = ? ORDER BY id DESC LIMIT ?)
+      AND id NOT IN (SELECT integrity_id FROM queue)`).run(player.id, player.id, c.keepReports);
+  });
+
+  return { verdict: result.verdict, findings, mods, integrityToken: token, expiresAt: expires };
 }
 
+// A clean, unexpired token for a game build that is still active.
 function validIntegrity(db, player, token) {
-  const r = db.prepare(`SELECT * FROM integrity_reports WHERE token = ? AND player_id = ? AND verdict = 'clean'`).get(String(token || ''), player.id);
-  if (!r || r.expires_at < now()) throw new HttpError(403, 'valid integrity token required: run the scanner again');
+  const fail = () => new HttpError(403, 'valid integrity token required: run the scanner again');
+  if (typeof token !== 'string' || !token) throw fail();
+  const r = db.prepare(`SELECT r.* FROM integrity_reports r JOIN baselines b ON b.game_version = r.game_version AND b.active = 1
+    WHERE r.token = ? AND r.player_id = ? AND r.verdict = 'clean'`).get(token, player.id);
+  if (!r || r.expires_at < now()) throw fail();
   return r;
 }
 
 // ---------- queue & matchmaking ----------
-function joinQueue(db, player, { integrityToken, region = 'global' }) {
+function joinQueue(db, player, { integrityToken, region } = {}) {
   if (player.status !== 'active') throw new HttpError(403, `account is ${player.status}; competitive queue disabled`);
+  const regions = config.matchmaking.regions;
+  const reg = region == null || region === '' ? 'global' : region;
+  if (typeof reg !== 'string' || !regions.includes(reg)) throw new HttpError(400, `region must be one of: ${regions.join(', ')}`);
   const scan = validIntegrity(db, player, integrityToken);
   if (openMatchFor(db, player.id)) throw new HttpError(409, 'you already have an open match');
-  db.prepare(`INSERT OR REPLACE INTO queue (player_id, rating, region, integrity_id, joined_at) VALUES (?, ?, ?, ?, ?)`)
-    .run(player.id, player.rating, String(region).slice(0, 16), scan.id, now());
+  db.prepare(`INSERT OR REPLACE INTO queue (player_id, rating, region, integrity_id, game_version, joined_at) VALUES (?, ?, ?, ?, ?, ?)`)
+    .run(player.id, player.rating, reg, scan.id, scan.game_version, now());
   runMatchmaker(db);
   return queueStatus(db, player);
 }
@@ -117,38 +170,63 @@ function windowFor(entry, t) {
 }
 
 // Pairs queued players. Tournament opponents are paired first, then rating-based ranked matches.
+// Runs from the background tick and when someone joins, never on status polls.
 function runMatchmaker(db, t = now()) {
   return tx(db, () => {
-    db.prepare('DELETE FROM queue WHERE joined_at < ?').run(t - config.matchmaking.queueTimeoutMs);
-    const entries = db.prepare('SELECT * FROM queue ORDER BY joined_at ASC').all();
-    const taken = new Set();
-    const created = [];
+    const mm = config.matchmaking;
+    db.prepare('DELETE FROM queue WHERE joined_at < ?').run(t - mm.queueTimeoutMs);
+    // Entries that stopped being eligible while queued: account flagged/banned, scan expired, build retired.
+    db.prepare("DELETE FROM queue WHERE player_id IN (SELECT id FROM players WHERE status != 'active')").run();
+    db.prepare('DELETE FROM queue WHERE integrity_id IN (SELECT id FROM integrity_reports WHERE expires_at IS NULL OR expires_at < ?)').run(t);
+    db.prepare('DELETE FROM queue WHERE game_version NOT IN (SELECT game_version FROM baselines WHERE active = 1)').run();
 
+    const entries = db.prepare('SELECT * FROM queue ORDER BY joined_at ASC, player_id ASC').all();
+    const byId = new Map(entries.map((e) => [e.player_id, e]));
+    const taken = new Set();
+    const seriesBound = new Set(); // owe a series: kept for their tournament opponent, not paired in ranked
+    const created = [];
+    const openSeries = db.prepare(tournaments.OPEN_SERIES_SQL);
+    const rulesOf = db.prepare('SELECT rules FROM tournaments WHERE id = ?');
+
+    // 1. Tournament series: any open series whose opponent is queued on the same build.
     for (const e of entries) {
+      const open = openSeries.all(e.player_id, e.player_id);
+      if (open.length) seriesBound.add(e.player_id);
       if (taken.has(e.player_id)) continue;
-      const s = tournaments.pendingSeriesFor(db, e.player_id);
-      if (!s) continue;
-      const opp = s.player_a === e.player_id ? s.player_b : s.player_a;
-      if (!taken.has(opp) && entries.some((x) => x.player_id === opp)) {
-        const t2 = db.prepare('SELECT rules FROM tournaments WHERE id = ?').get(s.tournament_id);
-        created.push(createMatch(db, s.player_a, s.player_b, { ...config.match.defaultRules, ...json(t2.rules, {}) }, s.id));
+      for (const s of open) {
+        const opp = s.player_a === e.player_id ? s.player_b : s.player_a;
+        const o = byId.get(opp);
+        if (!o || taken.has(opp) || o.game_version !== e.game_version) continue;
+        const rules = { ...config.match.defaultRules, ...json(rulesOf.get(s.tournament_id).rules, {}) };
+        created.push(createMatch(db, s.player_a, s.player_b, rules, s.id, e.game_version));
         taken.add(e.player_id); taken.add(opp);
+        break;
       }
     }
 
-    for (const a of entries) {
-      if (taken.has(a.player_id)) continue;
+    // 2. Ranked: closest rating inside both players' windows, same build, same region unless both waited long.
+    //    Candidates are found by binary search on a rating-sorted pool, so a big queue stays cheap.
+    const pool = entries.filter((e) => !taken.has(e.player_id) && !seriesBound.has(e.player_id))
+      .sort((x, y) => x.rating - y.rating || x.player_id - y.player_id);
+    const firstAtLeast = (r) => {
+      let lo = 0; let hi = pool.length;
+      while (lo < hi) { const mid = (lo + hi) >> 1; if (pool[mid].rating < r) lo = mid + 1; else hi = mid; }
+      return lo;
+    };
+    for (const a of entries) { // oldest first
+      if (taken.has(a.player_id) || seriesBound.has(a.player_id)) continue;
       let best = null;
-      for (const b of entries) {
-        if (b.player_id === a.player_id || taken.has(b.player_id)) continue;
+      for (let i = firstAtLeast(a.rating - mm.maxWindow); i < pool.length && pool[i].rating <= a.rating + mm.maxWindow; i++) {
+        const b = pool[i];
+        if (b.player_id === a.player_id || taken.has(b.player_id) || b.game_version !== a.game_version) continue;
         const gap = Math.abs(a.rating - b.rating);
         const win = Math.max(windowFor(a, t), windowFor(b, t));
-        const longWait = t - a.joined_at > 120000 && t - b.joined_at > 120000;
+        const longWait = t - a.joined_at > mm.longWaitMs && t - b.joined_at > mm.longWaitMs;
         if (gap > win || (a.region !== b.region && !longWait)) continue;
         if (!best || gap < best.gap) best = { b, gap };
       }
       if (best) {
-        created.push(createMatch(db, a.player_id, best.b.player_id, config.match.defaultRules, null));
+        created.push(createMatch(db, a.player_id, best.b.player_id, config.match.defaultRules, null, a.game_version));
         taken.add(a.player_id); taken.add(best.b.player_id);
       }
     }
@@ -160,12 +238,12 @@ function runMatchmaker(db, t = now()) {
   });
 }
 
-function createMatch(db, a, b, rules, seriesId) {
+function createMatch(db, a, b, rules, seriesId, gameVersion) {
   const id = 'm_' + crypto.randomBytes(9).toString('base64url');
   // The host creates the private room in-game; alternate who hosts at random.
   const [host, guest] = crypto.randomInt(2) ? [a, b] : [b, a];
-  db.prepare(`INSERT INTO matches (id, player_a, player_b, rules, state, series_id, created_at)
-    VALUES (?, ?, ?, ?, 'pending', ?, ?)`).run(id, host, guest, JSON.stringify(rules), seriesId, now());
+  db.prepare(`INSERT INTO matches (id, player_a, player_b, rules, game_version, state, series_id, created_at)
+    VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)`).run(id, host, guest, JSON.stringify(rules), gameVersion, seriesId, now());
   return id;
 }
 
@@ -173,7 +251,7 @@ function matchView(db, m, viewerId) {
   const pa = db.prepare('SELECT * FROM players WHERE id = ?').get(m.player_a);
   const pb = db.prepare('SELECT * FROM players WHERE id = ?').get(m.player_b);
   const view = {
-    id: m.id, state: m.state, rules: json(m.rules, {}), seriesId: m.series_id,
+    id: m.id, state: m.state, rules: json(m.rules, {}), gameVersion: m.game_version, seriesId: m.series_id,
     host: publicPlayer(pa), guest: publicPlayer(pb),
     score: m.score_a == null ? null : { host: m.score_a, guest: m.score_b },
     winner: m.winner, ratingDelta: m.rating_delta_a == null ? null : { host: m.rating_delta_a, guest: m.rating_delta_b },
@@ -188,7 +266,7 @@ function matchView(db, m, viewerId) {
 }
 
 function getMatch(db, id, viewerId) {
-  const m = db.prepare('SELECT * FROM matches WHERE id = ?').get(id);
+  const m = db.prepare('SELECT * FROM matches WHERE id = ?').get(String(id));
   if (!m) throw new HttpError(404, 'match not found');
   return matchView(db, m, viewerId);
 }
@@ -199,7 +277,7 @@ function setLobby(db, player, matchId, lobbyCode) {
   if (m.player_a !== player.id) throw new HttpError(403, 'only the host sets the lobby');
   if (m.state !== 'pending') throw new HttpError(409, 'match already started');
   if (typeof lobbyCode !== 'string' || !/^[A-Za-z0-9_-]{3,64}$/.test(lobbyCode)) throw new HttpError(400, 'invalid lobby code');
-  db.prepare("UPDATE matches SET lobby_code = ?, state = 'live' WHERE id = ?").run(lobbyCode, matchId);
+  db.prepare("UPDATE matches SET lobby_code = ?, state = 'live', live_at = ? WHERE id = ?").run(lobbyCode, now(), matchId);
   return getMatch(db, matchId, player.id);
 }
 
@@ -212,8 +290,12 @@ function submitReport(db, player, matchId, report) {
     if (!['live', 'awaiting_reports'].includes(m.state)) throw new HttpError(409, `match is ${m.state}`);
     const errs = matchlog.validateShape(report);
     if (errs.length) throw new HttpError(400, 'invalid report: ' + errs.join(', '));
+    // One report per pilot. A resubmission would also restart the report window and stall the sweep.
+    if (db.prepare('SELECT 1 FROM match_reports WHERE match_id = ? AND player_id = ?').get(matchId, player.id)) {
+      throw new HttpError(409, 'report already submitted');
+    }
 
-    db.prepare('INSERT OR REPLACE INTO match_reports (match_id, player_id, report, received_at) VALUES (?, ?, ?, ?)')
+    db.prepare('INSERT INTO match_reports (match_id, player_id, report, received_at) VALUES (?, ?, ?, ?)')
       .run(matchId, player.id, JSON.stringify(report), now());
     const reports = db.prepare('SELECT * FROM match_reports WHERE match_id = ?').all(matchId);
     if (reports.length < 2) {
@@ -228,19 +310,27 @@ function submitReport(db, player, matchId, report) {
 function resolveMatch(db, m, reports) {
   const repA = json(reports.find((r) => r.player_id === m.player_a).report);
   const repB = json(reports.find((r) => r.player_id === m.player_b).report);
-  const gameVersion = repA.gameVersion || repB.gameVersion;
-  const baseline = activeBaseline(db, gameVersion);
-  const rules = json(m.rules, {});
+  // The build comes from both players' clean scans (stored on the match), never from the logs themselves.
+  const baseline = baselineFor(db, m.game_version, { activeOnly: false });
+  const extra = [];
+  if (!baseline) extra.push({ code: 'no_reference_stats', gameVersion: m.game_version });
+  for (const [rep, pid] of [[repA, m.player_a], [repB, m.player_b]]) {
+    if (rep.gameVersion !== m.game_version) {
+      extra.push({ code: 'game_version_mismatch', player: pid, reported: rep.gameVersion ?? null, expected: m.game_version });
+    }
+  }
   const res = matchlog.reconcile(repA, repB, {
-    rules, aircraftStats: baseline ? baseline.aircraft : {}, playerA: m.player_a, playerB: m.player_b,
+    rules: json(m.rules, {}), aircraftStats: baseline ? baseline.aircraft : {},
+    playerA: m.player_a, playerB: m.player_b, minDurationSec: config.match.minDurationSec,
   });
-  if (repA.durationSec < config.match.minDurationSec && res.outcome === 'draw') res.flags.push({ code: 'too_short' });
+  res.flags.push(...extra);
 
   if (res.flags.length) {
     db.prepare("UPDATE matches SET state = 'disputed', score_a = ?, score_b = ?, flags = ? WHERE id = ?")
       .run(res.scoreA, res.scoreB, JSON.stringify(res.flags), m.id);
-    // Physics anomalies seen by the opponent flag the suspect's account for review.
-    for (const f of res.flags.filter((x) => x.code === 'speed_anomaly')) {
+    // Tampered stats in a pilot's OWN log flag that pilot's account. Anything the opponent observed (such as a
+    // speed anomaly) only sends the match to admin review: one opponent's number must not lock anyone out.
+    for (const f of res.flags.filter((x) => x.code === 'aircraft_stat_modified')) {
       db.prepare("UPDATE players SET status = 'flagged' WHERE id = ? AND status = 'active'").run(f.player);
     }
     return;
@@ -253,51 +343,83 @@ function applyResult(db, m, outcome, scoreA, scoreB, repA, repB) {
   const pb = db.prepare('SELECT * FROM players WHERE id = ?').get(m.player_b);
   const s = outcome === 'a' ? 1 : outcome === 'b' ? 0 : 0.5;
   const d = eloUpdate(pa, pb, s);
+  const ka = repA ? repA.self.kills : scoreA; const da = repA ? repA.self.deaths : scoreB;
+  const kb = repB ? repB.self.kills : scoreB; const dbb = repB ? repB.self.deaths : scoreA;
   const upd = db.prepare(`UPDATE players SET rating = rating + ?, peak_rating = MAX(peak_rating, rating + ?),
-    wins = wins + ?, losses = losses + ?, kills = kills + ?, deaths = deaths + ? WHERE id = ?`);
-  upd.run(d.a, d.a, s === 1 ? 1 : 0, s === 0 ? 1 : 0, repA ? repA.self.kills : scoreA, repA ? repA.self.deaths : scoreB, pa.id);
-  upd.run(d.b, d.b, s === 0 ? 1 : 0, s === 1 ? 1 : 0, repB ? repB.self.kills : scoreB, repB ? repB.self.deaths : scoreA, pb.id);
+    wins = wins + ?, losses = losses + ?, draws = draws + ?, kills = kills + ?, deaths = deaths + ? WHERE id = ?`);
+  upd.run(d.a, d.a, s === 1 ? 1 : 0, s === 0 ? 1 : 0, s === 0.5 ? 1 : 0, ka, da, pa.id);
+  upd.run(d.b, d.b, s === 0 ? 1 : 0, s === 1 ? 1 : 0, s === 0.5 ? 1 : 0, kb, dbb, pb.id);
   const winner = s === 1 ? pa.id : s === 0 ? pb.id : null;
   db.prepare(`UPDATE matches SET state = 'verified', winner = ?, score_a = ?, score_b = ?, rating_delta_a = ?, rating_delta_b = ?,
-    verified_at = ? WHERE id = ?`).run(winner, scoreA, scoreB, d.a, d.b, now(), m.id);
+    kills_a = ?, deaths_a = ?, kills_b = ?, deaths_b = ?, verified_at = ? WHERE id = ?`)
+    .run(winner, scoreA, scoreB, d.a, d.b, ka, da, kb, dbb, now(), m.id);
   if (m.series_id && winner) tournaments.recordSeriesResult(db, m.series_id, winner);
 }
 
-// Admin: settle a disputed match (or void it).
-function resolveDispute(db, matchId, { winner, scoreHost = 0, scoreGuest = 0, void: isVoid }) {
+// Undo a verified result: rating deltas, record, credited K/D and the series game. peak_rating is not
+// recomputed (see docs/SECURITY.md).
+function revertResult(db, m) {
+  if (m.series_id && m.winner) tournaments.revertSeriesResult(db, m.series_id, m.winner);
+  const s = m.winner == null ? 0.5 : m.winner === m.player_a ? 1 : 0;
+  const upd = db.prepare(`UPDATE players SET rating = rating - ?, wins = MAX(0, wins - ?), losses = MAX(0, losses - ?),
+    draws = MAX(0, draws - ?), kills = MAX(0, kills - ?), deaths = MAX(0, deaths - ?) WHERE id = ?`);
+  upd.run(m.rating_delta_a || 0, s === 1 ? 1 : 0, s === 0 ? 1 : 0, s === 0.5 ? 1 : 0, m.kills_a ?? m.score_a ?? 0, m.deaths_a ?? m.score_b ?? 0, m.player_a);
+  upd.run(m.rating_delta_b || 0, s === 0 ? 1 : 0, s === 1 ? 1 : 0, s === 0.5 ? 1 : 0, m.kills_b ?? m.score_b ?? 0, m.deaths_b ?? m.score_a ?? 0, m.player_b);
+}
+
+// Admin: settle a disputed or stuck match, or void any match (a verified one is reverted first).
+function resolveDispute(db, matchId, { winner, scoreHost = 0, scoreGuest = 0, void: isVoid } = {}) {
   return tx(db, () => {
-    const m = db.prepare('SELECT * FROM matches WHERE id = ?').get(matchId);
+    const m = db.prepare('SELECT * FROM matches WHERE id = ?').get(String(matchId));
     if (!m) throw new HttpError(404, 'match not found');
-    if (!['disputed', 'awaiting_reports', 'live', 'pending'].includes(m.state)) throw new HttpError(409, `match is ${m.state}`);
-    if (isVoid) {
-      db.prepare("UPDATE matches SET state = 'void' WHERE id = ?").run(matchId);
+    if (isVoid === true) {
+      if (!['disputed', 'awaiting_reports', 'live', 'pending', 'verified'].includes(m.state)) throw new HttpError(409, `match is ${m.state}`);
+      if (m.state === 'verified') revertResult(db, m);
+      db.prepare("UPDATE matches SET state = 'void' WHERE id = ?").run(m.id);
     } else {
+      if (!['disputed', 'awaiting_reports', 'live', 'pending'].includes(m.state)) throw new HttpError(409, `match is ${m.state}`);
       const outcome = winner === 'host' ? 'a' : winner === 'guest' ? 'b' : winner === 'draw' ? 'draw' : null;
       if (!outcome) throw new HttpError(400, 'winner must be host, guest or draw');
-      applyResult(db, m, outcome, Number(scoreHost), Number(scoreGuest), null, null);
+      const sh = Number(scoreHost); const sg = Number(scoreGuest);
+      if (!Number.isSafeInteger(sh) || !Number.isSafeInteger(sg) || sh < 0 || sg < 0) throw new HttpError(400, 'scores must be non-negative integers');
+      applyResult(db, m, outcome, sh, sg, null, null);
     }
-    return getMatch(db, matchId);
+    return getMatch(db, m.id);
   });
 }
 
-// Matches where only one side reported inside the window go to admin review.
+// Background sweep for matches that can no longer finish on their own.
 function sweepStaleMatches(db, t = now()) {
+  const c = config.match;
+  // Only one side reported inside the window: admin review.
   const stale = db.prepare(`SELECT m.id FROM matches m WHERE m.state = 'awaiting_reports'
-    AND (SELECT MIN(received_at) FROM match_reports r WHERE r.match_id = m.id) < ?`).all(t - config.match.reportWindowMs);
+    AND (SELECT MIN(received_at) FROM match_reports r WHERE r.match_id = m.id) < ?`).all(t - c.reportWindowMs);
   const upd = db.prepare("UPDATE matches SET state = 'disputed', flags = ? WHERE id = ?");
   for (const { id } of stale) upd.run(JSON.stringify([{ code: 'missing_opponent_report' }]), id);
   // Rooms never created within the window are voided.
-  db.prepare("UPDATE matches SET state = 'void' WHERE state = 'pending' AND created_at < ?").run(t - config.match.reportWindowMs);
-  return stale.length;
+  db.prepare("UPDATE matches SET state = 'void' WHERE state = 'pending' AND created_at < ?").run(t - c.reportWindowMs);
+  // Rooms that went live but got no report from anyone are voided once the match must be over, so a guest who
+  // never joined (or a fake room code) cannot lock both pilots out of the queue.
+  const live = db.prepare(`SELECT id, rules, created_at, live_at FROM matches m WHERE state = 'live'
+    AND NOT EXISTS (SELECT 1 FROM match_reports r WHERE r.match_id = m.id)`).all();
+  const voidIt = db.prepare("UPDATE matches SET state = 'void', flags = ? WHERE id = ? AND state = 'live'");
+  let voided = 0;
+  for (const m of live) {
+    const limit = Number(json(m.rules, {}).timeLimitSec) || c.defaultRules.timeLimitSec;
+    if ((m.live_at ?? m.created_at) + limit * 1000 + c.liveGraceMs < t) {
+      voidIt.run(JSON.stringify([{ code: 'no_reports' }]), m.id); voided++;
+    }
+  }
+  return stale.length + voided;
 }
 
 function recentMatches(db, { playerId, state, limit = 50 } = {}) {
   const where = []; const args = [];
   if (playerId) { where.push('(m.player_a = ? OR m.player_b = ?)'); args.push(playerId, playerId); }
-  if (state) { where.push('m.state = ?'); args.push(state); }
+  if (typeof state === 'string' && state) { where.push('m.state = ?'); args.push(state); }
   const rows = db.prepare(`SELECT m.*, pa.name a_name, pb.name b_name FROM matches m
     JOIN players pa ON pa.id = m.player_a JOIN players pb ON pb.id = m.player_b
-    ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY m.created_at DESC LIMIT ?`).all(...args, Math.min(limit, 200));
+    ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY m.created_at DESC LIMIT ?`).all(...args, clampInt(limit, 50, 1, 200));
   return rows.map((m) => ({
     id: m.id, state: m.state, host: { id: m.player_a, name: m.a_name }, guest: { id: m.player_b, name: m.b_name },
     score: m.score_a == null ? null : { host: m.score_a, guest: m.score_b }, winner: m.winner,
@@ -307,20 +429,50 @@ function recentMatches(db, { playerId, state, limit = 50 } = {}) {
 }
 
 // ---------- admin: baselines & mods ----------
-function putBaseline(db, { gameVersion, manifest, aircraft }) {
-  if (!gameVersion || !manifest || !Array.isArray(manifest.files)) throw new HttpError(400, 'gameVersion and manifest.files required');
-  db.prepare(`INSERT INTO baselines (game_version, manifest, aircraft, active, created_at) VALUES (?, ?, ?, 1, ?)
-    ON CONFLICT(game_version) DO UPDATE SET manifest = excluded.manifest, aircraft = excluded.aircraft, active = 1`)
-    .run(String(gameVersion), JSON.stringify(manifest), JSON.stringify(aircraft || {}), now());
-  return { gameVersion, files: manifest.files.length, aircraft: Object.keys(aircraft || {}).length };
+function putBaseline(db, { gameVersion, manifest, aircraft, active = true } = {}) {
+  if (typeof gameVersion !== 'string' || !gameVersion || gameVersion.length > 32 || !manifest || !Array.isArray(manifest.files)) {
+    throw new HttpError(400, 'gameVersion (string) and manifest.files required');
+  }
+  if (aircraft !== undefined && !isPlainObject(aircraft)) throw new HttpError(400, 'aircraft must be an object of stats per aircraft id');
+  const on = active === false || active === 0 ? 0 : 1;
+  db.prepare(`INSERT INTO baselines (game_version, manifest, aircraft, active, created_at) VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(game_version) DO UPDATE SET manifest = excluded.manifest, aircraft = excluded.aircraft, active = excluded.active`)
+    .run(gameVersion, JSON.stringify(manifest), JSON.stringify(aircraft || {}), on, now());
+  return { gameVersion, active: !!on, files: manifest.files.length, aircraft: Object.keys(aircraft || {}).length };
 }
 
-function addApprovedMod(db, { name, path, size, sha256: hash, category = 'cosmetic' }) {
-  if (!name || !path || !Number.isInteger(size) || !/^[a-f0-9]{64}$/i.test(hash || '')) throw new HttpError(400, 'name, path, size, sha256 required');
+// Retire (or re-enable) a game build. Retired builds cannot scan clean and their tokens stop working.
+function setBaselineActive(db, gameVersion, active) {
+  if (typeof active !== 'boolean') throw new HttpError(400, 'active must be true or false');
+  const r = db.prepare('UPDATE baselines SET active = ? WHERE game_version = ?').run(active ? 1 : 0, String(gameVersion));
+  if (!r.changes) throw new HttpError(404, 'baseline not found');
+  return { gameVersion: String(gameVersion), active };
+}
+
+function addOneMod(db, { name, path, size, sha256: hash, category = 'cosmetic' } = {}) {
+  if (typeof name !== 'string' || !name || typeof path !== 'string' || !path || !Number.isSafeInteger(size) || size < 0
+    || typeof hash !== 'string' || !/^[a-f0-9]{64}$/i.test(hash)) {
+    throw new HttpError(400, 'name, path, size, sha256 required');
+  }
   if (!['required', 'cosmetic'].includes(category)) throw new HttpError(400, 'category must be required or cosmetic');
   db.prepare('INSERT OR REPLACE INTO approved_mods (name, path, size, sha256, category) VALUES (?, ?, ?, ?, ?)')
     .run(name, path, size, hash.toLowerCase(), category);
-  return db.prepare('SELECT * FROM approved_mods ORDER BY name').all();
+}
+
+// Body is one mod file, or { mods: [...] } for a whole folder (see `rvng approve`).
+function addApprovedMods(db, body = {}) {
+  const list = Array.isArray(body.mods) ? body.mods : [body];
+  if (!list.length || list.length > 5000) throw new HttpError(400, 'mods must hold 1-5000 entries');
+  tx(db, () => { for (const m of list) addOneMod(db, m); });
+  return listApprovedMods(db);
+}
+
+const listApprovedMods = (db) => db.prepare('SELECT * FROM approved_mods ORDER BY name, path').all();
+
+function removeApprovedMod(db, id) {
+  const r = db.prepare('DELETE FROM approved_mods WHERE id = ?').run(id);
+  if (!r.changes) throw new HttpError(404, 'approved mod not found');
+  return listApprovedMods(db);
 }
 
 function setPlayerStatus(db, id, status) {
@@ -330,9 +482,10 @@ function setPlayerStatus(db, id, status) {
 }
 
 function integrityLog(db, { limit = 100, verdict } = {}) {
+  const v = typeof verdict === 'string' && verdict ? verdict : null;
   return db.prepare(`SELECT r.id, r.player_id, p.name, r.game_version, r.verdict, r.findings, r.mods, r.created_at
-    FROM integrity_reports r JOIN players p ON p.id = r.player_id ${verdict ? 'WHERE r.verdict = ?' : ''}
-    ORDER BY r.id DESC LIMIT ?`).all(...(verdict ? [verdict] : []), limit)
+    FROM integrity_reports r JOIN players p ON p.id = r.player_id ${v ? 'WHERE r.verdict = ?' : ''}
+    ORDER BY r.id DESC LIMIT ?`).all(...(v ? [v] : []), clampInt(limit, 100, 1, 500))
     .map((r) => ({ ...r, findings: json(r.findings, []), mods: json(r.mods, []) }));
 }
 
@@ -349,5 +502,6 @@ module.exports = {
   registerPlayer, leaderboard, playerProfile, publicPlayer,
   submitIntegrity, joinQueue, leaveQueue, queueStatus, runMatchmaker,
   getMatch, setLobby, submitReport, resolveDispute, sweepStaleMatches, recentMatches,
-  putBaseline, addApprovedMod, setPlayerStatus, integrityLog, stats,
+  putBaseline, setBaselineActive, addApprovedMods, listApprovedMods, removeApprovedMod,
+  setPlayerStatus, integrityLog, stats,
 };

@@ -1,5 +1,9 @@
 'use strict';
 process.env.ADMIN_TOKEN = 'test-admin';
+const config = require('../src/config');
+// Tests scan and register many times in quick succession.
+config.integrity.minIntervalMs = 0;
+config.registration.max = 1e9;
 const { openDb } = require('../src/db');
 const { createApp } = require('../src/app');
 const { api } = require('../../client/lib/sign');
@@ -35,15 +39,41 @@ async function setup() {
   return { db, url, admin, register, cleanReport, close };
 }
 
-function log({ selfAc = 'f22a', oppAc = 'su57', k = 5, d = 2, dur = 300, oppSpeed = 2300, end = 'kill_target' } = {}) {
+// A match log as the host's mod writes it. `stats` overrides the live stats of the pilot's own aircraft.
+function log({ selfAc = 'f22a', oppAc = 'su57', k = 5, d = 2, dur = 300, oppSpeed = 2300, end = 'kill_target', events: extra = [], stats } = {}) {
   const events = [];
   for (let i = 0; i < k; i++) events.push({ t: i * 10, type: 'kill', actor: 'self' });
   for (let i = 0; i < d; i++) events.push({ t: i * 10 + 5, type: 'kill', actor: 'opponent' });
+  events.push(...extra);
   return { gameVersion: '1.0.0', durationSec: dur, endReason: end, self: { aircraftId: selfAc, kills: k, deaths: d },
-    opponent: { aircraftId: oppAc, kills: d, deaths: k }, events, telemetry: { opponentMaxSpeed: oppSpeed } };
+    opponent: { aircraftId: oppAc, kills: d, deaths: k }, events, telemetry: { opponentMaxSpeed: oppSpeed },
+    runtime: { aircraft: { [selfAc]: stats || AIRCRAFT[selfAc] } } };
 }
 
 // Mirror of `log` from the other pilot's point of view.
-const mirror = (o = {}) => log({ selfAc: o.oppAc || 'su57', oppAc: o.selfAc || 'f22a', k: o.d ?? 2, d: o.k ?? 5, dur: o.dur ?? 300, oppSpeed: o.mirrorOppSpeed ?? 2300 });
+const mirror = (o = {}) => log({
+  selfAc: o.oppAc || 'su57', oppAc: o.selfAc || 'f22a', k: o.d ?? 2, d: o.k ?? 5, dur: o.dur ?? 300,
+  oppSpeed: o.mirrorOppSpeed ?? 2300, end: o.end, events: o.mirrorEvents, stats: o.mirrorStats,
+});
 
-module.exports = { setup, log, mirror, BASE_FILES, MOD_FILE, AIRCRAFT, H };
+// Scan both pilots clean, queue them, and have the host open the room. Returns the live match.
+async function queuePair(env, a, b, { region = 'eu' } = {}) {
+  const assert = require('node:assert');
+  for (const p of [a, b]) {
+    const s = await p.call('POST', '/api/integrity/report', env.cleanReport());
+    assert.equal(s.verdict, 'clean');
+    await p.call('POST', '/api/queue/join', { integrityToken: s.integrityToken, region });
+  }
+  const sa = await a.call('GET', '/api/queue/status');
+  const sb = await b.call('GET', '/api/queue/status');
+  assert.equal(sa.state, 'matched'); assert.equal(sb.state, 'matched');
+  assert.equal(sa.match.id, sb.match.id);
+  const host = sa.match.role === 'host' ? a : b;
+  const guest = host === a ? b : a;
+  await host.call('POST', `/api/matches/${sa.match.id}/lobby`, { lobbyCode: 'ROOM1234' });
+  return { id: sa.match.id, seriesId: sa.match.seriesId, host, guest };
+}
+
+const pub = async (env, path) => (await fetch(env.url + path)).json();
+
+module.exports = { setup, log, mirror, queuePair, pub, BASE_FILES, MOD_FILE, AIRCRAFT, H, config };

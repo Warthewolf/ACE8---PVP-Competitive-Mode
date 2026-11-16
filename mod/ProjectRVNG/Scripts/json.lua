@@ -1,6 +1,11 @@
 -- Minimal JSON encode/decode for the bridge files.
 local M = {}
 
+-- Lua has one table type, so an empty list and an empty object look the same. Lists that may be empty
+-- (such as a match log's events) are created with M.array() and always encode as [].
+local ARRAY_MT = {}
+function M.array(t) return setmetatable(t or {}, ARRAY_MT) end
+
 local escapes = { ['"'] = '\\"', ['\\'] = '\\\\', ['\b'] = '\\b', ['\f'] = '\\f', ['\n'] = '\\n', ['\r'] = '\\r', ['\t'] = '\\t' }
 
 local function isArray(t)
@@ -24,7 +29,7 @@ function M.encode(v)
     return '"' .. v:gsub('[%c"\\]', function(c) return escapes[c] or string.format("\\u%04x", c:byte()) end) .. '"'
   elseif t == "table" then
     local parts = {}
-    if next(v) ~= nil and isArray(v) then
+    if getmetatable(v) == ARRAY_MT or (next(v) ~= nil and isArray(v)) then
       for _, x in ipairs(v) do parts[#parts + 1] = M.encode(x) end
       return "[" .. table.concat(parts, ",") .. "]"
     end

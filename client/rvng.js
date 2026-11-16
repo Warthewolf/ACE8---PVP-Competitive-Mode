@@ -3,10 +3,14 @@
 /**
  * Project RVNG companion.
  *
- *   rvng register --server URL --name NAME            create an account, writes credentials.json
- *   rvng scan     --game DIR [--no-cache]             integrity scan, prints the server verdict
- *   rvng baseline --game DIR --version V [--aircraft stats.json]   (admins) build a clean-install baseline
- *   rvng run      --game DIR [--region eu]            bridge daemon used by the in-game mod
+ *   rvng register   --server URL --name NAME              create an account, writes credentials.json (owner-only)
+ *   rvng scan       --game DIR [--no-cache]                integrity scan, prints the server verdict
+ *   rvng join-event --id N                                 sign up for an open knockout event
+ *   rvng run        --game DIR [--region eu] [--no-cache]  bridge daemon used by the in-game mod
+ *   rvng baseline   --game DIR --version V [--aircraft stats.json]             (admins) build a clean-install baseline
+ *   rvng approve    --game DIR --path REL --name NAME [--category required]    (admins) pin a mod file or every file of a folder
+ *
+ * --no-cache hashes every file instead of reusing hashes from .rvng-cache.json. Use it for event matches.
  *
  * The in-game mod (UE4SS Lua) cannot speak signed HTTPS, so it exchanges small JSON files with this
  * daemon in <game>/ProjectRVNG/bridge/ :
@@ -15,13 +19,15 @@
  *                   lobby.json    { matchId, lobbyCode }        (host only, after creating the room)
  *                   result.json   match log (see server/src/matchlog.js)
  *   daemon -> mod : state.json    { state, message, match }
+ * lobby.json and result.json are deleted only once the server has accepted them; a permanent rejection
+ * renames them to *.failed. Every result is copied to bridge/archive/ before it is sent.
  */
 const fs = require('node:fs');
 const path = require('node:path');
 const { api } = require('./lib/sign');
-const { scan, DEFAULT_EXCLUDES } = require('./lib/scan');
+const { scan, hashFile, DEFAULT_EXCLUDES } = require('./lib/scan');
 
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 
 function args(argv) {
   const out = { _: [] };
@@ -37,118 +43,216 @@ function args(argv) {
 }
 
 const credPath = (a) => a.credentials || path.join(process.cwd(), 'credentials.json');
-const loadCreds = (a) => JSON.parse(fs.readFileSync(credPath(a), 'utf8'));
+function loadCreds(a) {
+  const p = credPath(a);
+  if (process.platform !== 'win32') {
+    try {
+      if ((fs.statSync(p).mode & 0o077) !== 0) console.warn(`warning: ${p} is readable by other users; run: chmod 600 "${p}"`);
+    } catch { /* reported by the read below */ }
+  }
+  return JSON.parse(fs.readFileSync(p, 'utf8'));
+}
 const bridgeDir = (game) => path.join(game, 'ProjectRVNG', 'bridge');
 const readJson = (f) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; } };
-function writeJson(f, data) {
+function writeJson(f, data, mode) {
   fs.mkdirSync(path.dirname(f), { recursive: true });
-  fs.writeFileSync(f + '.tmp', JSON.stringify(data, null, 2));
-  fs.renameSync(f + '.tmp', f);
+  const tmp = f + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2), mode ? { mode } : undefined);
+  if (mode) fs.chmodSync(tmp, mode); // the mode option only applies when the file is created
+  fs.renameSync(tmp, f);
 }
-const take = (f) => { const d = readJson(f); if (d) fs.rmSync(f, { force: true }); return d; };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function buildReport(game, opts = {}) {
-  const files = scan(game, { cacheFile: opts.noCache ? path.join(require('node:os').tmpdir(), `rvng-${process.pid}.json`) : undefined });
+function buildReport(game, opts = {}) {
+  const stats = {};
+  const files = scan(game, { useCache: !opts.noCache, stats });
   const runtime = readJson(path.join(bridgeDir(game), 'runtime.json')) || {};
   return {
     scannerVersion: VERSION,
     gameVersion: opts.gameVersion || runtime.gameVersion,
     files,
+    scanStats: stats,
     runtime: { aircraft: runtime.aircraft, loadedModules: runtime.loadedModules },
   };
 }
 
 async function cmdRegister(a) {
-  const res = await api(a.server, null, 'POST', '/api/players/register', { name: a.name, platformId: a.platform });
-  writeJson(credPath(a), { server: a.server, apiKey: res.apiKey, apiSecret: res.apiSecret, playerId: res.id, name: res.name });
+  if (!a.server || !a.name) throw new Error('--server and --name required');
+  const res = await api(a.server, null, 'POST', '/api/players/register', { name: a.name });
+  writeJson(credPath(a), { server: a.server, apiKey: res.apiKey, apiSecret: res.apiSecret, playerId: res.id, name: res.name }, 0o600);
   console.log(`Registered ${res.name} (#${res.id}). Credentials saved to ${credPath(a)} - keep this file private.`);
 }
 
 async function cmdScan(a) {
   const creds = loadCreds(a);
-  const report = await buildReport(a.game, { noCache: a['no-cache'], gameVersion: a.version });
+  const report = buildReport(a.game, { noCache: a['no-cache'], gameVersion: a.version });
   const res = await api(creds.server, creds, 'POST', '/api/integrity/report', report);
-  console.log(`Verdict: ${res.verdict.toUpperCase()}  (${report.files.length} files scanned)`);
+  console.log(`Verdict: ${res.verdict.toUpperCase()}  (${report.files.length} files scanned, ${report.scanStats.hashed} hashed)`);
   for (const m of res.mods) console.log(`  mod ${m.approved ? 'APPROVED  ' : 'UNAPPROVED'} ${m.path} (${m.size} bytes)`);
   for (const f of res.findings) console.log(`  [${f.severity}] ${f.code} ${f.path || f.aircraft || f.module || ''}${f.stat ? '.' + f.stat : ''}`);
   return res;
 }
 
+async function cmdJoinEvent(a) {
+  if (!a.id) throw new Error('--id <event number> required');
+  const creds = loadCreds(a);
+  const t = await api(creds.server, creds, 'POST', `/api/tournaments/${encodeURIComponent(a.id)}/register`);
+  console.log(`Registered for ${t.name} (${t.entrants.length}/${t.size} pilots). The bracket is seeded when the event starts.`);
+}
+
 function cmdBaseline(a) {
   if (!a.version) throw new Error('--version required');
-  const files = scan(a.game, { cacheFile: path.join(require('node:os').tmpdir(), 'rvng-baseline.json') })
+  const files = scan(a.game, { useCache: false })
     // Mods are registered separately as approved mods, never baked into the baseline.
     .filter((f) => !/(^|\/)(~mods|logicmods|ue4ss|projectrvng)\//i.test(f.path));
+  const links = files.filter((f) => f.size < 0);
+  if (links.length) throw new Error(`the install contains links, which cannot be part of a baseline: ${links.map((f) => f.path).join(', ')}`);
   const aircraft = a.aircraft ? JSON.parse(fs.readFileSync(a.aircraft, 'utf8')) : {};
   const out = a.out || `baseline-${a.version}.json`;
   writeJson(out, { gameVersion: a.version, manifest: { files }, aircraft });
   console.log(`Wrote ${out}: ${files.length} files, ${Object.keys(aircraft).length} aircraft. Upload with PUT /api/admin/baselines.`);
+  if (!Object.keys(aircraft).length) console.warn('warning: no aircraft stats given (--aircraft); every match on this build will be disputed.');
 }
 
-async function cmdRun(a) {
-  const creds = loadCreds(a);
-  const dir = bridgeDir(a.game);
-  fs.mkdirSync(dir, { recursive: true });
-  const setState = (state, extra = {}) => writeJson(path.join(dir, 'state.json'), { state, at: Date.now(), ...extra });
-  let current = { state: 'idle' };
-  setState('idle', { message: 'Companion connected' });
-  console.log(`Bridge running in ${dir}`);
+// Admin helper: pins one file, or every file of a folder (a mod, or the UE4SS loader and its settings), as approved.
+function cmdApprove(a) {
+  const rel = a.path || a.dir;
+  if (!rel || !a.name) throw new Error('--path <file or folder under the game root> and --name required');
+  const sub = String(rel).replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+  const category = a.category || 'cosmetic';
+  if (!['required', 'cosmetic'].includes(category)) throw new Error('--category must be required or cosmetic');
+  const full = path.join(a.game, sub);
+  const st = fs.lstatSync(full);
+  if (st.isSymbolicLink()) throw new Error(`links cannot be approved: ${sub}`);
+  const all = st.isFile()
+    ? [{ path: '', size: st.size, sha256: hashFile(full) }]
+    : scan(full, { useCache: false, excludes: [] });
+  const links = all.filter((f) => f.size < 0);
+  if (links.length) throw new Error(`links cannot be approved: ${links.map((f) => f.path).join(', ')}`);
+  const mods = all.map((f) => ({ name: a.name, path: f.path ? `${sub}/${f.path}` : sub, size: f.size, sha256: f.sha256, category }));
+  const out = a.out || `mods-${String(a.name).replace(/[^A-Za-z0-9_-]/g, '_')}.json`;
+  writeJson(out, { mods });
+  console.log(`Wrote ${out}: ${mods.length} files (${category}). Upload with POST /api/admin/mods.`);
+}
 
-  const tick = async () => {
-    const req = take(path.join(dir, 'request.json'));
+/**
+ * The bridge between the in-game mod and the server. tick() runs once a second.
+ * @param call  (method, path, body) => Promise; defaults to signed requests with `creds`.
+ */
+function createBridge({ creds, game, region, noCache = false, call = (m, p, b) => api(creds.server, creds, m, p, b) }) {
+  const dir = bridgeDir(game);
+  fs.mkdirSync(dir, { recursive: true });
+  const file = (n) => path.join(dir, n);
+  let current = { state: 'idle' };
+  let last = { state: 'idle' };
+  const setState = (state, extra = {}) => { last = { state, at: Date.now(), ...extra }; writeJson(file('state.json'), last); };
+
+  const show = (q, message) => {
+    current = q;
+    if (q.state === 'matched') setState('matched', { match: q.match, message: message || `Match ${q.match.id} (${q.match.state})` });
+    else if (q.state === 'queued') setState('queued', { message: message || `Searching... ${q.waitingSec}s` });
+    else setState(q.state, { message: message || 'Ready' });
+  };
+  // Ask the server where this pilot stands: after a restart, a cancel, or a refused join.
+  const resync = async (message) => show(await call('GET', '/api/queue/status'), message);
+
+  // Network errors, 429 and 5xx keep the file for the next tick; other 4xx mean the server will never take it.
+  const permanent = (e) => e.status >= 400 && e.status < 500 && e.status !== 429;
+  const finish = (f, ok) => { try { if (ok) fs.rmSync(f, { force: true }); else fs.renameSync(f, f + '.failed'); } catch { /* gone */ } };
+  async function submit(name, send, alreadyDone) {
+    const f = file(name);
+    const data = readJson(f);
+    if (!data) return null;
+    try {
+      const res = await send(data);
+      finish(f, true);
+      return { data, res };
+    } catch (e) {
+      if (alreadyDone(e)) { finish(f, true); return { data, res: null }; }
+      if (permanent(e)) finish(f, false);
+      throw e;
+    }
+  }
+
+  async function tick() {
+    const reqF = file('request.json');
+    const req = readJson(reqF);
+    if (req) fs.rmSync(reqF, { force: true }); // one-shot UI actions
     if (req && req.action === 'cancel') {
-      await api(creds.server, creds, 'POST', '/api/queue/leave').catch(() => {});
-      current = { state: 'idle' }; setState('idle', { message: 'Left queue' });
+      await call('POST', '/api/queue/leave').catch(() => {});
+      await resync('Left queue');
+      if (current.state === 'matched') setState('matched', { match: current.match, message: 'An opponent was already found: the match stays open' });
     }
     if (req && req.action === 'queue') {
       setState('scanning', { message: 'Verifying game files...' });
-      const report = await buildReport(a.game);
-      const scanRes = await api(creds.server, creds, 'POST', '/api/integrity/report', report);
+      const scanRes = await call('POST', '/api/integrity/report', buildReport(game, { noCache }));
       if (scanRes.verdict !== 'clean') {
         current = { state: 'rejected' };
         setState('rejected', { message: 'Integrity check failed', findings: scanRes.findings.slice(0, 20) });
         return;
       }
-      const q = await api(creds.server, creds, 'POST', '/api/queue/join', { integrityToken: scanRes.integrityToken, region: req.region || a.region || 'global' });
-      current = q; setState(q.state, { match: q.match, message: q.state === 'queued' ? 'Searching for opponent' : 'Opponent found' });
+      try {
+        const q = await call('POST', '/api/queue/join', { integrityToken: scanRes.integrityToken, region: req.region || region || 'global' });
+        show(q, q.state === 'queued' ? 'Searching for opponent' : 'Opponent found');
+      } catch (e) {
+        if (e.status === 409) await resync('You already have an open match');
+        else throw e;
+      }
     }
 
     if (['queued', 'matched'].includes(current.state)) {
-      const q = await api(creds.server, creds, 'GET', '/api/queue/status');
-      current = q;
-      if (q.state === 'idle') setState('idle', { message: 'Queue timed out' });
-      else setState(q.state, { match: q.match, message: q.state === 'matched' ? `Match ${q.match.id} (${q.match.state})` : `Searching... ${q.waitingSec}s` });
+      const q = await call('GET', '/api/queue/status');
+      if (q.state === 'idle') show(q, current.state === 'queued' ? 'Queue timed out' : 'Match closed');
+      else show(q);
     }
 
-    const lobby = take(path.join(dir, 'lobby.json'));
-    if (lobby) await api(creds.server, creds, 'POST', `/api/matches/${lobby.matchId}/lobby`, { lobbyCode: lobby.lobbyCode });
+    // A 409 on the lobby means the room was already posted (the earlier response was lost).
+    await submit('lobby.json', (l) => call('POST', `/api/matches/${encodeURIComponent(l.matchId)}/lobby`, { lobbyCode: l.lobbyCode }),
+      (e) => e.status === 409);
 
-    const result = take(path.join(dir, 'result.json'));
+    const result = readJson(file('result.json'));
     if (result) {
-      const m = await api(creds.server, creds, 'POST', `/api/matches/${result.matchId}/report`, result);
-      current = { state: 'reported' };
-      setState('reported', { match: m, message: `Result submitted (${m.state})` });
-      writeJson(path.join(dir, 'archive', `${result.matchId}.json`), result);
+      const safeId = String(result.matchId || 'unknown').replace(/[^A-Za-z0-9_-]/g, '');
+      writeJson(path.join(dir, 'archive', `${safeId}.json`), result); // keep a copy before sending
+      const r = await submit('result.json', (d) => call('POST', `/api/matches/${encodeURIComponent(d.matchId)}/report`, d),
+        (e) => e.status === 409 && /already submitted/.test(e.message));
+      if (r) {
+        current = { state: 'reported' };
+        setState('reported', { match: r.res, message: r.res ? `Result submitted (${r.res.state})` : 'Result already submitted' });
+      }
     }
-  };
+  }
 
+  return { dir, tick, resync, setState, current: () => current, last: () => last };
+}
+
+async function cmdRun(a) {
+  const creds = loadCreds(a);
+  const bridge = createBridge({ creds, game: a.game, region: a.region, noCache: !!a['no-cache'] });
+  await bridge.resync('Companion connected').catch((e) => bridge.setState('idle', { message: 'Companion connected (server unreachable)', error: e.message }));
+  console.log(`Bridge running in ${bridge.dir}`);
   for (;;) {
-    try { await tick(); } catch (e) { console.error('bridge:', e.message); setState(current.state || 'idle', { error: e.message }); }
-    await new Promise((r) => setTimeout(r, 1000));
+    try { await bridge.tick(); } catch (e) {
+      console.error('bridge:', e.message);
+      try { bridge.setState(bridge.last().state, { ...bridge.last(), error: e.message }); } catch { /* disk error */ }
+    }
+    await sleep(1000);
   }
 }
 
 async function main() {
   const a = args(process.argv.slice(2));
   const cmd = a._[0];
-  const needGame = ['scan', 'baseline', 'run'];
+  const needGame = ['scan', 'baseline', 'run', 'approve'];
   if (needGame.includes(cmd) && !a.game) throw new Error('--game <install dir> required');
   if (cmd === 'register') return cmdRegister(a);
   if (cmd === 'scan') return cmdScan(a);
+  if (cmd === 'join-event') return cmdJoinEvent(a);
   if (cmd === 'baseline') return cmdBaseline(a);
+  if (cmd === 'approve') return cmdApprove(a);
   if (cmd === 'run') return cmdRun(a);
   console.log(fs.readFileSync(__filename, 'utf8').split('*/')[0].replace(/^[\s\S]*?\/\*\*/, '').replace(/^ \* ?/gm, ''));
 }
 
 if (require.main === module) main().catch((e) => { console.error(e.message); process.exit(1); });
-module.exports = { buildReport, DEFAULT_EXCLUDES };
+module.exports = { buildReport, createBridge, writeJson, DEFAULT_EXCLUDES };

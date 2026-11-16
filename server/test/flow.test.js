@@ -56,7 +56,7 @@ test('disagreeing logs are disputed and do not change ratings', async () => {
   } finally { await env.close(); }
 });
 
-test('speed anomaly seen in the opponent log flags the cheater', async () => {
+test('speed anomaly seen in the opponent log sends the match to review without locking the suspect out', async () => {
   const env = await setup();
   try {
     const a = await env.register('Speedy'); const b = await env.register('Honest');
@@ -67,7 +67,9 @@ test('speed anomaly seen in the opponent log flags the cheater', async () => {
     assert.equal(r.state, 'disputed');
     const f = r.flags.find((x) => x.code === 'speed_anomaly');
     assert.equal(f.player, host.id);
-    await assert.rejects(host.call('GET', '/api/me').then((me) => { if (me.status === 'flagged') throw new Error('flagged'); }), /flagged/);
+    // One opponent's number is evidence for the admin, not grounds to flag the account automatically.
+    assert.equal((await host.call('GET', '/api/me')).status, 'active');
+    assert.equal((await host.call('GET', '/api/me')).rating, 1500);
   } finally { await env.close(); }
 });
 

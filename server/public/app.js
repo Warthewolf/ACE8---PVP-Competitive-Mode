@@ -30,10 +30,10 @@ const cat = (base, active, items) => `<div class="cat"><div class="lbl">Category
 // ---------- reusable blocks ----------
 function pilotRow(p, i) {
   return `<div class="row" role="button" tabindex="0" aria-expanded="false" data-drawer="d${i}">
-      <div class="thumb">${tile({ art: '', big: esc(p.name[0].toUpperCase()), cls: 'sq' })}</div>
+      <div class="thumb">${tile({ art: '', big: esc((p.name || '?').charAt(0).toUpperCase()), cls: 'sq' })}</div>
       <div class="yr">${p.rank}</div>
       <div class="name"><a href="#/player/${p.id}">${esc(p.name)}</a> ${badge(p.tier, p.tier)}</div>
-      <div class="stats"><span><b>${p.rating}</b>Rating</span><span><b>${p.wins}–${p.losses}</b>Record</span>
+      <div class="stats"><span><b>${p.rating}</b>Rating</span><span><b>${record(p)}</b>Record</span>
         <span class="opt"><b>${Math.round((100 * p.wins) / Math.max(1, p.wins + p.losses))}%</b>Win rate</span><span class="opt"><b>${p.kd}</b>K/D</span></div>
       <span class="plus" aria-hidden="true"></span>
     </div>
@@ -42,6 +42,7 @@ function pilotRow(p, i) {
       <a class="btn-line" href="#/player/${p.id}">Pilot profile</a>
     </div>`;
 }
+const record = (p) => `${p.wins}–${p.losses}${p.draws ? `–${p.draws}` : ''}`;
 const fig = (label, value) => `<div><span class="box">${esc(label)}</span><div class="when">${esc(value)}</div></div>`;
 const leaderList = (rows) => (rows.length
   ? `<div class="toolbar"><button type="button" data-allopen>All open <svg width="18" height="12" viewBox="0 0 18 12" fill="none" stroke="#555"><path d="M1 1l8 5 8-5M1 6l8 5 8-5"/></svg></button></div><div class="list">${rows.map(pilotRow).join('')}</div>`
@@ -49,10 +50,12 @@ const leaderList = (rows) => (rows.length
 
 function matchCard(m) {
   const score = m.score ? `${m.score.host} – ${m.score.guest}` : 'VS';
-  const winner = m.winner === m.host.id ? m.host.name : m.winner === m.guest.id ? m.guest.name : null;
-  const loser = winner === m.host.name ? m.guest.name : m.host.name;
+  // Decide by id: two pilots' names can look alike, ids cannot.
+  const hostWon = m.winner != null && m.winner === m.host.id;
+  const guestWon = m.winner != null && m.winner === m.guest.id;
+  const [winner, loser] = hostWon ? [m.host.name, m.guest.name] : [m.guest.name, m.host.name];
   const txt = m.state === 'verified'
-    ? (winner ? `${esc(winner)} defeats ${esc(loser)}` : `${esc(m.host.name)} and ${esc(m.guest.name)} draw`)
+    ? (hostWon || guestWon ? `${esc(winner)} defeats ${esc(loser)}` : `${esc(m.host.name)} and ${esc(m.guest.name)} draw`)
     : `${esc(m.host.name)} vs ${esc(m.guest.name)}`;
   return `<a class="card" href="#/match/${encodeURIComponent(m.id)}">
       ${tile({ big: score, names: `${esc(m.host.name)} · ${esc(m.guest.name)}`, cls: m.seriesId ? 'final' : '' })}
@@ -70,7 +73,7 @@ function eventRow(t, i) {
       <span class="plus" aria-hidden="true"></span>
     </div>
     <div class="drawer" id="e${i}">
-      <p>${t.champion_name ? `Champion: <b>${esc(t.champion_name)}</b>` : t.state === 'registration' ? 'Registration is open. Sign up from the companion app.' : 'Bracket in progress.'}</p>
+      <p>${t.champion != null ? `Champion: <b>${esc(t.champion_name)}</b>` : t.state === 'registration' ? `Registration is open. Join with <code>rvng join-event --id ${esc(t.id)}</code> in the companion app.` : 'Bracket in progress.'}</p>
       <a class="btn-line" href="#/tournament/${t.id}">View bracket</a>
     </div>`;
 }
@@ -106,10 +109,10 @@ const routes = {
     const p = await get(`/api/players/${encodeURIComponent(id)}`);
     const integ = p.integrity
       ? `<div class="chron"><div class="when">${ymd(p.integrity.at)}</div><p>Last scan ${badge(p.integrity.verdict)}</p>
-         ${p.integrity.mods.length ? `<p>${p.integrity.mods.map((m) => `<span class="box">${esc(m.name)}${m.approved ? '' : ' · unapproved'}</span>`).join(' ')}</p>` : '<p>No mods besides the competitive client.</p>'}</div>`
+         ${p.integrity.mods.length ? `<p>${p.integrity.mods.map((m) => `<span class="box">${esc(m.name)}${m.approved ? '' : ' · unapproved'}</span>`).join(' ')}${p.integrity.modsTotal > p.integrity.mods.length ? ` <span class="box">+${esc(p.integrity.modsTotal - p.integrity.mods.length)} more</span>` : ''}</p>` : '<p>No mods besides the competitive client.</p>'}</div>`
       : '<div class="chron"><p>No integrity scan submitted yet.</p></div>';
     return sheet(`${title(esc(p.name), `${badge(p.tier, p.tier)} ${p.status !== 'active' ? badge(p.status) : ''}`)}
-      <div class="figures">${fig('Rating', p.rating)}${fig('Peak', p.peakRating)}${fig('Wins', p.wins)}${fig('Losses', p.losses)}${fig('K/D', p.kd)}</div>
+      <div class="figures">${fig('Rating', p.rating)}${fig('Peak', p.peakRating)}${fig('Wins', p.wins)}${fig('Losses', p.losses)}${p.draws ? fig('Draws', p.draws) : ''}${fig('K/D', p.kd)}</div>
       <div class="bar">Integrity <span class="i">i</span></div>${integ}
       <section>${title('Recent Matches', '', 'h2')}${matchGrid(p.matches.slice(0, 12))}</section>`);
   },
@@ -158,14 +161,16 @@ const routes = {
       for (const s of t.series) (byRound[s.round] ||= []).push(s);
       body = `<div class="bracket">${Object.keys(byRound).map((r) => `<div class="round"><div class="bar">${roundName(Number(r))}</div><div class="slots">
         ${byRound[r].map((s) => {
-          const p = (pid, name, w) => `<div class="p ${s.winner && s.winner === pid ? 'w' : ''}"><span>${pid ? `<a href="#/player/${pid}">${esc(name)}</a>` : '<span class="tbd">TBD</span>'}</span><span class="s">${pid ? w : ''}</span></div>`;
-          return `<div class="series ${Number(r) === t.rounds ? 'final' : ''}">${p(s.player_a, s.a_name, s.wins_a)}${p(s.player_b, s.b_name, s.wins_b)}<div class="meta">Best of ${s.best_of}</div></div>`;
+          // Round-1 slots are fixed at the start, and a decided series is never filled: an empty slot there is a bye.
+          const bye = (Number(r) === 1 || s.winner != null) && !(s.player_a && s.player_b);
+          const p = (pid, name, w) => `<div class="p ${s.winner != null && s.winner === pid ? 'w' : ''}"><span>${pid ? `<a href="#/player/${pid}">${esc(name)}</a>` : `<span class="tbd">${bye ? 'BYE' : 'TBD'}</span>`}</span><span class="s">${pid && !bye ? w : ''}</span></div>`;
+          return `<div class="series ${Number(r) === t.rounds ? 'final' : ''}">${p(s.player_a, s.a_name, s.wins_a)}${p(s.player_b, s.b_name, s.wins_b)}<div class="meta">${bye ? 'Bye' : `Best of ${s.best_of}`}</div></div>`;
         }).join('')}</div></div>`).join('')}</div>`;
     }
     return sheet(`<div class="kv">${SVG.bracket}<div class="kv-name">${esc(t.name)}</div><div class="kv-sub hud">${t.size}-PILOT KNOCKOUT · FINAL BEST OF ${t.final_best_of}</div></div>
       <nav class="subnav"><a href="#/tournaments">All events</a><a href="#/leaderboard">Leaderboard</a><a href="#/integrity">Rules &amp; fair play</a></nav>
       ${title('Bracket', `${badge(t.state)}<br>Rounds best of ${t.best_of} · final best of ${t.final_best_of}`, 'h2')}
-      ${t.champion_name ? `<div class="champion">${tile({ art: 'bracket', big: 'CHAMPION', cls: 'final' })}<div class="who"><span class="box">Champion</span><b>${esc(t.champion_name)}</b></div></div>` : ''}
+      ${t.champion != null ? `<div class="champion">${tile({ art: 'bracket', big: 'CHAMPION', cls: 'final' })}<div class="who"><span class="box">Champion</span><b>${esc(t.champion_name)}</b></div></div>` : ''}
       ${body}`);
   },
 
@@ -179,13 +184,14 @@ const routes = {
     return sheet(`${title('Fair Play', 'Before every queue session the companion app and in-game mod submit an integrity report. Only a clean result can queue.')}
       <div class="frames">${checks.map(([art, cap, txt]) => `<div class="framed"><div class="fr">${tile({ art, cls: 'sq' })}</div><div class="cap">${cap}</div><p>${txt}</p></div>`).join('')}</div>
       <section><div class="bar">When a check fails <span class="i">i</span></div>
-      <div class="chron"><p>The match is marked ${badge('disputed')} and reviewed by an admin. It does not change anyone's rating. Tampered aircraft data or injected code puts the account under review.</p></div></section>`);
+      <div class="chron"><p>The match is marked ${badge('disputed')} and reviewed by an admin. It does not change anyone's rating, and an event series waits for the ruling. Tampered aircraft data or injected code in a pilot's own scan or log puts that account under review.</p></div></section>`);
   },
 
   async register() {
     return sheet(`${title('Sign up', 'Create a pilot account, then run the companion app next to the game.')}
-      <form class="form" id="reg"><label>Callsign<input name="name" required minlength="3" maxlength="24" pattern="[A-Za-z0-9_\\- ]+" autocomplete="nickname"></label>
-      <label>Steam ID (optional)<input name="platformId" inputmode="numeric"></label><button>Register</button><div id="regout"></div></form>`);
+      <form class="form" id="reg"><label>Callsign<input name="name" required minlength="3" maxlength="24" pattern="[A-Za-z0-9_\\-][A-Za-z0-9_\\- ]*[A-Za-z0-9_\\-]" autocomplete="nickname"
+        title="3-24 characters: letters, digits, space, _ or -, not starting or ending with a space"></label>
+      <button>Register</button><div id="regout"></div></form>`);
   },
 };
 
@@ -209,36 +215,52 @@ document.addEventListener('click', (e) => {
   if (row) toggle(row);
 });
 document.addEventListener('keydown', (e) => {
+  // Only when the row itself has focus: Enter on a link inside the row must follow the link.
   const row = e.target.closest?.('.row[data-drawer]');
-  if (row && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); toggle(row); }
+  if (row && e.target === row && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); toggle(row); }
 });
 
 document.addEventListener('submit', async (e) => {
-  if (e.target.id !== 'reg') return;
+  const form = e.target;
+  if (form.id !== 'reg') return;
   e.preventDefault();
+  // The credentials are shown once: a second submit (double click, Enter) must not replace them.
+  if (form.dataset.busy || form.dataset.done) return;
   const out = document.getElementById('regout');
-  const body = Object.fromEntries(new FormData(e.target));
-  if (!body.platformId) delete body.platformId;
+  const body = Object.fromEntries(new FormData(form)); // read before the controls are disabled
+  const controls = [...form.querySelectorAll('input, button')];
+  form.dataset.busy = '1';
+  controls.forEach((x) => { x.disabled = true; });
   try {
     const r = await fetch('/api/players/register', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
     const d = await r.json();
     if (!r.ok) throw new Error(d.error);
+    form.dataset.done = '1';
     const creds = { server: location.origin, apiKey: d.apiKey, apiSecret: d.apiSecret, playerId: d.id, name: d.name };
     out.innerHTML = `<p><b>Welcome, ${esc(d.name)}.</b> Save this as <code>credentials.json</code> next to the companion app. It is shown only once.</p>
       <pre class="secret">${esc(JSON.stringify(creds, null, 2))}</pre>`;
-  } catch (err) { out.innerHTML = `<p class="error">${esc(err.message)}</p>`; }
+  } catch (err) {
+    out.innerHTML = `<p class="error">${esc(err.message)}</p>`;
+    controls.forEach((x) => { x.disabled = false; });
+  } finally { delete form.dataset.busy; }
 });
 
 const totop = document.querySelector('.totop');
 totop.addEventListener('click', () => scrollTo({ top: 0, behavior: 'smooth' }));
 addEventListener('scroll', () => totop.classList.toggle('show', scrollY > 400), { passive: true });
 
+let renderSeq = 0;
 async function render() {
+  const my = ++renderSeq;
   const [, page = '', arg] = location.hash.replace(/^#/, '').split('/');
   const section = { player: 'leaderboard', match: 'matches', tournament: 'tournaments' }[page] ?? page;
   document.querySelectorAll('.gnav nav a').forEach((a) => a.classList.toggle('active', a.dataset.nav === section));
-  const fn = routes[page] || routes[''];
-  try { $view.innerHTML = await fn(arg ? decodeURIComponent(arg) : arg); } catch (e) { $view.innerHTML = sheet(`${title('Error')}<p class="error">${esc(e.message)}</p>`); }
+  // Own routes only: a hash such as #/constructor/... must not reach Object.prototype.
+  const fn = Object.hasOwn(routes, page) ? routes[page] : routes[''];
+  let html;
+  try { html = await fn(arg ? decodeURIComponent(arg) : arg); } catch (e) { html = sheet(`${title('Error')}<p class="error">${esc(e.message)}</p>`); }
+  if (my !== renderSeq) return; // the user navigated on while this page was loading
+  $view.innerHTML = html;
   scrollTo({ top: 0, behavior: 'instant' });
 }
 addEventListener('hashchange', render);

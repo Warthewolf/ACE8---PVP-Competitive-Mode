@@ -4,29 +4,27 @@
   Talks to the companion app (client/rvng.js run) through JSON files in
   <game root>/ProjectRVNG/bridge/. See docs/GAME_INTEGRATION.md.
 
-  IMPORTANT: ACE COMBAT 8 has no public modding API. Every name in HOOKS below is a
-  placeholder that must be replaced with the real class/function paths found by
-  dumping the game with UE4SS (Live View / "Dump all objects"). Nothing here has
-  been run against the retail game yet.
+  IMPORTANT: ACE COMBAT 8 has no public modding API. Every name in HOOKS and every
+  function in GAME below is a placeholder that must be filled in from a UE4SS object
+  dump (Live View / "Dump all objects"). Nothing here has been run against the retail
+  game yet.
 ]]
 
 local Json = require("json")
 
 -- Path of the game root as seen from UE4SS's working directory (Binaries/Win64).
-local BRIDGE = "../../../ProjectRVNG/bridge/"
+local BRIDGE = rawget(_G, "RVNG_BRIDGE") or "../../../ProjectRVNG/bridge/"
 
 -- ===== Fill these in from a UE4SS object dump =====================================
 local HOOKS = {
   -- Fired when the main menu widget is constructed: used to add the "Competitive 1v1" entry.
   MainMenuConstruct   = "/Script/TODO.MainMenuWidget:Construct",
-  -- Creates a private / custom online room. Must return or expose a joinable room id.
-  CreatePrivateRoom   = "/Script/TODO.OnlineSessionSubsystem:CreatePrivateRoom",
-  JoinPrivateRoom     = "/Script/TODO.OnlineSessionSubsystem:JoinRoomById",
-  -- Sortie / match start, kill, damage and match end events.
+  -- Sortie / match start, kill, damage, weapon, leave and match end events.
   MatchStart          = "/Script/TODO.MultiplayerGameMode:OnMatchStarted",
   AircraftDestroyed   = "/Script/TODO.AircraftPawn:OnDestroyed",
   DamageApplied       = "/Script/TODO.AircraftPawn:ReceiveDamage",
   WeaponFired         = "/Script/TODO.WeaponComponent:Fire",
+  PlayerLeft          = "/Script/TODO.MultiplayerGameMode:OnPlayerLeft",   -- surrender / disconnect
   MatchEnd            = "/Script/TODO.MultiplayerGameMode:OnMatchEnded",
 }
 -- Class holding per-aircraft flight parameters (speed, turn rate, HP, ...).
@@ -34,11 +32,38 @@ local AIRCRAFT_PARAM_CLASS = "TODO_AircraftParameter"
 -- Map from our stat names to the property names on AIRCRAFT_PARAM_CLASS.
 local STAT_PROPS = { maxSpeed = "TODO_MaxSpeed", turnRate = "TODO_TurnRate", hp = "TODO_HP", stallSpeed = "TODO_StallSpeed" }
 local GAME_VERSION = "TODO"   -- read from the build string once located
+
+-- Every game-specific call goes through this table. RVNG_GAME exists only for the test harness
+-- (mod/test/harness.lua); another script mod able to set it would itself fail the integrity scan.
+local GAME = rawget(_G, "RVNG_GAME") or {
+  -- Create a private 2-player room with these rules (time limit, kill target, special weapons).
+  -- Return the joinable room id, or nil if the game is not ready yet (it is retried every few seconds).
+  createRoom = function(rules) return nil end,
+  -- Join a private room by id. Return true once the join has started.
+  joinRoom = function(code) return false end,
+  isLocal = function(pawn) return false end,          -- pawn belongs to the local pilot
+  isOpponent = function(pawn) return false end,       -- pawn belongs to the other pilot (not AI)
+  -- "gun" | "missile" | "special" for a weapon component.
+  weaponKind = function(component) return nil end,
+  -- Aircraft ids of both pilots, as used in the baseline's aircraft stats.
+  aircraftIds = function() return "TODO", "TODO" end,
+  -- Current speeds (km/h) of both aircraft, or nil.
+  speeds = function() return nil, nil end,
+  -- "kill_target" | "time_limit" | "disconnect" | "surrender" from the MatchEnd hook context.
+  endReason = function(ctx) return "kill_target" end,
+}
 -- ===================================================================================
 
-local state = { phase = "idle", match = nil, log = nil, maxSpeedSelf = 0, maxSpeedOpp = 0 }
+local state = {
+  match = nil,          -- latest server view of the open match (from state.json)
+  lobby = nil,          -- host: { matchId, at, code } room creation for that match
+  joinedMatchId = nil,  -- guest: the match whose room we joined
+  doneMatchId = nil,    -- the match we already played and wrote a result for
+  log = nil,
+}
 
-local function now() return os.clock() end
+-- Wall-clock seconds. (os.clock() is CPU time and would make durations meaningless.)
+local function now() return os.time() end
 
 local function readJson(name)
   local f = io.open(BRIDGE .. name, "r")
@@ -93,21 +118,34 @@ pcall(RegisterHook, HOOKS.MainMenuConstruct, function(ctx)
 end)
 
 -- ---- Lobby: host creates the room, guest joins it ------------------------------------
+local RETRY_SEC = 5
+
+-- Host: create the room once per match, retrying while the game is not ready, and re-post the code if the
+-- server still has none a few seconds later (the companion keeps lobby.json until the server accepts it).
 local function onMatched(match)
-  if state.match and state.match.id == match.id then return end
   state.match = match
-  if match.role == "host" and not match.lobbyCode then
-    -- TODO: call the game's private-room creation with match.rules applied
-    -- (time limit, kill target, 2 player slots, special weapons on/off).
-    local roomId = nil -- = CreatePrivateRoom(...)
-    if roomId then writeJson("lobby.json", { matchId = match.id, lobbyCode = tostring(roomId) }) end
+  if match.role ~= "host" or match.lobbyCode then return end
+  local l = state.lobby
+  if l and l.matchId == match.id then
+    if now() - l.at < RETRY_SEC then return end
+    if l.code then
+      writeJson("lobby.json", { matchId = match.id, lobbyCode = l.code }); l.at = now()
+      return
+    end
+  end
+  state.lobby = { matchId = match.id, at = now() }
+  local ok, roomId = pcall(GAME.createRoom, match.rules)
+  if ok and roomId then
+    state.lobby.code = tostring(roomId)
+    writeJson("lobby.json", { matchId = match.id, lobbyCode = state.lobby.code })
   end
 end
 
+-- Guest: join each match's room exactly once.
 local function onLobbyReady(match)
-  if match.role == "guest" and state.phase ~= "joined" then
-    state.phase = "joined"
-    -- TODO: JoinPrivateRoom(match.lobbyCode)
+  if match.role == "guest" and state.joinedMatchId ~= match.id then
+    local ok, started = pcall(GAME.joinRoom, match.lobbyCode)
+    if ok and started then state.joinedMatchId = match.id end
   end
 end
 
@@ -119,54 +157,121 @@ local function logEvent(type_, actor, extra)
   table.insert(state.log.events, e)
 end
 
+-- Keeps, per aircraft and stat, the sampled value furthest from the match-start value, so a trainer
+-- switched on mid-match still shows up in the result (the server compares it with the baseline).
+local function sampleStats()
+  local log = state.log
+  if not log then return end
+  for id, stats in pairs(collectAircraftStats()) do
+    local start = log.startStats[id] or stats
+    log.startStats[id] = start
+    local worst = log.worstStats[id] or {}
+    for stat, v in pairs(stats) do
+      local ref = start[stat] or v
+      if worst[stat] == nil or math.abs(v - ref) > math.abs(worst[stat] - ref) then worst[stat] = v end
+    end
+    log.worstStats[id] = worst
+  end
+  local okS, selfSpeed, oppSpeed = pcall(GAME.speeds)
+  if okS then
+    if type(selfSpeed) == "number" and selfSpeed > log.maxSpeedSelf then log.maxSpeedSelf = selfSpeed end
+    if type(oppSpeed) == "number" and oppSpeed > log.maxSpeedOpp then log.maxSpeedOpp = oppSpeed end
+  end
+end
+
 pcall(RegisterHook, HOOKS.MatchStart, function()
-  if not state.match then return end
+  if not state.match or state.match.id == state.doneMatchId then return end
   writeRuntime()
-  state.log = { start = now(), events = {}, self = { kills = 0, deaths = 0 }, opponent = { kills = 0, deaths = 0 } }
-  state.maxSpeedSelf, state.maxSpeedOpp = 0, 0
+  state.log = {
+    matchId = state.match.id, start = now(), events = Json.array(),
+    self = { kills = 0, deaths = 0 }, opponent = { kills = 0, deaths = 0 },
+    startStats = {}, worstStats = {}, maxSpeedSelf = 0, maxSpeedOpp = 0,
+  }
+  sampleStats()
 end)
 
--- TODO: resolve whether the destroyed aircraft belongs to the local player.
-local function isLocal(pawn) return false end
+-- pawn -> pawn that last damaged it, so kills are credited to the instigator, not inferred from the victim.
+local lastHitBy = {}
+pcall(RegisterHook, HOOKS.DamageApplied, function(ctx, _damage, instigator)
+  if not state.log then return end
+  local victim = ctx:get()
+  lastHitBy[victim] = instigator and instigator:get() or nil
+  local actor = GAME.isLocal(victim) and "opponent" or (GAME.isOpponent(victim) and "self") or nil
+  if actor then logEvent("hit", actor) end
+end)
 
 pcall(RegisterHook, HOOKS.AircraftDestroyed, function(ctx)
   if not state.log then return end
-  local victimLocal = isLocal(ctx:get())
-  local killer = victimLocal and "opponent" or "self"
-  local victim = victimLocal and "self" or "opponent"
-  state.log[killer].kills = state.log[killer].kills + 1
+  local pawn = ctx:get()
+  local victim = GAME.isLocal(pawn) and "self" or (GAME.isOpponent(pawn) and "opponent") or nil
+  if not victim then return end -- AI or other non-pilot aircraft
+  local inst = lastHitBy[pawn]; lastHitBy[pawn] = nil
+  local killer = (victim == "self" and inst and GAME.isOpponent(inst) and "opponent")
+              or (victim == "opponent" and inst and GAME.isLocal(inst) and "self") or nil
   state.log[victim].deaths = state.log[victim].deaths + 1
-  logEvent("kill", killer)
   logEvent("death", victim)
+  -- A crash or self-destruct is a death without a kill.
+  -- TODO: if the game credits the last attacker for crashes, mirror its rule here.
+  if killer then
+    state.log[killer].kills = state.log[killer].kills + 1
+    logEvent("kill", killer)
+  end
 end)
 
+-- Unknown weapon kinds are logged as special weapons (fail closed when special weapons are banned).
+local WEAPON_EVENT = { gun = "gun_fired", missile = "missile_fired", special = "special_fired" }
 pcall(RegisterHook, HOOKS.WeaponFired, function(ctx)
-  logEvent("missile_fired", isLocal(ctx:get():GetOwner()) and "self" or "opponent")
+  if not state.log then return end
+  local comp = ctx:get()
+  local owner = comp:GetOwner()
+  local actor = GAME.isLocal(owner) and "self" or (GAME.isOpponent(owner) and "opponent") or nil
+  if not actor then return end
+  local ok, kind = pcall(GAME.weaponKind, comp)
+  logEvent(WEAPON_EVENT[ok and kind or ""] or "special_fired", actor)
 end)
 
-pcall(RegisterHook, HOOKS.MatchEnd, function()
-  if not (state.log and state.match) then return end
+pcall(RegisterHook, HOOKS.PlayerLeft, function(ctx)
+  if not state.log then return end
+  local p = ctx:get()
+  logEvent("disconnect", GAME.isLocal(p) and "self" or "opponent")
+end)
+
+pcall(RegisterHook, HOOKS.MatchEnd, function(ctx)
+  local log = state.log
+  if not (log and state.match and state.match.id == log.matchId) then return end
+  sampleStats()
+  local selfAc, oppAc = GAME.aircraftIds()
+  local okR, reason = pcall(GAME.endReason, ctx)
   writeJson("result.json", {
-    matchId = state.match.id,
+    matchId = log.matchId,
     gameVersion = GAME_VERSION,
-    durationSec = now() - state.log.start,
-    endReason = "kill_target", -- TODO: map from the game's end reason
-    self = { aircraftId = "TODO", kills = state.log.self.kills, deaths = state.log.self.deaths },
-    opponent = { aircraftId = "TODO", kills = state.log.opponent.kills, deaths = state.log.opponent.deaths },
-    events = state.log.events,
-    telemetry = { selfMaxSpeed = state.maxSpeedSelf, opponentMaxSpeed = state.maxSpeedOpp },
+    durationSec = now() - log.start,
+    endReason = okR and reason or "kill_target",
+    self = { aircraftId = selfAc, kills = log.self.kills, deaths = log.self.deaths },
+    opponent = { aircraftId = oppAc, kills = log.opponent.kills, deaths = log.opponent.deaths },
+    events = log.events,
+    telemetry = { selfMaxSpeed = log.maxSpeedSelf, opponentMaxSpeed = log.maxSpeedOpp },
+    runtime = { aircraft = log.worstStats },
   })
-  state.log, state.match, state.phase = nil, nil, "idle"
+  state.doneMatchId = log.matchId
+  state.log, state.lobby = nil, nil
 end)
 
 -- ---- Poll the companion ---------------------------------------------------------------
-LoopAsync(1000, function()
+local function poll()
   local s = readJson("state.json")
-  if s and s.match then
-    if s.state == "matched" then onMatched(s.match) end
+  -- Act only on an open match we have not played yet. The companion keeps showing a finished match
+  -- as "matched" for a moment (until its result is submitted), which must not trigger a rejoin.
+  if s and s.state == "matched" and type(s.match) == "table" and s.match.id ~= state.doneMatchId
+    and (s.match.state == "pending" or s.match.state == "live") then
+    onMatched(s.match)
     if s.match.lobbyCode then onLobbyReady(s.match) end
   end
-  -- TODO: sample both aircraft's current speed here to fill telemetry max speeds.
+  sampleStats()
+end
+
+LoopAsync(1000, function()
+  poll()
   return false -- keep looping
 end)
 
