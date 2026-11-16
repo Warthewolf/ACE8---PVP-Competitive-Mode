@@ -45,8 +45,11 @@ function start(db, tournamentId) {
     const t = db.prepare('SELECT * FROM tournaments WHERE id = ?').get(tournamentId);
     if (!t) throw new HttpError(404, 'tournament not found');
     if (t.state !== 'registration') throw new HttpError(409, 'already started');
+    // The bracket never grows past its configured size. If more active pilots hold an entry than there are
+    // slots (an entrant reinstated after others took the freed slot), the earliest sign-ups play.
     const entrants = db.prepare(`SELECT p.id, p.rating FROM tournament_entrants e JOIN players p ON p.id = e.player_id
-      WHERE e.tournament_id = ? AND p.status = 'active' ORDER BY p.rating DESC, p.id ASC`).all(tournamentId);
+      WHERE e.tournament_id = ? AND p.status = 'active' ORDER BY e.rowid ASC LIMIT ?`).all(tournamentId, t.size)
+      .sort((x, y) => y.rating - x.rating || x.id - y.id);
     if (entrants.length < 2) throw new HttpError(409, 'need at least 2 active entrants');
     // Shrink to the smallest bracket that holds everyone, so every first-round slot has at least one
     // pilot and byes only happen in round 1 (an empty slot would block the next round forever).
@@ -109,13 +112,28 @@ function recordSeriesResult(db, seriesId, winnerId) {
   else if (updated.wins_b >= need) finishSeries(db, t, updated, updated.player_b);
 }
 
-// Undo one counted game of an undecided series (an admin voided the match). A decided series is final.
+// Undo one counted game of a series (an admin voided the match). If it was one of the wins that decided the
+// series, the series reopens: the winner leaves the next round again, or for the final the title is cleared.
+// That is refused once the next round has been played or decided (void those games first).
 function revertSeriesResult(db, seriesId, winnerId) {
   const s = db.prepare('SELECT * FROM series WHERE id = ?').get(seriesId);
   if (!s || !winnerId) return;
-  if (s.winner) throw new HttpError(409, 'the series this match belongs to is already decided; it cannot be voided');
   const col = winnerId === s.player_a ? 'wins_a' : winnerId === s.player_b ? 'wins_b' : null;
-  if (col) db.prepare(`UPDATE series SET ${col} = MAX(0, ${col} - 1) WHERE id = ?`).run(s.id);
+  if (!col) return;
+  // A series decided by walkover never reaches the win count, so it is not reopened by voiding a game.
+  if (s.winner === winnerId && s[col] === Math.ceil(s.best_of / 2)) {
+    const t = db.prepare('SELECT * FROM tournaments WHERE id = ?').get(s.tournament_id);
+    if (s.round === rounds(t.size)) {
+      db.prepare("UPDATE tournaments SET state = 'running', champion = NULL WHERE id = ?").run(t.id);
+    } else {
+      const next = db.prepare('SELECT * FROM series WHERE tournament_id = ? AND round = ? AND slot = ?').get(t.id, s.round + 1, Math.floor(s.slot / 2));
+      const played = db.prepare("SELECT COUNT(*) c FROM matches WHERE series_id = ? AND state != 'void'").get(next.id).c;
+      if (next.winner || played) throw new HttpError(409, 'the next round of this series has already been played or decided; void its games first');
+      db.prepare(`UPDATE series SET ${s.slot % 2 === 0 ? 'player_a' : 'player_b'} = NULL WHERE id = ?`).run(next.id);
+    }
+    db.prepare('UPDATE series SET winner = NULL WHERE id = ?').run(s.id);
+  }
+  db.prepare(`UPDATE series SET ${col} = MAX(0, ${col} - 1) WHERE id = ?`).run(s.id);
 }
 
 // Admin walkover: the named player wins the series (no-show, ban, or flagged opponent).

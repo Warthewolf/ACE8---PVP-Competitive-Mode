@@ -27,8 +27,9 @@ const SCRIPT_EXT = /\.(lua|py|js)$/i;
 // Mod folders: matched as the folder itself (a link/junction entry) or anything below it.
 const MOD_DIR = /(^|\/)(~mods|logicmods)(\/|$)/;
 // The script loader's own tree, and its config files wherever they are (they can relocate the mods folder).
+// override.txt next to the proxy DLL points UE4SS at a whole loader (settings and Mods) outside the install.
 const LOADER_DIR = /(^|\/)(ue4ss|ue5ss)(\/|$)/;
-const LOADER_CONFIG = /(^|\/)(ue4ss-settings\.ini|mods\.txt|mods\.json|enabled\.txt)$/;
+const LOADER_CONFIG = /(^|\/)(ue4ss-settings\.ini|mods\.txt|mods\.json|enabled\.txt|override\.txt)$/;
 const CONFIG_EXT = /\.ini$/i;
 // DLL names commonly used as proxy loaders for injection.
 const PROXY_DLLS = new Set([
@@ -109,20 +110,19 @@ function evaluate(report, baseline, approved) {
     return { verdict: 'rejected', findings: [{ code: 'malformed_report', severity: 'critical' }], mods, manifestHash: '' };
   }
   if (!baseline) {
-    return {
-      verdict: 'rejected',
-      findings: [{ code: 'unsupported_game_version', severity: 'critical', gameVersion: report.gameVersion }],
-      mods, manifestHash: '',
-    };
+    const gameVersion = typeof report.gameVersion === 'string' ? report.gameVersion.slice(0, 32) : null;
+    return { verdict: 'rejected', findings: [{ code: 'unsupported_game_version', severity: 'critical', gameVersion }], mods, manifestHash: '' };
   }
 
+  // Values come from the player: only real numbers and strings are used (an object with a bogus toString
+  // must not throw). Anything else fails isFileRecord or the hash comparison below.
   const reported = new Map();
   for (const f of report.files) {
-    if (!f || typeof f.path !== 'string') continue;
+    if (!isPlainObject(f) || typeof f.path !== 'string') continue;
     const k = norm(f.path);
     // Two entries for one path: a clean twin could otherwise overwrite the file the game really loads.
     if (reported.has(k)) { findings.push({ code: 'duplicate_path', severity: 'critical', path: k }); continue; }
-    reported.set(k, { size: Number(f.size), sha256: String(f.sha256 || '').toLowerCase() });
+    reported.set(k, { size: typeof f.size === 'number' ? f.size : NaN, sha256: typeof f.sha256 === 'string' ? f.sha256.toLowerCase() : '' });
   }
 
   // 1. Every baseline file must exist with identical size and hash.
@@ -155,6 +155,12 @@ function evaluate(report, baseline, approved) {
     }
     const candidates = approvedByPath.get(path) || [];
     const match = candidates.find((m) => m.sha256.toLowerCase() === got.sha256 && Number(m.size) === got.size);
+    if (match && match.category === 'retired') {
+      // A build that used to be approved: out of date, not tampered, so it never flags the account.
+      findings.push({ code: 'outdated_mod', severity: 'high', name: match.name, version: match.version || '', path });
+      mods.push({ name: match.name, path, size: got.size, approved: false, outdated: true });
+      continue;
+    }
     if (match) {
       mods.push({ name: match.name, path, size: got.size, approved: true, category: match.category });
       continue;
@@ -170,23 +176,42 @@ function evaluate(report, baseline, approved) {
     }
   }
 
-  // 3. Required files (the competitive mod, the loader and its settings) must be present in exactly the
-  //    approved build. An older approved version at the same path does not satisfy a newer required one.
-  for (const m of approved.filter((x) => x.category === 'required')) {
+  // 3. Required mods (the competitive mod, the loader and its settings): one complete required build of each
+  //    must be installed exactly. Several builds of a mod (same name, different version) can be required at
+  //    once while players update; cosmetic or retired copies at the same paths never count.
+  const builds = new Map(); // name -> version -> rows
+  for (const m of approved) {
+    if (m.category !== 'required') continue;
+    if (!builds.has(m.name)) builds.set(m.name, new Map());
+    const byVersion = builds.get(m.name);
+    const v = m.version || '';
+    if (!byVersion.has(v)) byVersion.set(v, []);
+    byVersion.get(v).push(m);
+  }
+  const installed = (m) => {
     const got = reported.get(norm(m.path));
-    if (!got || got.sha256 !== String(m.sha256).toLowerCase() || got.size !== Number(m.size)) {
-      findings.push({ code: 'missing_required_mod', severity: 'critical', name: m.name, path: norm(m.path) });
+    return !!got && got.sha256 === String(m.sha256).toLowerCase() && got.size === Number(m.size);
+  };
+  for (const [name, byVersion] of builds) {
+    let closest = null; // report against the build nearest to what is installed
+    for (const [version, rows] of byVersion) {
+      const missing = rows.filter((m) => !installed(m));
+      if (!closest || missing.length < closest.missing.length) closest = { version, missing };
+    }
+    for (const m of closest.missing) {
+      findings.push({ code: 'missing_required_mod', severity: 'critical', name, version: closest.version, path: norm(m.path) });
     }
   }
 
   // 4. Runtime checks from inside the game process.
-  const rt = report.runtime || {};
+  const rt = isPlainObject(report.runtime) ? report.runtime : {};
   if (Array.isArray(rt.loadedModules)) {
     const allowedBinaries = new Set(
       [...baseFiles.keys(), ...mods.filter((m) => m.approved).map((m) => m.path)]
         .filter((p) => CODE_EXT.test(p)).map((p) => p.split('/').pop()),
     );
-    for (const mod of new Set(rt.loadedModules.map((x) => norm(x)))) {
+    if (rt.loadedModules.some((x) => typeof x !== 'string')) findings.push({ code: 'malformed_report', severity: 'critical', field: 'runtime.loadedModules' });
+    for (const mod of new Set(rt.loadedModules.filter((x) => typeof x === 'string').map(norm))) {
       const name = mod.split('/').pop();
       if (allowedBinaries.has(name) || SYSTEM_MODULE_ALLOW.test(name)) continue;
       findings.push({ code: 'unexpected_loaded_module', severity: 'high', module: name });

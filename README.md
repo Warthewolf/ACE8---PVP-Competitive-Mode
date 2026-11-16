@@ -34,16 +34,22 @@ node client/rvng.js baseline --game "C:/.../ACE COMBAT 8" --version 1.0.2 --airc
 curl -X PUT "$SERVER/api/admin/baselines" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'content-type: application/json' --data @baseline-1.0.2.json
 # 2. Pin the script loader and the competitive mod, every file, as REQUIRED. This includes UE4SS-settings.ini
 #    (with ModsFolderPath empty and the debug console off), mods.txt and the mod's enabled.txt: any loader
-#    file or script that is not pinned is rejected, and a required file must match its pinned hash exactly.
-node client/rvng.js approve --game "C:/.../ACE COMBAT 8" --path ACE8/Binaries/Win64/ue4ss --name UE4SS --category required
-curl -X POST "$SERVER/api/admin/mods" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'content-type: application/json' --data @mods-UE4SS.json
+#    file or script that is not pinned is rejected, and a required mod must match one pinned build exactly.
+#    Logs and crash dumps are skipped (the players' scanner never reports them).
+node client/rvng.js approve --game "C:/.../ACE COMBAT 8" --path ACE8/Binaries/Win64/ue4ss --name UE4SS --version 3.0.1 --category required
+curl -X POST "$SERVER/api/admin/mods" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'content-type: application/json' --data @mods-UE4SS-3.0.1.json
 #    Do the same for the loader's proxy DLL next to the game exe (--path ACE8/Binaries/Win64/dwmapi.dll)
 #    and for the Project RVNG mod folder.
 # 3. Optional cosmetic mods: --category cosmetic.
-# 4. After a patch: upload the new baseline, then retire the old build so it can no longer queue:
+# 4. After a game patch: upload the new baseline, then retire the old build so it can no longer queue:
 curl -X POST "$SERVER/api/admin/baselines/1.0.1/active" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'content-type: application/json' -d '{"active":false}'
-# Withdraw an old mod version: GET /api/admin/mods, then DELETE /api/admin/mods/<id>.
+# 5. New release of a required mod: approve it with the SAME --name and a new --version and upload it. Both
+#    builds pass while players update. Then retire the old build. Pilots who still have it are told to update
+#    (outdated_mod) and are not flagged. Do not purge old builds: a purged build reads as a tampered mod.
+curl -X POST "$SERVER/api/admin/mods/retire" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'content-type: application/json' -d '{"name":"Project RVNG","version":"1.0"}'
 ```
+
+Behind a reverse proxy, start the server with `TRUST_PROXY=1` (one hop; `true` or an address list also work) so the per-client sign-up limit sees real client addresses.
 
 Players: sign up on the website (or `rvng register`), save `credentials.json`, then run `node client/rvng.js run --game "<install dir>"` alongside the game. To enter an open event: `node client/rvng.js join-event --id <event number>`. For event matches add `--no-cache` to `run` so every file is re-hashed.
 
@@ -53,7 +59,7 @@ Public: `GET /api/leaderboard`, `/api/players/:id`, `/api/matches`, `/api/tourna
 
 Player (HMAC-signed): `POST /api/integrity/report`, `/api/queue/join` (`region`: global, na, sa, eu, asia, oce, me, af), `/api/queue/leave`, `GET /api/queue/status`, `GET /api/matches/:id`, `POST /api/matches/:id/lobby`, `/api/matches/:id/report`, `/api/tournaments/:id/register`
 
-Admin (Bearer `ADMIN_TOKEN`): `PUT /api/admin/baselines`, `POST /api/admin/baselines/:version/active`, `GET|POST /api/admin/mods`, `DELETE /api/admin/mods/:id`, `GET /api/admin/integrity`, `POST /api/admin/players/:id/status`, `/api/admin/matches/:id/resolve` (`{winner, scoreHost, scoreGuest}` or `{void:true}`, which also reverts a verified match), `/api/admin/tournaments`, `/api/admin/tournaments/:id/start`, `/api/admin/series/:id/forfeit` (`{winner: <player id>}` walkover)
+Admin (Bearer `ADMIN_TOKEN`): `PUT /api/admin/baselines`, `POST /api/admin/baselines/:version/active`, `GET|POST /api/admin/mods` (`version`; `category`: required, cosmetic or retired), `POST /api/admin/mods/retire` (`{name, version}`), `DELETE /api/admin/mods/:id` (retires; `?purge=1` deletes), `GET /api/admin/integrity`, `POST /api/admin/players/:id/status`, `/api/admin/matches/:id/resolve` (`{winner, scoreHost, scoreGuest}` or `{void:true}`, which also reverts a verified match and reopens an event series it decided), `/api/admin/tournaments`, `/api/admin/tournaments/:id/start`, `/api/admin/series/:id/forfeit` (`{winner: <player id>}` walkover)
 
 More: [`docs/GAME_INTEGRATION.md`](docs/GAME_INTEGRATION.md) · [`docs/SECURITY.md`](docs/SECURITY.md)
 

@@ -8,7 +8,8 @@
  *   rvng join-event --id N                                 sign up for an open knockout event
  *   rvng run        --game DIR [--region eu] [--no-cache]  bridge daemon used by the in-game mod
  *   rvng baseline   --game DIR --version V [--aircraft stats.json]             (admins) build a clean-install baseline
- *   rvng approve    --game DIR --path REL --name NAME [--category required]    (admins) pin a mod file or every file of a folder
+ *   rvng approve    --game DIR --path REL --name NAME [--version V] [--category required|cosmetic|retired]
+ *                                                          (admins) pin a mod file or every file of a folder
  *
  * --no-cache hashes every file instead of reusing hashes from .rvng-cache.json. Use it for event matches.
  *
@@ -18,14 +19,16 @@
  *                   runtime.json  { gameVersion, aircraft: {...}, loadedModules: [...] }
  *                   lobby.json    { matchId, lobbyCode }        (host only, after creating the room)
  *                   result.json   match log (see server/src/matchlog.js)
- *   daemon -> mod : state.json    { state, message, match }
- * lobby.json and result.json are deleted only once the server has accepted them; a permanent rejection
- * renames them to *.failed. Every result is copied to bridge/archive/ before it is sent.
+ *   daemon -> mod : state.json    { state, message, match, error? }
+ *                   state: idle | scanning | waiting | queued | matched | rejected | reported
+ * lobby.json and result.json are deleted only once the server has accepted them; a rejection of the content
+ * (400/403/404/409/413) renames them to *.failed, anything else is retried. Every result is copied to
+ * bridge/archive/ before it is sent.
  */
 const fs = require('node:fs');
 const path = require('node:path');
 const { api } = require('./lib/sign');
-const { scan, hashFile, DEFAULT_EXCLUDES } = require('./lib/scan');
+const { scan, hashFile, excluded, DEFAULT_EXCLUDES } = require('./lib/scan');
 
 const VERSION = '0.2.0';
 
@@ -120,7 +123,8 @@ function cmdApprove(a) {
   if (!rel || !a.name) throw new Error('--path <file or folder under the game root> and --name required');
   const sub = String(rel).replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
   const category = a.category || 'cosmetic';
-  if (!['required', 'cosmetic'].includes(category)) throw new Error('--category must be required or cosmetic');
+  if (!['required', 'cosmetic', 'retired'].includes(category)) throw new Error('--category must be required, cosmetic or retired');
+  const version = a.version === undefined ? '' : String(a.version);
   const full = path.join(a.game, sub);
   const st = fs.lstatSync(full);
   if (st.isSymbolicLink()) throw new Error(`links cannot be approved: ${sub}`);
@@ -129,10 +133,18 @@ function cmdApprove(a) {
     : scan(full, { useCache: false, excludes: [] });
   const links = all.filter((f) => f.size < 0);
   if (links.length) throw new Error(`links cannot be approved: ${links.map((f) => f.path).join(', ')}`);
-  const mods = all.map((f) => ({ name: a.name, path: f.path ? `${sub}/${f.path}` : sub, size: f.size, sha256: f.sha256, category }));
-  const out = a.out || `mods-${String(a.name).replace(/[^A-Za-z0-9_-]/g, '_')}.json`;
+  // Files the players' scanner never reports (logs, crash dumps) cannot be pinned: a pinned file that is never
+  // reported would reject everyone, and UE4SS rewrites its log on every launch anyway.
+  const files = all.map((f) => ({ ...f, path: f.path ? `${sub}/${f.path}` : sub }));
+  const skipped = files.filter((f) => excluded(f.path, DEFAULT_EXCLUDES));
+  const mods = files.filter((f) => !excluded(f.path, DEFAULT_EXCLUDES))
+    .map((f) => ({ name: a.name, version, path: f.path, size: f.size, sha256: f.sha256, category }));
+  if (skipped.length) console.warn(`skipped ${skipped.length} file(s) the scanner never reports: ${skipped.map((f) => f.path).join(', ')}`);
+  if (!mods.length) throw new Error(`nothing to approve under ${sub}`);
+  const out = a.out || `mods-${String(a.name).replace(/[^A-Za-z0-9_-]/g, '_')}${version ? '-' + version.replace(/[^A-Za-z0-9_.-]/g, '_') : ''}.json`;
   writeJson(out, { mods });
-  console.log(`Wrote ${out}: ${mods.length} files (${category}). Upload with POST /api/admin/mods.`);
+  console.log(`Wrote ${out}: ${mods.length} files (${category}${version ? ', version ' + version : ''}). Upload with POST /api/admin/mods.`);
+  return { out, mods, skipped: skipped.map((f) => f.path) };
 }
 
 /**
@@ -143,9 +155,10 @@ function createBridge({ creds, game, region, noCache = false, call = (m, p, b) =
   const dir = bridgeDir(game);
   fs.mkdirSync(dir, { recursive: true });
   const file = (n) => path.join(dir, n);
-  let current = { state: 'idle' };
-  let last = { state: 'idle' };
-  const setState = (state, extra = {}) => { last = { state, at: Date.now(), ...extra }; writeJson(file('state.json'), last); };
+  let current = { state: 'idle' }; // where the server says this pilot stands
+  let last = { state: 'idle' }; // what state.json shows (can be transient, e.g. 'scanning')
+  let retryQueue = null; // a queue request the server asked us to repeat later: { req, at }
+  const setState = (state, extra = {}) => { last = { ...extra, state, at: Date.now() }; writeJson(file('state.json'), last); };
 
   const show = (q, message) => {
     current = q;
@@ -156,8 +169,10 @@ function createBridge({ creds, game, region, noCache = false, call = (m, p, b) =
   // Ask the server where this pilot stands: after a restart, a cancel, or a refused join.
   const resync = async (message) => show(await call('GET', '/api/queue/status'), message);
 
-  // Network errors, 429 and 5xx keep the file for the next tick; other 4xx mean the server will never take it.
-  const permanent = (e) => e.status >= 400 && e.status < 500 && e.status !== 429;
+  // Rejections of the content itself. Everything else (network errors, 401 from a skewed clock, 408, 429,
+  // 5xx) keeps the file for the next tick.
+  const PERMANENT = new Set([400, 403, 404, 409, 410, 413, 422]);
+  const permanent = (e) => PERMANENT.has(e.status);
   const finish = (f, ok) => { try { if (ok) fs.rmSync(f, { force: true }); else fs.renameSync(f, f + '.failed'); } catch { /* gone */ } };
   async function submit(name, send, alreadyDone) {
     const f = file(name);
@@ -174,17 +189,9 @@ function createBridge({ creds, game, region, noCache = false, call = (m, p, b) =
     }
   }
 
-  async function tick() {
-    const reqF = file('request.json');
-    const req = readJson(reqF);
-    if (req) fs.rmSync(reqF, { force: true }); // one-shot UI actions
-    if (req && req.action === 'cancel') {
-      await call('POST', '/api/queue/leave').catch(() => {});
-      await resync('Left queue');
-      if (current.state === 'matched') setState('matched', { match: current.match, message: 'An opponent was already found: the match stays open' });
-    }
-    if (req && req.action === 'queue') {
-      setState('scanning', { message: 'Verifying game files...' });
+  async function queueUp(req) {
+    setState('scanning', { message: 'Verifying game files...' });
+    try {
       const scanRes = await call('POST', '/api/integrity/report', buildReport(game, { noCache }));
       if (scanRes.verdict !== 'clean') {
         current = { state: 'rejected' };
@@ -192,13 +199,37 @@ function createBridge({ creds, game, region, noCache = false, call = (m, p, b) =
         return;
       }
       try {
-        const q = await call('POST', '/api/queue/join', { integrityToken: scanRes.integrityToken, region: req.region || region || 'global' });
+        const reg = String(req.region || region || 'global').toLowerCase();
+        const q = await call('POST', '/api/queue/join', { integrityToken: scanRes.integrityToken, region: reg });
         show(q, q.state === 'queued' ? 'Searching for opponent' : 'Opponent found');
       } catch (e) {
         if (e.status === 409) await resync('You already have an open match');
         else throw e;
       }
+    } catch (e) {
+      if (e.status === 429) { // scans are spaced out: keep the request and repeat it when the server allows
+        const wait = Math.min(Number((/(\d+)s/.exec(e.message) || [])[1]) || 5, 60);
+        retryQueue = { req, at: Date.now() + wait * 1000 };
+        setState('waiting', { message: `Scanning again in ${wait}s`, error: e.message });
+        return;
+      }
+      // Never leave the transient 'scanning' state behind: back to where the server has this pilot.
+      setState(current.state, { ...(current.match ? { match: current.match } : {}), message: 'Could not join the queue', error: e.message });
+      throw e;
     }
+  }
+
+  async function tick() {
+    const reqF = file('request.json');
+    let req = readJson(reqF);
+    if (req) { fs.rmSync(reqF, { force: true }); retryQueue = null; } // one-shot UI actions; a new one replaces a pending retry
+    else if (retryQueue && Date.now() >= retryQueue.at) { req = retryQueue.req; retryQueue = null; }
+    if (req && req.action === 'cancel') {
+      await call('POST', '/api/queue/leave').catch(() => {});
+      await resync('Left queue');
+      if (current.state === 'matched') setState('matched', { match: current.match, message: 'An opponent was already found: the match stays open' });
+    }
+    if (req && req.action === 'queue') await queueUp(req);
 
     if (['queued', 'matched'].includes(current.state)) {
       const q = await call('GET', '/api/queue/status');
@@ -234,7 +265,10 @@ async function cmdRun(a) {
   for (;;) {
     try { await bridge.tick(); } catch (e) {
       console.error('bridge:', e.message);
-      try { bridge.setState(bridge.last().state, { ...bridge.last(), error: e.message }); } catch { /* disk error */ }
+      try {
+        const last = bridge.last(); // keep what the mod shows, with the error, but never a transient 'scanning'
+        bridge.setState(last.state === 'scanning' ? bridge.current().state : last.state, { ...last, error: e.message });
+      } catch { /* disk error */ }
     }
     await sleep(1000);
   }
@@ -255,4 +289,4 @@ async function main() {
 }
 
 if (require.main === module) main().catch((e) => { console.error(e.message); process.exit(1); });
-module.exports = { buildReport, createBridge, writeJson, DEFAULT_EXCLUDES };
+module.exports = { buildReport, createBridge, writeJson, cmdApprove, DEFAULT_EXCLUDES };

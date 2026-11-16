@@ -12,7 +12,8 @@
  *   opponent: { aircraftId: "su57", kills: 3, deaths: 5 },
  *   events: [ { t: 12.4, type: "missile_fired"|"special_fired"|"hit"|"kill"|"death"|"disconnect"|..., actor: "self"|"opponent" } ],
  *   telemetry: { selfMaxSpeed: 2410, opponentMaxSpeed: 2380 },  // km/h, observed
- *   runtime:   { aircraft: { "<aircraftId>": { maxSpeed, turnRate, hp, ... } } }  // live stats sampled during the match
+ *   runtime:   { aircraft:    { "<aircraftId>": { maxSpeed, turnRate, hp, ... } },   // highest value sampled per stat
+ *                aircraftMin: { "<aircraftId>": { ... } } }                         // lowest value sampled per stat
  * }
  *
  * Neither player can control the other player's log, so every number is cross-checked
@@ -116,15 +117,22 @@ function reconcile(repA, repB, ctx) {
   }
 
   // Live flight parameters the author's own game reported during the match (sampled by the mod), for the
-  // aircraft the author flew. Only self-incriminating: nobody can put values into another pilot's log.
+  // aircraft the author flew: the highest and the lowest value seen for each stat. A changed value lies above
+  // or below the reference, so it shows up in one of the two whenever it was active, even if the trainer was
+  // already on at match start or off for the final sample. Only self-incriminating: nobody can put values
+  // into another pilot's log.
   for (const [rep, , pid] of sides) {
     const id = rep.self.aircraftId;
-    const ac = rep.runtime && rep.runtime.aircraft;
-    if (!isPlainObject(ac) || !Object.hasOwn(ac, id)) { flag('runtime_stats_missing', { player: pid, aircraft: id }); continue; }
-    for (const f of compareAircraft({ [id]: ac[id] }, aircraftStats)) {
-      if (SEVERITY[f.severity] < SEVERITY.high) continue;
-      flag(f.code === 'aircraft_stat_modified' ? 'aircraft_stat_modified' : 'runtime_stats_invalid',
-        { player: pid, aircraft: id, stat: f.stat, expected: f.expected, actual: f.actual });
+    const seen = new Set();
+    const once = (code, extra) => { const k = `${code}:${extra.stat ?? ''}`; if (!seen.has(k)) { seen.add(k); flag(code, extra); } };
+    for (const key of ['aircraft', 'aircraftMin']) {
+      const ac = rep.runtime && rep.runtime[key];
+      if (!isPlainObject(ac) || !Object.hasOwn(ac, id)) { once('runtime_stats_missing', { player: pid, aircraft: id }); continue; }
+      for (const f of compareAircraft({ [id]: ac[id] }, aircraftStats)) {
+        if (SEVERITY[f.severity] < SEVERITY.high) continue;
+        once(f.code === 'aircraft_stat_modified' ? 'aircraft_stat_modified' : 'runtime_stats_invalid',
+          { player: pid, aircraft: id, stat: f.stat, expected: f.expected, actual: f.actual });
+      }
     }
   }
 

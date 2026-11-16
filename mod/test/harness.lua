@@ -24,13 +24,22 @@ function FindAllOf() return params end
 params[1] = param("f22a", { TODO_MaxSpeed = 2400, TODO_TurnRate = 30, TODO_HP = 100 })
 
 -- ---- stub game adapter ----
-local me, opp, ai = { name = "me" }, { name = "opp" }, { name = "ai" }
+-- Like UE4SS, every ctx:get() returns a NEW wrapper for the same object: only the address identifies it.
+local me, opp, ai = { name = "me", addr = 0x1000 }, { name = "opp", addr = 0x2000 }, { name = "ai", addr = 0x3000 }
+local function wrap(obj)
+  if obj == nil then return nil end
+  local w = { obj = obj, kind = obj.kind }
+  function w:GetAddress() return obj.addr end
+  function w:GetOwner() return wrap(obj.owner) end
+  return w
+end
 local joins, roomResult = {}, nil
 RVNG_GAME = {
   createRoom = function() return roomResult end,
   joinRoom = function(code) joins[#joins + 1] = code; return true end,
-  isLocal = function(p) return p == me end,
-  isOpponent = function(p) return p == opp end,
+  isLocal = function(p) return p ~= nil and p.obj == me end,
+  isOpponent = function(p) return p ~= nil and p.obj == opp end,
+  key = function(p) return p:GetAddress() end,
   weaponKind = function(c) return c.kind end,
   aircraftIds = function() return "f22a", "su57" end,
   speeds = function() return 2300, 2350 end,
@@ -39,7 +48,7 @@ RVNG_GAME = {
 dofile(here .. "/../ProjectRVNG/Scripts/main.lua")
 
 local function hook(name) for path, fn in pairs(hooks) do if path:find(name, 1, true) then return fn end end error("no hook " .. name) end
-local ctx = function(obj) return { get = function() return obj end } end
+local ctx = function(obj) return { get = function() return wrap(obj) end } end
 local function writeState(t) local f = assert(io.open(RVNG_BRIDGE .. "state.json", "w")); f:write(Json.encode(t)); f:close() end
 local function read(name) local f = io.open(RVNG_BRIDGE .. name, "r"); if not f then return nil end local s = f:read("a"); f:close(); return s end
 local function check(cond, msg) if not cond then error("FAIL: " .. msg, 2) end print("ok - " .. msg) end
@@ -60,8 +69,8 @@ hook("ReceiveDamage")(ctx(opp), 40, ctx(me))
 hook("AircraftPawn:OnDestroyed")(ctx(opp))
 hook("AircraftPawn:OnDestroyed")(ctx(me))
 hook("AircraftPawn:OnDestroyed")(ctx(ai))
-hook("WeaponComponent:Fire")(ctx({ GetOwner = function() return me end, kind = "mystery" }))
-hook("WeaponComponent:Fire")(ctx({ GetOwner = function() return opp end, kind = "gun" }))
+hook("WeaponComponent:Fire")(ctx({ owner = me, kind = "mystery" }))
+hook("WeaponComponent:Fire")(ctx({ owner = opp, kind = "gun" }))
 clock = clock + 100
 hook("OnMatchEnded")()
 local result = Json.decode(read("result.json"))
@@ -74,7 +83,8 @@ for _, e in ipairs(result.events) do kinds[#kinds + 1] = e.type .. ":" .. e.acto
 local evs = table.concat(kinds, ",")
 check(evs:find("special_fired:self", 1, true) ~= nil, "unknown weapon kinds are logged as special (fail closed)")
 check(evs:find("gun_fired:opponent", 1, true) ~= nil, "gun fire is classified")
-check(result.runtime.aircraft.f22a.maxSpeed == 2600, "the most-deviating live stat sample is reported")
+check(result.runtime.aircraft.f22a.maxSpeed == 2600 and result.runtime.aircraftMin.f22a.maxSpeed == 2400,
+  "the highest and lowest live stat samples are reported")
 check(result.telemetry.opponentMaxSpeed == 2350, "speed telemetry is sampled")
 
 -- The companion still shows m1 as matched/live until it submits: no rejoin.
@@ -86,6 +96,20 @@ tick()
 writeState({ state = "matched", match = { id = "m2", state = "live", role = "guest", lobbyCode = "ROOM2" } })
 tick()
 check(#joins == 2 and joins[2] == "ROOM2", "the next match's room is joined")
+
+-- 1b. A trainer already on at match start and briefly off still shows: highest and lowest samples are kept,
+--     not the sample furthest from the start value.
+local function setStats(turn, hp) params[1] = param("f22a", { TODO_MaxSpeed = 2400, TODO_TurnRate = turn, TODO_HP = hp }) end
+writeState({ state = "matched", match = { id = "m1b", state = "live", role = "guest", lobbyCode = "ROOM1B" } })
+setStats(39, 50) -- turn rate up, HP down, before the match starts
+tick()
+hook("OnMatchStarted")()
+tick(10); setStats(30, 100); tick(10); setStats(39, 50); tick(10); tick(10)
+hook("OnMatchEnded")()
+local r1b = Json.decode(read("result.json"))
+check(r1b.matchId == "m1b" and r1b.runtime.aircraft.f22a.turnRate == 39 and r1b.runtime.aircraftMin.f22a.hp == 50,
+  "tampered values present at match start are kept despite a clean sample")
+setStats(30, 100)
 
 -- 2. An empty match log encodes events as a JSON array.
 writeState({ state = "matched", match = { id = "m3", state = "live", role = "guest", lobbyCode = "ROOM3" } })

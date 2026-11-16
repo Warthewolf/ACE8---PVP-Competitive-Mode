@@ -26,7 +26,7 @@ function play(a, b, seriesId = null) {
   const mk = (k, d, s, o) => ({ gameVersion: 'demo', durationSec: 240 + Math.floor(Math.random() * 300), endReason: 'kill_target',
     self: { aircraftId: s, kills: k, deaths: d }, opponent: { aircraftId: o, kills: d, deaths: k },
     events: [...Array(k)].map((_, i) => ({ t: i * 20, type: 'kill', actor: 'self' })).concat([...Array(d)].map((_, i) => ({ t: i * 20 + 7, type: 'kill', actor: 'opponent' }))),
-    telemetry: { opponentMaxSpeed: 2300 }, runtime: { aircraft: { [s]: AIRCRAFT[s] } } });
+    telemetry: { opponentMaxSpeed: 2300 }, runtime: { aircraft: { [s]: AIRCRAFT[s] }, aircraftMin: { [s]: AIRCRAFT[s] } } });
   const ra = mk(ka, kb, 'f22a', 'su57'); const rb = mk(kb, ka, 'su57', 'f22a'); rb.durationSec = ra.durationSec;
   db.prepare('INSERT INTO match_reports (match_id, player_id, report, received_at) VALUES (?, ?, ?, ?)').run(id, a, JSON.stringify(ra), Date.now());
   const m = svc.submitReport(db, player(b), id, rb);

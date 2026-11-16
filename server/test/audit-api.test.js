@@ -157,7 +157,7 @@ test('series pairing: every open series is tried, and entrants are held for thei
   } finally { await env.close(); }
 });
 
-test('voiding a verified match reverts it; a decided series cannot be voided', async () => {
+test('voiding a verified match reverts it; voiding a won final reopens it', async () => {
   const env = await setup();
   try {
     const a = await env.register('Revert1'); const b = await env.register('Revert2');
@@ -172,10 +172,13 @@ test('voiding a verified match reverts it; a decided series cannot be voided', a
     await assert.rejects(env.admin('POST', `/api/admin/matches/${m.id}/resolve`, { winner: 'host', scoreHost: 'x' }), rejectsWith(409));
 
     const c = await env.register('Final1'); const d = await env.register('Final2');
-    await cup(env, [c, d]);
+    const t = await cup(env, [c, d]);
     const fm = await queuePair(env, c, d);
     await playHonest(fm);
-    await assert.rejects(env.admin('POST', `/api/admin/matches/${fm.id}/resolve`, { void: true }), rejectsWith(409));
+    assert.equal((await pub(env, `/api/tournaments/${t.id}`)).champion, fm.host.id);
+    await env.admin('POST', `/api/admin/matches/${fm.id}/resolve`, { void: true });
+    const reopened = await pub(env, `/api/tournaments/${t.id}`);
+    assert.deepEqual([reopened.state, reopened.champion, reopened.series[0].winner], ['running', null, null]);
   } finally { await env.close(); }
 });
 
@@ -227,7 +230,7 @@ test('queue eligibility: re-checked status, same build only, fixed regions, no p
   } finally { await env.close(); }
 });
 
-test('retired builds stop queueing; old required-mod versions can be withdrawn', async () => {
+test('retired builds stop queueing; withdrawn mods are retired, and purged only on request', async () => {
   const env = await setup();
   try {
     const a = await env.register('OldBuild');
@@ -241,7 +244,9 @@ test('retired builds stop queueing; old required-mod versions can be withdrawn',
     const mods = await env.admin('POST', '/api/admin/mods', { mods: [{ name: 'HUD', path: 'ACE8/Content/Paks/~mods/hud_P.pak', size: 7, sha256: H('d') }] });
     const hud = mods.find((m) => m.name === 'HUD');
     const left = await env.admin('DELETE', `/api/admin/mods/${hud.id}`);
-    assert.ok(!left.some((m) => m.name === 'HUD'));
+    assert.equal(left.find((m) => m.name === 'HUD').category, 'retired');
+    const purged = await env.admin('DELETE', `/api/admin/mods/${hud.id}?purge=1`);
+    assert.ok(!purged.some((m) => m.name === 'HUD'));
   } finally { await env.close(); }
 });
 

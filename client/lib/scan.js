@@ -42,7 +42,8 @@ function hashFile(file) {
   return h.digest('hex');
 }
 
-const excluded = (rel, excludes) => !NEVER_EXCLUDE.test(rel) && excludes.some((rx) => rx.test(rel));
+// Whether the scanner leaves a regular file out of the report (see DEFAULT_EXCLUDES).
+const excluded = (rel, excludes = DEFAULT_EXCLUDES) => !NEVER_EXCLUDE.test(rel) && excludes.some((rx) => rx.test(rel));
 
 /**
  * @param root  game install root
@@ -58,7 +59,9 @@ function scan(root, { excludes = DEFAULT_EXCLUDES, cacheFile, useCache = true, o
   const next = {};
   const files = [];
   stats.hashed = 0; stats.cached = 0;
-  const entries = walk(root).filter((e) => !excluded(e.rel, excludes));
+  // Links are always reported, whatever their name or place: a link is never a log or user data, and the
+  // excludes match names only (a junction called "x.log", or Saved itself as a link, must not hide a mods folder).
+  const entries = walk(root).filter((e) => e.symlink || !excluded(e.rel, excludes));
   entries.forEach((e, i) => {
     if (e.symlink) { files.push({ path: e.rel, size: -1, sha256: 'symlink' }); return; }
     const full = path.join(root, e.rel);
@@ -77,4 +80,4 @@ function scan(root, { excludes = DEFAULT_EXCLUDES, cacheFile, useCache = true, o
   return files.sort((a, b) => (a.path < b.path ? -1 : 1));
 }
 
-module.exports = { scan, hashFile, DEFAULT_EXCLUDES, NEVER_EXCLUDE };
+module.exports = { scan, hashFile, excluded, DEFAULT_EXCLUDES, NEVER_EXCLUDE };

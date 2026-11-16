@@ -39,15 +39,16 @@ async function setup() {
   return { db, url, admin, register, cleanReport, close };
 }
 
-// A match log as the host's mod writes it. `stats` overrides the live stats of the pilot's own aircraft.
-function log({ selfAc = 'f22a', oppAc = 'su57', k = 5, d = 2, dur = 300, oppSpeed = 2300, end = 'kill_target', events: extra = [], stats } = {}) {
+// A match log as the host's mod writes it. `stats` overrides the live stats of the pilot's own aircraft
+// (highest and lowest sample), `minStats` only the lowest sample.
+function log({ selfAc = 'f22a', oppAc = 'su57', k = 5, d = 2, dur = 300, oppSpeed = 2300, end = 'kill_target', events: extra = [], stats, minStats } = {}) {
   const events = [];
   for (let i = 0; i < k; i++) events.push({ t: i * 10, type: 'kill', actor: 'self' });
   for (let i = 0; i < d; i++) events.push({ t: i * 10 + 5, type: 'kill', actor: 'opponent' });
   events.push(...extra);
   return { gameVersion: '1.0.0', durationSec: dur, endReason: end, self: { aircraftId: selfAc, kills: k, deaths: d },
     opponent: { aircraftId: oppAc, kills: d, deaths: k }, events, telemetry: { opponentMaxSpeed: oppSpeed },
-    runtime: { aircraft: { [selfAc]: stats || AIRCRAFT[selfAc] } } };
+    runtime: { aircraft: { [selfAc]: stats || AIRCRAFT[selfAc] }, aircraftMin: { [selfAc]: minStats || stats || AIRCRAFT[selfAc] } } };
 }
 
 // Mirror of `log` from the other pilot's point of view.

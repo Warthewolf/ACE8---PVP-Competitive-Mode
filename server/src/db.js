@@ -46,7 +46,8 @@ CREATE TABLE IF NOT EXISTS approved_mods (
   path     TEXT NOT NULL,      -- path relative to game root
   size     INTEGER NOT NULL,
   sha256   TEXT NOT NULL,
-  category TEXT NOT NULL DEFAULT 'cosmetic', -- required | cosmetic
+  category TEXT NOT NULL DEFAULT 'cosmetic', -- required | cosmetic | retired (an old build: rejected, never flagged)
+  version  TEXT NOT NULL DEFAULT '',         -- build of the mod; any one complete build of a required mod passes
   UNIQUE (path, sha256)
 );
 
@@ -155,12 +156,41 @@ const ADDED_COLUMNS = [
   ['matches', 'kills_a', 'INTEGER'], ['matches', 'deaths_a', 'INTEGER'],
   ['matches', 'kills_b', 'INTEGER'], ['matches', 'deaths_b', 'INTEGER'],
   ['matches', 'live_at', 'INTEGER'],
+  ['approved_mods', 'version', "TEXT NOT NULL DEFAULT ''"],
 ];
 
+const parse = (s) => { try { return JSON.parse(s); } catch { return null; } };
+
 function migrate(db) {
+  const added = new Set();
   for (const [table, col, def] of ADDED_COLUMNS) {
     const cols = db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
-    if (!cols.includes(col)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${def}`);
+    if (!cols.includes(col)) { db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${def}`); added.add(`${table}.${col}`); }
+  }
+  // Queue entries keep their build: it is the build of the scan they joined with.
+  if (added.has('queue.game_version')) {
+    db.exec(`UPDATE queue SET game_version = COALESCE((SELECT game_version FROM integrity_reports r WHERE r.id = queue.integrity_id), '')`);
+  }
+  // Matches still being played: the build both pilots last scanned clean on before the match was created.
+  if (added.has('matches.game_version')) {
+    const lastClean = db.prepare(`SELECT game_version FROM integrity_reports WHERE player_id = ? AND verdict = 'clean'
+      AND created_at <= ? ORDER BY id DESC LIMIT 1`);
+    const set = db.prepare('UPDATE matches SET game_version = ? WHERE id = ?');
+    for (const m of db.prepare("SELECT * FROM matches WHERE state IN ('pending', 'live', 'awaiting_reports')").all()) {
+      const a = lastClean.get(m.player_a, m.created_at); const b = lastClean.get(m.player_b, m.created_at);
+      if (a && b && a.game_version === b.game_version) set.run(a.game_version, m.id);
+    }
+  }
+  // Verified matches: the kills/deaths that were credited, so voiding one later undoes exactly those.
+  if (added.has('matches.kills_a')) {
+    const rep = db.prepare('SELECT report FROM match_reports WHERE match_id = ? AND player_id = ?');
+    const set = db.prepare('UPDATE matches SET kills_a = ?, deaths_a = ?, kills_b = ?, deaths_b = ? WHERE id = ?');
+    const int = (n) => (Number.isSafeInteger(n) && n >= 0 ? n : 0);
+    for (const m of db.prepare("SELECT * FROM matches WHERE state = 'verified'").all()) {
+      const ra = parse(rep.get(m.id, m.player_a)?.report); const rb = parse(rep.get(m.id, m.player_b)?.report);
+      if (ra?.self && rb?.self) set.run(int(ra.self.kills), int(ra.self.deaths), int(rb.self.kills), int(rb.self.deaths), m.id);
+      else set.run(int(m.score_a), int(m.score_b), int(m.score_b), int(m.score_a), m.id); // settled by an admin
+    }
   }
 }
 

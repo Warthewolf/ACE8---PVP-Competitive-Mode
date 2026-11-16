@@ -1,13 +1,24 @@
 'use strict';
 
+// Express 'trust proxy' from an env string: true/false, a hop count, or a comma-separated list of
+// addresses/subnets (e.g. "loopback, 10.0.0.0/8"). Express would read "true" or "1" as an IP address.
+function parseTrustProxy(v) {
+  if (v === undefined || v === '' || v === 'false') return false;
+  if (v === 'true') return true;
+  if (/^\d+$/.test(v)) return Number(v);
+  return v.split(',').map((x) => x.trim()).filter(Boolean);
+}
+
 // Central configuration. Everything can be overridden by environment variables.
 module.exports = {
+  parseTrustProxy,
   port: Number(process.env.PORT || 8080),
   dbPath: process.env.DB_PATH || 'rvng.sqlite',
   // Admin bearer token for baseline uploads, tournament management, dispute resolution.
   adminToken: process.env.ADMIN_TOKEN || '',
-  // Set when running behind a reverse proxy so per-IP limits see the client address (Express 'trust proxy').
-  trustProxy: process.env.TRUST_PROXY || false,
+  // Set when running behind a reverse proxy so per-IP limits see the client address (Express 'trust proxy'):
+  // TRUST_PROXY=1 (one proxy hop), =true, or a list such as "loopback, 10.0.0.0/8".
+  trustProxy: parseTrustProxy(process.env.TRUST_PROXY),
 
   // Request signing (client/mod -> server)
   signatureMaxSkewMs: 5 * 60 * 1000,
@@ -20,11 +31,15 @@ module.exports = {
     maxLoadedModules: 2048,
     maxAircraft: 1000,
     keepReports: 20, // per player; older reports not in use are deleted
-    storedFindings: 200, // findings/mods kept per stored report (a per-code summary keeps the rest)
+    storedFindings: 200, // findings/mods kept per stored report, most severe first (a per-code summary keeps the rest)
+    maxStoredBytes: 256 * 1024, // stored findings + mods per report; over this only the summary is kept
+    maxPathLength: 1024, // characters per file path
+    maxModuleName: 260, // characters per loaded-module entry
+    maxAircraftId: 128, // characters per aircraft id
   },
 
-  // Anonymous sign-ups per client IP.
-  registration: { windowMs: 60 * 60 * 1000, max: 10 },
+  // Anonymous sign-ups per client address (IPv6 clients are counted per /64 network).
+  registration: { windowMs: 60 * 60 * 1000, max: 10, maxTracked: 50000 },
 
   rating: {
     initial: 1500,
@@ -55,8 +70,10 @@ module.exports = {
       aircraftBans: [],
     },
     reportWindowMs: 15 * 60 * 1000, // both reports must arrive within this time of the first
-    // A room that went live but never got a report is voided after the time limit plus this grace.
+    // A room that went live but never got a report is closed after the time limit plus this grace (ranked:
+    // void, event game: admin review). Reports that arrive later are still accepted and settle it.
     liveGraceMs: 15 * 60 * 1000,
+    untimedMatchSec: 3 * 60 * 60, // stands in for the time limit of rooms without one (timeLimitSec 0)
     minDurationSec: 30,
     maxObservedSpeed: 100000, // km/h; telemetry above this is malformed
   },

@@ -19,10 +19,10 @@ The mod targets [UE4SS](https://github.com/UE4SS-RE/RE-UE4SS), the usual Lua/C++
 | Main-menu entry | `HOOKS.MainMenuConstruct` | Add a "COMPETITIVE 1v1" button that calls `requestQueue()`. F8/F9 keybinds work until then. |
 | Create / join private room | `GAME.createRoom(rules)`, `GAME.joinRoom(code)` | Host creates the room (retried every 5 s until it returns an id) and writes `lobby.json`; the guest joins each match's room once. Apply `match.rules` (time limit, kill target, 2 slots, special weapons). |
 | Match start / end | `HOOKS.MatchStart`, `HOOKS.MatchEnd`, `GAME.endReason(ctx)` | Opens and closes the match log. The end reason must be the real one: the server checks it against the rules and the opponent's log. |
-| Kills / deaths | `HOOKS.AircraftDestroyed`, `HOOKS.DamageApplied` | Kills are credited to the last pilot who damaged the victim. Crashes are deaths without a kill. `GAME.isLocal` / `GAME.isOpponent` tell the two pilots from AI. |
+| Kills / deaths | `HOOKS.AircraftDestroyed`, `HOOKS.DamageApplied`, `GAME.key` | Kills are credited to the last pilot who damaged the victim. Crashes are deaths without a kill. `GAME.isLocal` / `GAME.isOpponent` tell the two pilots from AI. UE4SS creates a new Lua wrapper every time a hook receives an object, so the victim is remembered by `GAME.key(obj)` (default: `obj:GetAddress()`), never by the wrapper itself. |
 | Weapons | `HOOKS.WeaponFired`, `GAME.weaponKind` | `gun` / `missile` / `special`. Unknown kinds are logged as special (fail closed). |
 | Surrender / disconnect | `HOOKS.PlayerLeft` | Logs a `disconnect` event. A leaver only loses when both logs record it. |
-| Aircraft flight parameters | `AIRCRAFT_PARAM_CLASS`, `STAT_PROPS` | Read live at queue time, at match start and every second during the match. The same values (from a clean game) go into the admin baseline `aircraft` table, for every aircraft. |
+| Aircraft flight parameters | `AIRCRAFT_PARAM_CLASS`, `STAT_PROPS` | Read live at queue time, at match start and every second during the match; the log keeps the lowest and highest value of each stat. The same values (from a clean game) go into the admin baseline `aircraft` table, for every aircraft. These must be fixed parameters (maximum HP, not current HP). |
 | Aircraft ids and speeds | `GAME.aircraftIds()`, `GAME.speeds()` | Ids must match the baseline's aircraft table. Speeds fill `telemetry.selfMaxSpeed` / `opponentMaxSpeed`. |
 | Game build string | `GAME_VERSION` | Must match the baseline `gameVersion` the player scanned clean on. |
 
@@ -32,12 +32,12 @@ Every finished hook also needs a matching entry in the baseline aircraft table a
 
 Files are written in `<game root>/ProjectRVNG/bridge/` using write-to-temp-then-rename. The scanner excludes this folder, except for file types the game can load (`.pak`, `.dll`, `.lua`, …).
 
-The companion deletes `lobby.json` and `result.json` only after the server accepts them. A permanent rejection renames the file to `*.failed`. Results are also copied to `bridge/archive/`. The mod acts only on a `matched` state whose match is `pending` or `live` and that it has not already played.
+The companion deletes `lobby.json` and `result.json` only after the server accepts them. A rejection of the content (400, 403, 404, 409, 413) renames the file to `*.failed`; network errors, a 401 from a skewed clock, 429 and 5xx are retried every second. Results are also copied to `bridge/archive/`. A scan refused because it came too soon after the last one (429) is repeated by the companion once the server allows it, with state `waiting` meanwhile. The mod acts only on a `matched` state whose match is `pending` or `live` and that it has not already played.
 
 | File | Writer | Content |
 |---|---|---|
 | `request.json` | mod | `{ "action": "queue" \| "cancel", "region"? }` |
 | `runtime.json` | mod | `{ gameVersion, aircraft: { id: { maxSpeed, turnRate, hp, ... } }, loadedModules? }` |
 | `lobby.json` | mod (host) | `{ matchId, lobbyCode }` |
-| `result.json` | mod | Match log, see `server/src/matchlog.js`. `events` is always a JSON array (`Json.array()`); `runtime.aircraft` holds the sampled stats. |
-| `state.json` | companion | `{ state: idle\|scanning\|queued\|matched\|rejected\|reported, message, match: { id, role, lobbyCode, rules, host, guest } }` |
+| `result.json` | mod | Match log, see `server/src/matchlog.js`. `events` is always a JSON array (`Json.array()`); `runtime.aircraft` and `runtime.aircraftMin` hold the highest and lowest sampled stats. |
+| `state.json` | companion | `{ state: idle\|scanning\|waiting\|queued\|matched\|rejected\|reported, message, error?, match: { id, role, lobbyCode, rules, host, guest } }` |

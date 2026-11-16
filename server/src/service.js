@@ -70,12 +70,26 @@ function baselineFor(db, version, { activeOnly = true } = {}) {
   return b ? { ...b, manifest: json(b.manifest, { files: [] }), aircraft: json(b.aircraft, {}) } : null;
 }
 
-// Keep the first `n` entries and a per-code count of everything, so a huge report cannot bloat storage.
-function capFindings(findings, n) {
-  if (findings.length <= n) return findings;
+// The first entries of `list` that fit in `n` items and `budget` bytes of JSON.
+function capList(list, n, budget) {
+  const out = []; let bytes = 2;
+  for (const x of list) {
+    const b = Buffer.byteLength(JSON.stringify(x)) + 1;
+    if (out.length >= n || bytes + b > budget) break;
+    out.push(x); bytes += b;
+  }
+  return out;
+}
+
+// Most severe first, so the findings that explain a verdict are never the ones cut. Past `n` entries or
+// `budget` bytes, a per-code count of everything stands in for the rest.
+function capFindings(findings, n, budget = Infinity) {
+  const sorted = [...findings].sort((a, b) => (integrity.SEVERITY[b.severity] ?? 0) - (integrity.SEVERITY[a.severity] ?? 0));
+  const kept = capList(sorted, n, budget);
+  if (kept.length === sorted.length) return kept;
   const counts = {};
   for (const f of findings) counts[f.code] = (counts[f.code] || 0) + 1;
-  return [...findings.slice(0, n), { code: 'findings_truncated', severity: 'info', total: findings.length, counts }];
+  return [...kept, { code: 'findings_truncated', severity: 'info', total: findings.length, counts }];
 }
 
 // Tampered aircraft data or injected code in a player's own report puts the account under review.
@@ -85,10 +99,17 @@ function submitIntegrity(db, player, report) {
   const c = config.integrity;
   if (!isPlainObject(report)) throw new HttpError(400, 'report must be an object');
   const rt = isPlainObject(report.runtime) ? report.runtime : {};
+  const long = (v, max) => typeof v === 'string' && v.length > max;
   if ((Array.isArray(report.files) && report.files.length > c.maxFiles)
     || (Array.isArray(rt.loadedModules) && rt.loadedModules.length > c.maxLoadedModules)
     || (isPlainObject(rt.aircraft) && Object.keys(rt.aircraft).length > c.maxAircraft)) {
     throw new HttpError(413, 'integrity report too large');
+  }
+  // Counts alone do not bound storage: a few multi-megabyte strings would be copied into findings and mods.
+  if ((Array.isArray(report.files) && report.files.some((f) => isPlainObject(f) && long(f.path, c.maxPathLength)))
+    || (Array.isArray(rt.loadedModules) && rt.loadedModules.some((m) => long(m, c.maxModuleName)))
+    || (isPlainObject(rt.aircraft) && Object.keys(rt.aircraft).some((k) => k.length > c.maxAircraftId))) {
+    throw new HttpError(413, 'integrity report has an oversized path, module or aircraft name');
   }
   const last = db.prepare('SELECT created_at FROM integrity_reports WHERE player_id = ? ORDER BY id DESC LIMIT 1').get(player.id);
   if (last && now() - last.created_at < c.minIntervalMs) {
@@ -98,11 +119,11 @@ function submitIntegrity(db, player, report) {
   const gameVersion = typeof report.gameVersion === 'string' ? report.gameVersion.slice(0, 32) : '';
   const baseline = baselineFor(db, gameVersion);
   const approved = db.prepare('SELECT * FROM approved_mods').all();
-  const result = integrity.evaluate(report, baseline, approved);
+  const result = integrity.evaluate({ ...report, gameVersion }, baseline, approved);
   const token = result.verdict === 'clean' ? 'it_' + crypto.randomBytes(24).toString('base64url') : null;
   const expires = token ? now() + config.integrityTokenTtlMs : null;
-  const findings = capFindings(result.findings, c.storedFindings);
-  const mods = result.mods.slice(0, c.storedFindings);
+  const findings = capFindings(result.findings, c.storedFindings, c.maxStoredBytes / 2);
+  const mods = capList([...result.mods].sort((a, b) => a.approved - b.approved), c.storedFindings, c.maxStoredBytes / 2);
 
   tx(db, () => {
     db.prepare(`INSERT INTO integrity_reports (player_id, game_version, verdict, findings, mods, manifest_hash, token, expires_at, created_at)
@@ -282,24 +303,35 @@ function setLobby(db, player, matchId, lobbyCode) {
 }
 
 // ---------- match reports ----------
+// Closed by the background sweep rather than by an admin: reports that arrive late still settle the match.
+const SWEEP_CODES = ['no_reports', 'missing_opponent_report'];
+function closedBySweep(m) {
+  if (!['void', 'disputed'].includes(m.state)) return false;
+  const f = json(m.flags, []);
+  return Array.isArray(f) && f.length === 1 && SWEEP_CODES.includes(f[0]?.code);
+}
+
 function submitReport(db, player, matchId, report) {
   return tx(db, () => {
     const m = db.prepare('SELECT * FROM matches WHERE id = ?').get(matchId);
     if (!m) throw new HttpError(404, 'match not found');
     if (m.player_a !== player.id && m.player_b !== player.id) throw new HttpError(403, 'not a participant');
-    if (!['live', 'awaiting_reports'].includes(m.state)) throw new HttpError(409, `match is ${m.state}`);
-    const errs = matchlog.validateShape(report);
-    if (errs.length) throw new HttpError(400, 'invalid report: ' + errs.join(', '));
-    // One report per pilot. A resubmission would also restart the report window and stall the sweep.
+    // One report per pilot, checked first so a retry after a lost response is recognised whatever the match
+    // state is now. A resubmission would also restart the report window and stall the sweep.
     if (db.prepare('SELECT 1 FROM match_reports WHERE match_id = ? AND player_id = ?').get(matchId, player.id)) {
       throw new HttpError(409, 'report already submitted');
     }
+    const late = closedBySweep(m);
+    if (!['live', 'awaiting_reports'].includes(m.state) && !late) throw new HttpError(409, `match is ${m.state}`);
+    const errs = matchlog.validateShape(report);
+    if (errs.length) throw new HttpError(400, 'invalid report: ' + errs.join(', '));
 
     db.prepare('INSERT INTO match_reports (match_id, player_id, report, received_at) VALUES (?, ?, ?, ?)')
       .run(matchId, player.id, JSON.stringify(report), now());
     const reports = db.prepare('SELECT * FROM match_reports WHERE match_id = ?').all(matchId);
     if (reports.length < 2) {
-      db.prepare("UPDATE matches SET state = 'awaiting_reports' WHERE id = ?").run(matchId);
+      // A room the sweep closed stays closed (nobody is held out of the queue) until the other log arrives.
+      if (!late) db.prepare("UPDATE matches SET state = 'awaiting_reports' WHERE id = ?").run(matchId);
       return getMatch(db, matchId, player.id);
     }
     resolveMatch(db, m, reports);
@@ -375,7 +407,14 @@ function resolveDispute(db, matchId, { winner, scoreHost = 0, scoreGuest = 0, vo
     if (isVoid === true) {
       if (!['disputed', 'awaiting_reports', 'live', 'pending', 'verified'].includes(m.state)) throw new HttpError(409, `match is ${m.state}`);
       if (m.state === 'verified') revertResult(db, m);
-      db.prepare("UPDATE matches SET state = 'void' WHERE id = ?").run(m.id);
+      // The match no longer shows a winner, score or rating change; the flag keeps what was undone. The flag
+      // also marks the void as an admin decision, so late reports cannot reopen it.
+      const old = json(m.flags, []);
+      const flags = [...(Array.isArray(old) ? old : []), { code: 'admin_void',
+        ...(m.state === 'verified' ? { reverted: { winner: m.winner, score: [m.score_a, m.score_b], ratingDelta: [m.rating_delta_a, m.rating_delta_b] } } : {}) }];
+      db.prepare(`UPDATE matches SET state = 'void', winner = NULL, score_a = NULL, score_b = NULL, rating_delta_a = NULL,
+        rating_delta_b = NULL, kills_a = NULL, deaths_a = NULL, kills_b = NULL, deaths_b = NULL, flags = ? WHERE id = ?`)
+        .run(JSON.stringify(flags), m.id);
     } else {
       if (!['disputed', 'awaiting_reports', 'live', 'pending'].includes(m.state)) throw new HttpError(409, `match is ${m.state}`);
       const outcome = winner === 'host' ? 'a' : winner === 'guest' ? 'b' : winner === 'draw' ? 'draw' : null;
@@ -398,19 +437,22 @@ function sweepStaleMatches(db, t = now()) {
   for (const { id } of stale) upd.run(JSON.stringify([{ code: 'missing_opponent_report' }]), id);
   // Rooms never created within the window are voided.
   db.prepare("UPDATE matches SET state = 'void' WHERE state = 'pending' AND created_at < ?").run(t - c.reportWindowMs);
-  // Rooms that went live but got no report from anyone are voided once the match must be over, so a guest who
-  // never joined (or a fake room code) cannot lock both pilots out of the queue.
-  const live = db.prepare(`SELECT id, rules, created_at, live_at FROM matches m WHERE state = 'live'
+  // Rooms that went live but got no report from anyone are closed once the match must be over, so a guest who
+  // never joined (or a fake room code) cannot lock both pilots out of the queue. A ranked room is voided. An
+  // event game goes to an admin instead: voiding it would hand the series a rematch, and a pilot who is losing
+  // could stall the room to get one. Either way, logs that arrive later still settle the match.
+  const live = db.prepare(`SELECT id, rules, created_at, live_at, series_id FROM matches m WHERE state = 'live'
     AND NOT EXISTS (SELECT 1 FROM match_reports r WHERE r.match_id = m.id)`).all();
-  const voidIt = db.prepare("UPDATE matches SET state = 'void', flags = ? WHERE id = ? AND state = 'live'");
-  let voided = 0;
+  const close = db.prepare("UPDATE matches SET state = ?, flags = ? WHERE id = ? AND state = 'live'");
+  let closed = 0;
   for (const m of live) {
-    const limit = Number(json(m.rules, {}).timeLimitSec) || c.defaultRules.timeLimitSec;
+    const tl = Number(json(m.rules, {}).timeLimitSec);
+    const limit = tl > 0 ? tl : c.untimedMatchSec; // timeLimitSec 0 means no time limit
     if ((m.live_at ?? m.created_at) + limit * 1000 + c.liveGraceMs < t) {
-      voidIt.run(JSON.stringify([{ code: 'no_reports' }]), m.id); voided++;
+      close.run(m.series_id ? 'disputed' : 'void', JSON.stringify([{ code: 'no_reports' }]), m.id); closed++;
     }
   }
-  return stale.length + voided;
+  return stale.length + closed;
 }
 
 function recentMatches(db, { playerId, state, limit = 50 } = {}) {
@@ -449,14 +491,19 @@ function setBaselineActive(db, gameVersion, active) {
   return { gameVersion: String(gameVersion), active };
 }
 
-function addOneMod(db, { name, path, size, sha256: hash, category = 'cosmetic' } = {}) {
-  if (typeof name !== 'string' || !name || typeof path !== 'string' || !path || !Number.isSafeInteger(size) || size < 0
-    || typeof hash !== 'string' || !/^[a-f0-9]{64}$/i.test(hash)) {
+const MOD_CATEGORIES = ['required', 'cosmetic', 'retired'];
+
+function addOneMod(db, m) {
+  if (!isPlainObject(m)) throw new HttpError(400, 'each mod must be an object');
+  const { name, path, size, sha256: hash, category = 'cosmetic', version = '' } = m;
+  if (typeof name !== 'string' || !name || name.length > 128 || typeof path !== 'string' || !path || path.length > 1024
+    || !Number.isSafeInteger(size) || size < 0 || typeof hash !== 'string' || !/^[a-f0-9]{64}$/i.test(hash)) {
     throw new HttpError(400, 'name, path, size, sha256 required');
   }
-  if (!['required', 'cosmetic'].includes(category)) throw new HttpError(400, 'category must be required or cosmetic');
-  db.prepare('INSERT OR REPLACE INTO approved_mods (name, path, size, sha256, category) VALUES (?, ?, ?, ?, ?)')
-    .run(name, path, size, hash.toLowerCase(), category);
+  if (!MOD_CATEGORIES.includes(category)) throw new HttpError(400, 'category must be required, cosmetic or retired');
+  if (typeof version !== 'string' || version.length > 64) throw new HttpError(400, 'version must be a string of up to 64 characters');
+  db.prepare('INSERT OR REPLACE INTO approved_mods (name, path, size, sha256, category, version) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(name, path, size, hash.toLowerCase(), category, version);
 }
 
 // Body is one mod file, or { mods: [...] } for a whole folder (see `rvng approve`).
@@ -467,11 +514,23 @@ function addApprovedMods(db, body = {}) {
   return listApprovedMods(db);
 }
 
-const listApprovedMods = (db) => db.prepare('SELECT * FROM approved_mods ORDER BY name, path').all();
+const listApprovedMods = (db) => db.prepare('SELECT * FROM approved_mods ORDER BY name, version, path').all();
 
-function removeApprovedMod(db, id) {
-  const r = db.prepare('DELETE FROM approved_mods WHERE id = ?').run(id);
+// Withdrawing a mod retires it: the old build stays known, so pilots who still have it are told it is out of
+// date instead of being flagged for a tampered mod. `purge` deletes the row (for one added by mistake).
+function removeApprovedMod(db, id, { purge = false } = {}) {
+  const r = purge
+    ? db.prepare('DELETE FROM approved_mods WHERE id = ?').run(id)
+    : db.prepare("UPDATE approved_mods SET category = 'retired' WHERE id = ?").run(id);
   if (!r.changes) throw new HttpError(404, 'approved mod not found');
+  return listApprovedMods(db);
+}
+
+// Retire every file of one build of a mod (for example the previous release of Project RVNG or UE4SS).
+function retireMods(db, { name, version = '' } = {}) {
+  if (typeof name !== 'string' || !name || typeof version !== 'string') throw new HttpError(400, 'name (and optional version) required');
+  const r = db.prepare("UPDATE approved_mods SET category = 'retired' WHERE name = ? AND version = ?").run(name, version);
+  if (!r.changes) throw new HttpError(404, 'no approved files for that name and version');
   return listApprovedMods(db);
 }
 
@@ -481,11 +540,11 @@ function setPlayerStatus(db, id, status) {
   if (status !== 'active') db.prepare('DELETE FROM queue WHERE player_id = ?').run(id);
 }
 
-function integrityLog(db, { limit = 100, verdict } = {}) {
+function integrityLog(db, { limit = 50, verdict } = {}) {
   const v = typeof verdict === 'string' && verdict ? verdict : null;
   return db.prepare(`SELECT r.id, r.player_id, p.name, r.game_version, r.verdict, r.findings, r.mods, r.created_at
     FROM integrity_reports r JOIN players p ON p.id = r.player_id ${v ? 'WHERE r.verdict = ?' : ''}
-    ORDER BY r.id DESC LIMIT ?`).all(...(v ? [v] : []), clampInt(limit, 100, 1, 500))
+    ORDER BY r.id DESC LIMIT ?`).all(...(v ? [v] : []), clampInt(limit, 50, 1, 200))
     .map((r) => ({ ...r, findings: json(r.findings, []), mods: json(r.mods, []) }));
 }
 
@@ -502,6 +561,6 @@ module.exports = {
   registerPlayer, leaderboard, playerProfile, publicPlayer,
   submitIntegrity, joinQueue, leaveQueue, queueStatus, runMatchmaker,
   getMatch, setLobby, submitReport, resolveDispute, sweepStaleMatches, recentMatches,
-  putBaseline, setBaselineActive, addApprovedMods, listApprovedMods, removeApprovedMod,
+  putBaseline, setBaselineActive, addApprovedMods, listApprovedMods, removeApprovedMod, retireMods, capFindings,
   setPlayerStatus, integrityLog, stats,
 };

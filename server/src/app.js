@@ -7,13 +7,30 @@ const { requirePlayer, requireAdmin } = require('./auth');
 const svc = require('./service');
 const tournaments = require('./tournaments');
 
-// Fixed-window counter per key (client IP), kept in memory.
-function rateLimiter({ windowMs, max }) {
+// The address a limit applies to: IPv4 (also when IPv4-mapped), or the /64 network of an IPv6 address,
+// since one IPv6 client normally holds a whole /64 and can pick any address in it.
+function clientKey(ip) {
+  const s = String(ip || '').split('%')[0];
+  const v4 = s.match(/^(?:::ffff:)?(\d{1,3}(?:\.\d{1,3}){3})$/i);
+  if (v4) return v4[1];
+  if (!s.includes(':')) return s;
+  const [head, tail] = s.split('::');
+  const h = head ? head.split(':') : [];
+  const groups = tail === undefined ? h : [...h, ...Array(Math.max(0, 8 - h.length - (tail ? tail.split(':').length : 0))).fill('0')];
+  return groups.concat(['0', '0', '0', '0']).slice(0, 4).map((g) => (parseInt(g, 16) || 0).toString(16)).join(':') + '::/64';
+}
+
+// Fixed-window counter per key, kept in memory. Windows start in insertion order, so expired entries are
+// dropped from the oldest end without scanning the rest, and the map never holds more than maxTracked keys.
+function rateLimiter({ windowMs, max, maxTracked = 50000 }) {
   const hits = new Map();
   return (key, t = Date.now()) => {
-    if (hits.size > 10000) for (const [k, v] of hits) if (t - v.start > windowMs) hits.delete(k);
+    for (const [k, v] of hits) {
+      if (t - v.start <= windowMs && hits.size < maxTracked) break;
+      hits.delete(k);
+    }
     const h = hits.get(key);
-    if (!h || t - h.start > windowMs) { hits.set(key, { start: t, n: 1 }); return true; }
+    if (!h || t - h.start > windowMs) { hits.delete(key); hits.set(key, { start: t, n: 1 }); return true; }
     h.n += 1;
     return h.n <= max;
   };
@@ -69,7 +86,7 @@ function createApp({ db = openDb(config.dbPath) } = {}) {
 
   // Registration returns credentials exactly once; the player saves them as credentials.json.
   app.post('/api/players/register', wrap((req, res) => {
-    if (!allowSignup(req.ip)) throw new tournaments.HttpError(429, 'too many sign-ups from this address; try again later');
+    if (!allowSignup(clientKey(req.ip))) throw new tournaments.HttpError(429, 'too many sign-ups from this address; try again later');
     res.status(201);
     return svc.registerPlayer(db, req.body || {});
   }));
@@ -94,8 +111,9 @@ function createApp({ db = openDb(config.dbPath) } = {}) {
   app.post('/api/admin/baselines/:version/active', requireAdmin, wrap((req) => svc.setBaselineActive(db, req.params.version, (req.body || {}).active)));
   app.get('/api/admin/mods', requireAdmin, wrap(() => svc.listApprovedMods(db)));
   app.post('/api/admin/mods', requireAdmin, wrap((req) => svc.addApprovedMods(db, req.body || {})));
-  app.delete('/api/admin/mods/:id', requireAdmin, wrap((req) => svc.removeApprovedMod(db, id(req.params.id))));
-  app.get('/api/admin/integrity', requireAdmin, wrap((req) => svc.integrityLog(db, { verdict: str(req.query.verdict), limit: int(req.query.limit, 100, 1, 500) })));
+  app.post('/api/admin/mods/retire', requireAdmin, wrap((req) => svc.retireMods(db, req.body || {})));
+  app.delete('/api/admin/mods/:id', requireAdmin, wrap((req) => svc.removeApprovedMod(db, id(req.params.id), { purge: str(req.query.purge) === '1' })));
+  app.get('/api/admin/integrity', requireAdmin, wrap((req) => svc.integrityLog(db, { verdict: str(req.query.verdict), limit: int(req.query.limit, 50, 1, 200) })));
   app.post('/api/admin/players/:id/status', requireAdmin, wrap((req) => { svc.setPlayerStatus(db, id(req.params.id), (req.body || {}).status); return { ok: true }; }));
   app.post('/api/admin/matches/:id/resolve', requireAdmin, wrap((req) => svc.resolveDispute(db, req.params.id, req.body || {})));
   app.post('/api/admin/tournaments', requireAdmin, wrap((req, res) => { res.status(201); return tournaments.create(db, req.body || {}); }));
@@ -115,4 +133,4 @@ function createApp({ db = openDb(config.dbPath) } = {}) {
   return app;
 }
 
-module.exports = { createApp };
+module.exports = { createApp, rateLimiter, clientKey };

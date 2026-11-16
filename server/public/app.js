@@ -126,7 +126,9 @@ const routes = {
 
   async match(id) {
     const m = await get(`/api/matches/${encodeURIComponent(id)}/public`);
-    const won = (p) => m.winner === p.id;
+    // Only a verified result shows a winner and rating changes (a voided one has been undone).
+    const ok = m.state === 'verified';
+    const won = (p) => ok && m.winner === p.id;
     const row = (p, role, score, d) => `<tr><td><a href="#/player/${p.id}"><b>${esc(p.name)}</b></a>${won(p) ? ' ' + badge('verified', 'win') : ''}</td>
       <td class="opt">${role}</td><td class="r">${score ?? '—'}</td><td class="r">${delta(d)}</td></tr>`;
     const r = m.rules || {};
@@ -135,7 +137,7 @@ const routes = {
         <div class="who"><span class="box">${m.seriesId ? 'Knockout event' : 'Ranked'}</span><b>${esc(m.host.name)}</b><span class="when">vs</span><b>${esc(m.guest.name)}</b></div></div>
       <div class="bar">Result <span class="i">i</span></div>
       <table class="tbl"><thead><tr><th>Pilot</th><th class="opt">Role</th><th class="r">Kills</th><th class="r">Rating</th></tr></thead><tbody>
-        ${row(m.host, 'Host', m.score?.host, m.ratingDelta?.host)}${row(m.guest, 'Guest', m.score?.guest, m.ratingDelta?.guest)}</tbody></table>
+        ${row(m.host, 'Host', m.score?.host, ok ? m.ratingDelta?.host : null)}${row(m.guest, 'Guest', m.score?.guest, ok ? m.ratingDelta?.guest : null)}</tbody></table>
       <div class="bar gap">Rules <span class="i">i</span></div>
       <div class="chron"><p>${r.killTarget ? `First to <b>${r.killTarget}</b> kills` : 'No kill target'} · ${r.timeLimitSec ? `${Math.round(r.timeLimitSec / 60)} min limit` : 'No time limit'} ·
         Special weapons ${r.specialWeapons === false ? 'off' : 'on'}${r.aircraftBans?.length ? ` · Banned: ${r.aircraftBans.map(esc).join(', ')}` : ''}</p></div>

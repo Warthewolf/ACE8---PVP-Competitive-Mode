@@ -43,6 +43,9 @@ local GAME = rawget(_G, "RVNG_GAME") or {
   joinRoom = function(code) return false end,
   isLocal = function(pawn) return false end,          -- pawn belongs to the local pilot
   isOpponent = function(pawn) return false end,       -- pawn belongs to the other pilot (not AI)
+  -- A stable identity for a game object. UE4SS hands every hook a new Lua wrapper for the same object, and
+  -- table keys compare wrappers by reference, so the object's address is used instead.
+  key = function(obj) return obj:GetAddress() end,
   -- "gun" | "missile" | "special" for a weapon component.
   weaponKind = function(component) return nil end,
   -- Aircraft ids of both pilots, as used in the baseline's aircraft stats.
@@ -157,20 +160,19 @@ local function logEvent(type_, actor, extra)
   table.insert(state.log.events, e)
 end
 
--- Keeps, per aircraft and stat, the sampled value furthest from the match-start value, so a trainer
--- switched on mid-match still shows up in the result (the server compares it with the baseline).
+-- Keeps, per aircraft and stat, the lowest and the highest sampled value. The server compares both with the
+-- baseline: a changed value is above or below it, so it shows up whenever it was active, also when a trainer
+-- was already on at match start or switched off before the last sample. (The mod cannot know the baseline.)
 local function sampleStats()
   local log = state.log
   if not log then return end
   for id, stats in pairs(collectAircraftStats()) do
-    local start = log.startStats[id] or stats
-    log.startStats[id] = start
-    local worst = log.worstStats[id] or {}
+    local lo, hi = log.minStats[id] or {}, log.maxStats[id] or {}
     for stat, v in pairs(stats) do
-      local ref = start[stat] or v
-      if worst[stat] == nil or math.abs(v - ref) > math.abs(worst[stat] - ref) then worst[stat] = v end
+      if lo[stat] == nil or v < lo[stat] then lo[stat] = v end
+      if hi[stat] == nil or v > hi[stat] then hi[stat] = v end
     end
-    log.worstStats[id] = worst
+    log.minStats[id], log.maxStats[id] = lo, hi
   end
   local okS, selfSpeed, oppSpeed = pcall(GAME.speeds)
   if okS then
@@ -185,29 +187,45 @@ pcall(RegisterHook, HOOKS.MatchStart, function()
   state.log = {
     matchId = state.match.id, start = now(), events = Json.array(),
     self = { kills = 0, deaths = 0 }, opponent = { kills = 0, deaths = 0 },
-    startStats = {}, worstStats = {}, maxSpeedSelf = 0, maxSpeedOpp = 0,
+    minStats = {}, maxStats = {}, maxSpeedSelf = 0, maxSpeedOpp = 0,
+    lastHitBy = {}, -- object key -> side ("self"/"opponent") of whoever damaged it last
   }
   sampleStats()
 end)
 
--- pawn -> pawn that last damaged it, so kills are credited to the instigator, not inferred from the victim.
-local lastHitBy = {}
+-- "self" / "opponent" for the two pilots' objects, nil for AI and everything else.
+local function sideOf(obj)
+  if obj == nil then return nil end
+  if GAME.isLocal(obj) then return "self" end
+  if GAME.isOpponent(obj) then return "opponent" end
+  return nil
+end
+local function keyOf(obj)
+  local ok, k = pcall(GAME.key, obj)
+  return ok and k or nil
+end
+
+-- Kills are credited to whoever last damaged the victim, not inferred from the victim. The attacker's side
+-- is resolved when the damage happens and stored under the victim's stable key.
 pcall(RegisterHook, HOOKS.DamageApplied, function(ctx, _damage, instigator)
   if not state.log then return end
   local victim = ctx:get()
-  lastHitBy[victim] = instigator and instigator:get() or nil
-  local actor = GAME.isLocal(victim) and "opponent" or (GAME.isOpponent(victim) and "self") or nil
-  if actor then logEvent("hit", actor) end
+  local k = keyOf(victim)
+  if k ~= nil then state.log.lastHitBy[k] = sideOf(instigator and instigator:get() or nil) end
+  local hit = sideOf(victim)
+  if hit then logEvent("hit", hit == "self" and "opponent" or "self") end
 end)
 
 pcall(RegisterHook, HOOKS.AircraftDestroyed, function(ctx)
   if not state.log then return end
   local pawn = ctx:get()
-  local victim = GAME.isLocal(pawn) and "self" or (GAME.isOpponent(pawn) and "opponent") or nil
+  local victim = sideOf(pawn)
   if not victim then return end -- AI or other non-pilot aircraft
-  local inst = lastHitBy[pawn]; lastHitBy[pawn] = nil
-  local killer = (victim == "self" and inst and GAME.isOpponent(inst) and "opponent")
-              or (victim == "opponent" and inst and GAME.isLocal(inst) and "self") or nil
+  local k = keyOf(pawn)
+  local inst = k ~= nil and state.log.lastHitBy[k] or nil
+  if k ~= nil then state.log.lastHitBy[k] = nil end
+  local killer = (victim == "self" and inst == "opponent" and "opponent")
+              or (victim == "opponent" and inst == "self" and "self") or nil
   state.log[victim].deaths = state.log[victim].deaths + 1
   logEvent("death", victim)
   -- A crash or self-destruct is a death without a kill.
@@ -251,7 +269,7 @@ pcall(RegisterHook, HOOKS.MatchEnd, function(ctx)
     opponent = { aircraftId = oppAc, kills = log.opponent.kills, deaths = log.opponent.deaths },
     events = log.events,
     telemetry = { selfMaxSpeed = log.maxSpeedSelf, opponentMaxSpeed = log.maxSpeedOpp },
-    runtime = { aircraft = log.worstStats },
+    runtime = { aircraft = log.maxStats, aircraftMin = log.minStats },
   })
   state.doneMatchId = log.matchId
   state.log, state.lobby = nil, nil
