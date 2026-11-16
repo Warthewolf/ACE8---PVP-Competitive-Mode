@@ -517,17 +517,25 @@ const { canonPath } = integrity;
 // an older approval of the other mod swept this mod's files in (retire those rows, all in one call, then upload
 // again), or this upload holds the other mod's folder (leave it out of this approval).
 function pinnedConflict(name, rows) {
+  const byPath = new Map(); // each file once, with every build row that pins it
+  for (const o of rows) {
+    if (!byPath.has(o.path)) byPath.set(o.path, new Map());
+    byPath.get(o.path).set(o.id, o);
+  }
+  const files = [...byPath];
   const ids = [...new Set(rows.map((o) => o.id))].sort((a, b) => a - b);
-  const shown = rows.slice(0, 10).map((o) => `${o.path} by "${o.name}" version "${o.version}" (id ${o.id})`).join('; ')
-    + (rows.length > 10 ? `; and ${rows.length - 10} more` : '');
-  return new HttpError(409, `${rows.length === 1 ? 'a file is' : `${rows.length} files are`} already pinned by another mod: ${shown}. `
+  const shown = files.slice(0, 10).map(([p, os]) => `${p} by ${[...os.values()].map((o) => `"${o.name}" version "${o.version}" (id ${o.id})`).join(', ')}`)
+    .join('; ') + (files.length > 10 ? `; and ${files.length - 10} more` : '');
+  return new HttpError(409, `${files.length === 1 ? 'a file is' : `${files.length} files are`} already pinned by another mod: ${shown}. `
     + `A file belongs to one mod. If these are part of "${name}" (an older approval swept them into the other build), retire them there `
     + `in one call, POST /api/admin/mods/retire {"ids":[${ids.join(',')}]}, then upload this again right away (pilots who scan in between `
     + 'are told to update, never flagged). If they belong to the other mod, leave its folder out of this approval: add it to rvng approve --exclude');
 }
 const PINNED_SQL = `SELECT id, name, version, path FROM approved_mods WHERE path = ? AND name != ? AND category != 'retired' ORDER BY id`;
 
-function addOneMod(db, m) {
+// The checks on one file entry, made for the whole upload before anything is looked up or written. Returns the
+// values as stored.
+function checkMod(m) {
   if (!isPlainObject(m)) throw new HttpError(400, 'each mod must be an object');
   const { name, path, size, sha256: hash, category = 'cosmetic', version = '' } = m;
   if (typeof name !== 'string' || !name || name.length > 128 || typeof path !== 'string' || !path || path.length > 1024
@@ -542,7 +550,10 @@ function addOneMod(db, m) {
   // are one file here too.
   const p = canonPath(path);
   if (!p || p.split('/').some((seg) => seg === '.' || seg === '..')) throw new HttpError(400, 'path must name a file under the game root');
-  const sha = hash.toLowerCase();
+  return { name, p, size, sha: hash.toLowerCase(), category, version };
+}
+
+function addOneMod(db, { name, p, size, sha, category, version }) {
   // A file belongs to one mod. A loader folder approved with another mod inside it would make the loader's
   // build require that mod's files too, and one of the two could then never be updated. (addApprovedMods checks
   // the whole upload first; this catches two names for one path within an upload.)
@@ -575,34 +586,41 @@ function addApprovedMods(db, body = {}) {
     if (roots.some((r) => !r || r.split('/').some((seg) => seg === '.' || seg === '..'))) throw new HttpError(400, 'roots must be paths under the game root');
   }
   const under = (p) => roots.some((r) => p === r || p.startsWith(r + '/'));
+  // Every entry is checked before the conflict check: a refusal that says to retire another build's rows must
+  // only come for an upload that will then go in.
+  const mods = list.map(checkMod);
+  if (roots && mods.some((c) => !under(c.p))) throw new HttpError(400, 'every file must be an object whose path is under one of the roots');
+  const owner = new Map();
+  for (const c of mods) {
+    if (owner.has(c.p) && owner.get(c.p) !== c.name) throw new HttpError(400, `${c.p} is listed under two mods in this upload: "${owner.get(c.p)}" and "${c.name}"`);
+    owner.set(c.p, c.name);
+  }
   tx(db, () => {
     const pinned = db.prepare(PINNED_SQL);
-    const clash = []; let who = null;
-    for (const m of list) {
-      if (!isPlainObject(m) || typeof m.path !== 'string' || typeof m.name !== 'string') continue; // refused by addOneMod
-      const rows = pinned.all(canonPath(m.path), m.name);
-      if (rows.length) { clash.push(...rows); who ??= m.name; }
+    const clash = []; const seen = new Set(); let who = null;
+    for (const c of mods) {
+      const k = JSON.stringify([c.name, c.p]);
+      if (seen.has(k)) continue;
+      seen.add(k);
+      const rows = pinned.all(c.p, c.name);
+      if (rows.length) { clash.push(...rows); who ??= c.name; }
     }
     if (clash.length) throw pinnedConflict(who, clash);
     if (roots) {
-      if (list.some((m) => !isPlainObject(m) || typeof m.path !== 'string' || !under(canonPath(m.path)))) {
-        throw new HttpError(400, 'every file must be an object whose path is under one of the roots');
-      }
       const builds = new Map();
-      for (const m of list) {
-        const k = JSON.stringify([m.name, m.version === undefined ? '' : m.version]);
+      for (const c of mods) {
+        const k = JSON.stringify([c.name, c.version]);
         if (!builds.has(k)) builds.set(k, new Set());
-        builds.get(k).add(canonPath(m.path));
+        builds.get(k).add(c.p);
       }
       const rows = db.prepare("SELECT id, path FROM approved_mods WHERE name = ? AND version = ? AND category != 'retired'");
       const retire = db.prepare("UPDATE approved_mods SET category = 'retired' WHERE id = ?");
       for (const [k, listed] of builds) {
         const [name, version] = JSON.parse(k);
-        if (typeof name !== 'string' || typeof version !== 'string') continue; // refused by addOneMod below
         for (const r of rows.all(name, version)) if (under(r.path) && !listed.has(r.path)) retire.run(r.id);
       }
     }
-    for (const m of list) addOneMod(db, m);
+    for (const c of mods) addOneMod(db, c);
   });
   return listApprovedMods(db);
 }
@@ -625,8 +643,8 @@ function removeApprovedMod(db, id, { purge = false } = {}) {
 // files an older approval swept into another mod's build, as the upload's 409 lists them), all or none.
 function retireMods(db, { name, version = '', ids } = {}) {
   if (ids !== undefined) {
-    if (!Array.isArray(ids) || !ids.length || ids.length > 5000 || ids.some((i) => !Number.isSafeInteger(i) || i < 1)) {
-      throw new HttpError(400, 'ids must list 1-5000 approved file ids');
+    if (!Array.isArray(ids) || !ids.length || ids.length > 100000 || ids.some((i) => !Number.isSafeInteger(i) || i < 1)) {
+      throw new HttpError(400, 'ids must list 1-100000 approved file ids');
     }
     return tx(db, () => {
       const st = db.prepare("UPDATE approved_mods SET category = 'retired' WHERE id = ?");

@@ -57,7 +57,20 @@ test('an upload that hits files another mod pins is refused once, naming every f
     const upload = { roots: [RVNG], mods: mod.map((x) => ({ name: 'Project RVNG', version: '1.0', category: 'required', ...x })) };
     const err = await env.admin('POST', '/api/admin/mods', upload).catch((e) => e);
     assert.equal(err.status, 409);
-    assert.match(err.message, /^6 files are already pinned by another mod: /);
+    assert.match(err.message, /^3 files are already pinned by another mod: /);
+    for (const x of mod) {
+      const p = integrity.canonPath(x.path);
+      assert.equal(err.message.split(p).length - 1, 1, `${p} is listed once`);
+      assert.match(err.message, new RegExp(`${p.replace(/[.]/g, '\\.')} by "UE4SS" version "" \\(id \\d+\\), "UE4SS" version "3\\.0\\.1" \\(id \\d+\\)`));
+    }
+    // An upload with a mistake is refused for that mistake, before anything tells the admin to retire rows.
+    const typo = (over) => ({ ...upload, mods: upload.mods.map((m, i) => (i ? m : { ...m, ...over })) });
+    for (const over of [{ category: 'Required' }, { version: '1.0#rc' }, { sha256: 'x' }, { size: -1 }, { name: '' }]) {
+      await assert.rejects(env.admin('POST', '/api/admin/mods', typo(over)), rejectsWith(400), JSON.stringify(over));
+    }
+    await assert.rejects(env.admin('POST', '/api/admin/mods', { ...upload, roots: [`${RVNG}/Scripts`] }), rejectsWith(400, /under one of the roots/));
+    await assert.rejects(env.admin('POST', '/api/admin/mods', { mods: [...upload.mods, { ...upload.mods[0], name: 'Other' }] }),
+      rejectsWith(400, /listed under two mods in this upload/));
     for (const x of mod) assert.ok(err.message.includes(integrity.canonPath(x.path)), x.path);
     assert.ok(err.message.includes(`POST /api/admin/mods/retire {"ids":[${swept.join(',')}]}`), err.message);
 

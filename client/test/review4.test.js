@@ -100,6 +100,26 @@ test('bridge: a log that cannot be sent does not hold up a queue request; it is 
   } finally { fs.rmSync(game, { recursive: true }); }
 });
 
+test('bridge: a log refused for good is reported even when a later step of the same tick fails too', async () => {
+  const game = tree({ 'ACE8/Content/Paks/a.pak': 'x' });
+  try {
+    const call = async (m, p) => {
+      if (p.startsWith('/api/matches/')) throw httpError(409, 'match is disputed: logs were due long ago');
+      if (p === '/api/integrity/report') return { verdict: 'clean', integrityToken: 't' };
+      if (p === '/api/queue/join') throw httpError(400, 'region must be one of: global, eu');
+      return { state: 'idle' };
+    };
+    const bridge = createBridge({ game, call });
+    writeJson(path.join(bridge.dir, 'request.json'), { action: 'queue' });
+    writeJson(path.join(bridge.dir, 'result.json'), { matchId: 'm_old', self: { kills: 1, deaths: 0 } });
+    const err = await bridge.tick().catch((e) => e);
+    assert.match(err.message, /logs were due long ago; region must be one of/);
+    bridge.fail(err);
+    assert.match(JSON.parse(fs.readFileSync(path.join(bridge.dir, 'state.json'), 'utf8')).error, /logs were due long ago/);
+    assert.ok(fs.existsSync(path.join(bridge.dir, 'result.json.failed')));
+  } finally { fs.rmSync(game, { recursive: true }); }
+});
+
 test('rvng approve: --version "" is the version-less build, and an option given without a value is refused', () => {
   const ue = 'ACE8/Binaries/Win64/ue4ss';
   const game = tree({ [`${ue}/UE4SS.dll`]: 'dll' });

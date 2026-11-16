@@ -318,6 +318,15 @@ function createBridge({ creds, game, region, noCache = false, call = (m, p, b) =
     // rejected scan in this tick must stay on screen. A log that cannot be sent now does not hold up the queue.
     let resultError = null;
     await sendResult().catch((e) => { resultError = e; });
+    try { await afterResult(); } catch (e) {
+      // Both are shown: a log the server refused for good was just set aside as result.json.failed and is not sent again.
+      if (resultError) throw Object.assign(new Error(`${resultError.message}; ${e.message}`), { status: e.status });
+      throw e;
+    }
+    if (resultError) throw resultError;
+  }
+
+  async function afterResult() {
     const reqF = file('request.json');
     let req = readJson(reqF);
     if (req) { fs.rmSync(reqF, { force: true }); retryQueue = null; } // one-shot UI actions; a new one replaces a pending retry
@@ -338,7 +347,6 @@ function createBridge({ creds, game, region, noCache = false, call = (m, p, b) =
     // A 409 on the lobby means the room was already posted (the earlier response was lost).
     await submit('lobby.json', (l) => call('POST', `/api/matches/${encodeURIComponent(l.matchId)}/lobby`, { lobbyCode: l.lobbyCode }),
       (e) => e.status === 409);
-    if (resultError) throw resultError;
   }
 
   return { dir, tick, resync, fail, setState, current: () => current, last: () => last };
