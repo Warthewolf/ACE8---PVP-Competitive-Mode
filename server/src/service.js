@@ -55,7 +55,9 @@ const publicPlayer = (p, { self = false } = {}) => {
     id: p.id, name: p.name, rating: hidden ? null : Math.round(p.rating), peakRating: hidden ? null : Math.round(p.peak_rating),
     ratingHidden: !!p.hide_rating, tier: tierFor(p.rating), wins: p.wins, losses: p.losses, draws: p.draws || 0,
     kills: p.kills, deaths: p.deaths, kd: p.deaths ? +(p.kills / p.deaths).toFixed(2) : p.kills, status: p.status,
-    role: p.role || 'player', note: p.note || '',
+    role: p.role || 'player', note: p.note || '', bio: p.bio || '',
+    // the approved photo; ?v= changes with every new photo, so a browser never shows a replaced one from its cache
+    photo: p.photo_id ? `/api/players/${p.id}/photo?v=${p.photo_id}` : null,
   };
 };
 
@@ -77,6 +79,7 @@ function playerProfile(db, id, { self = false } = {}) {
   const mods = lastScan ? json(lastScan.mods, []) : [];
   return {
     ...publicPlayer(p, { self }),
+    ...(self ? { photoReview: photoReview(db, id) } : {}),
     integrity: lastScan ? { verdict: lastScan.verdict, mods: mods.slice(0, 50), modsTotal: mods.length, at: lastScan.created_at } : null,
     matches,
   };
@@ -88,6 +91,113 @@ function updateSettings(db, player, body = {}) {
   if (typeof body.hideRating !== 'boolean') throw new HttpError(400, 'hideRating must be true or false');
   db.prepare('UPDATE players SET hide_rating = ? WHERE id = ?').run(body.hideRating ? 1 : 0, player.id);
   return playerProfile(db, player.id, { self: true });
+}
+
+// ---------- the profile: bio and photo ----------
+const BIO_MAX = 300;
+// A bio may have line breaks (up to BIO_LINES); otherwise the same rules as UNSAFE_TEXT below.
+const BIO_UNSAFE = /[\u0000-\u0009\u000b-\u001f\u007f-\u009f‪-‮⁦-⁩]/;
+const BIO_LINES = 6;
+const PHOTO_MAX_BYTES = 200 * 1024;
+// The file's own first bytes decide its type (never a name or a header the client sends). No SVG or GIF.
+function photoMime(buf) {
+  if (buf.length > 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg';
+  if (buf.length > 8 && buf.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return 'image/png';
+  if (buf.length > 12 && buf.toString('latin1', 0, 4) === 'RIFF' && buf.toString('latin1', 8, 12) === 'WEBP') return 'image/webp';
+  return null;
+}
+// Editing the profile: accounts that have been let in and aren't banned.
+function requireCanEdit(player) {
+  requireLetIn(player);
+  if (player.status === 'banned') throw new HttpError(403, 'this account is banned');
+}
+
+// The pilot's own view of their latest upload that isn't the shown photo: waiting, or turned down.
+function photoReview(db, playerId) {
+  const r = db.prepare(`SELECT state, created_at, reviewed_at FROM player_photos WHERE player_id = ? AND state IN ('pending', 'rejected')
+    ORDER BY id DESC LIMIT 1`).get(playerId);
+  return r ? { state: r.state, at: r.reviewed_at || r.created_at } : null;
+}
+
+function updateProfile(db, player, body = {}) {
+  requireCanEdit(player);
+  if (!isPlainObject(body) || typeof body.bio !== 'string') throw new HttpError(400, 'send { "bio": "..." } (an empty string clears it)');
+  const bio = body.bio.replace(/\r\n?/g, '\n').split('\n').map((l) => l.trimEnd()).join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  if ([...bio].length > BIO_MAX) throw new HttpError(400, `bio: at most ${BIO_MAX} characters`);
+  if (bio.split('\n').length > BIO_LINES) throw new HttpError(400, `bio: at most ${BIO_LINES} lines`);
+  if (BIO_UNSAFE.test(bio)) throw new HttpError(400, 'bio: control characters are not allowed');
+  db.prepare('UPDATE players SET bio = ? WHERE id = ?').run(bio, player.id);
+  return playerProfile(db, player.id, { self: true });
+}
+
+// A new photo: { image: base64 (a data: URL is fine too) }. It waits for an admin; an earlier one still waiting is
+// replaced, and a turned-down one is forgotten.
+function uploadPhoto(db, player, body = {}) {
+  requireCanEdit(player);
+  if (!isPlainObject(body) || typeof body.image !== 'string') throw new HttpError(400, 'send { "image": "<base64 JPEG, PNG or WebP>" }');
+  const b64 = body.image.replace(/^data:image\/[a-z]+;base64,/i, '');
+  if (!b64 || !/^[A-Za-z0-9+/]+={0,2}$/.test(b64) || b64.length % 4) throw new HttpError(400, 'image: not base64');
+  const buf = Buffer.from(b64, 'base64');
+  if (buf.length > PHOTO_MAX_BYTES) throw new HttpError(413, `image: at most ${PHOTO_MAX_BYTES / 1024} KB (the website shrinks it for you)`);
+  const mime = photoMime(buf);
+  if (!mime) throw new HttpError(400, 'image: only JPEG, PNG or WebP');
+  db.prepare("DELETE FROM player_photos WHERE player_id = ? AND state IN ('pending', 'rejected')").run(player.id);
+  db.prepare("INSERT INTO player_photos (player_id, state, mime, data, created_at) VALUES (?, 'pending', ?, ?, ?)")
+    .run(player.id, mime, buf.toString('base64'), now());
+  return playerProfile(db, player.id, { self: true });
+}
+
+// The pilot takes their photo down (the shown one and any waiting upload).
+function deletePhoto(db, player) {
+  requireCanEdit(player);
+  db.prepare('DELETE FROM player_photos WHERE player_id = ?').run(player.id);
+  db.prepare('UPDATE players SET photo_id = NULL WHERE id = ?').run(player.id);
+  return playerProfile(db, player.id, { self: true });
+}
+
+// The approved photo's bytes, for the website.
+function photoFile(db, playerId) {
+  const r = db.prepare(`SELECT ph.mime, ph.data FROM players p JOIN player_photos ph ON ph.id = p.photo_id AND ph.state = 'approved'
+    WHERE p.id = ?`).get(playerId);
+  if (!r) throw new HttpError(404, 'no photo');
+  return { mime: r.mime, data: Buffer.from(r.data, 'base64') };
+}
+
+// Admin: the uploads waiting for review, oldest first, with the image (a data: URL the admin page shows).
+function pendingPhotos(db) {
+  return db.prepare(`SELECT ph.id, ph.player_id, ph.mime, ph.data, ph.created_at, p.name, p.photo_id FROM player_photos ph
+    JOIN players p ON p.id = ph.player_id WHERE ph.state = 'pending' ORDER BY ph.id`).all()
+    .map((r) => ({ id: r.id, playerId: r.player_id, name: r.name, createdAt: r.created_at, replaces: r.photo_id != null,
+      image: `data:${r.mime};base64,${r.data}` }));
+}
+
+// Admin: approve (it becomes the shown photo; the one before is dropped) or turn down a waiting upload.
+function reviewPhoto(db, photoId, body = {}) {
+  if (!isPlainObject(body) || typeof body.approve !== 'boolean') throw new HttpError(400, 'send { "approve": true | false }');
+  const ph = db.prepare("SELECT * FROM player_photos WHERE id = ? AND state = 'pending'").get(photoId);
+  if (!ph) throw new HttpError(404, 'no photo waiting with that id');
+  const t = now();
+  if (body.approve) {
+    db.prepare("DELETE FROM player_photos WHERE player_id = ? AND state = 'approved'").run(ph.player_id);
+    db.prepare("UPDATE player_photos SET state = 'approved', reviewed_at = ? WHERE id = ?").run(t, ph.id);
+    db.prepare('UPDATE players SET photo_id = ? WHERE id = ?').run(ph.id, ph.player_id);
+  } else {
+    db.prepare("UPDATE player_photos SET state = 'rejected', data = '', reviewed_at = ? WHERE id = ?").run(t, ph.id);
+  }
+  return { id: ph.id, playerId: ph.player_id, state: body.approve ? 'approved' : 'rejected' };
+}
+
+// Admin: clear a pilot's bio and/or take down their photo (and any upload waiting).
+function clearProfile(db, playerId, body = {}) {
+  if (!isPlainObject(body) || (body.bio !== true && body.photo !== true)) throw new HttpError(400, 'send { "bio": true } and/or { "photo": true }');
+  const p = db.prepare('SELECT id FROM players WHERE id = ?').get(playerId);
+  if (!p) throw new HttpError(404, 'player not found');
+  if (body.bio === true) db.prepare("UPDATE players SET bio = '' WHERE id = ?").run(playerId);
+  if (body.photo === true) {
+    db.prepare('DELETE FROM player_photos WHERE player_id = ?').run(playerId);
+    db.prepare('UPDATE players SET photo_id = NULL WHERE id = ?').run(playerId);
+  }
+  return publicPlayer(db.prepare('SELECT * FROM players WHERE id = ?').get(playerId));
 }
 
 // Plain one-line text: no control characters, and no bidirectional overrides that would make a note or a
@@ -118,7 +228,7 @@ function setPlayerCard(db, id, body = {}) {
 // Admin: players by status (for example the pending sign-ups of an invite-only server), newest first.
 function adminPlayers(db, { status, limit = 100 } = {}) {
   const s = typeof status === 'string' && status ? status : null;
-  return db.prepare(`SELECT p.id, p.name, p.status, p.role, p.note, p.hide_rating, p.rating, p.wins, p.losses, p.draws, p.created_at,
+  return db.prepare(`SELECT p.id, p.name, p.status, p.role, p.note, p.bio, p.photo_id, p.hide_rating, p.rating, p.wins, p.losses, p.draws, p.created_at,
       (SELECT COUNT(*) FROM lapses l WHERE l.player_id = p.id) lapses,
       (SELECT COUNT(*) FROM player_reports r WHERE r.reported_id = p.id AND r.state = 'open') open_reports
     FROM players p ${s ? 'WHERE p.status = ?' : ''} ORDER BY p.id DESC LIMIT ?`).all(...(s ? [s] : []), clampInt(limit, 100, 1, 500))
@@ -902,6 +1012,29 @@ function retireMods(db, { name, version = '', ids } = {}) {
 }
 
 // 'active' lets a pending (invite-only) sign-up in; 'pending' takes an account back out of play.
+// Admin: delete an account that never played (a sign-up whose credentials.json was lost, a test account). One with a
+// match, an event entry or a series is part of other pilots' history: ban it instead. Its scans, reports either way,
+// lapses, photos and queue entry go with it.
+function deletePlayer(db, id) {
+  return tx(db, () => {
+    const p = db.prepare('SELECT id, name FROM players WHERE id = ?').get(id);
+    if (!p) throw new HttpError(404, 'player not found');
+    const played = db.prepare(`SELECT
+        (SELECT COUNT(*) FROM matches WHERE player_a = ? OR player_b = ? OR winner = ?)
+      + (SELECT COUNT(*) FROM match_reports WHERE player_id = ?)
+      + (SELECT COUNT(*) FROM tournament_entrants WHERE player_id = ?)
+      + (SELECT COUNT(*) FROM tournaments WHERE champion = ?)
+      + (SELECT COUNT(*) FROM series WHERE player_a = ? OR player_b = ? OR winner = ?) n`).get(...Array(9).fill(id)).n;
+    if (played) throw new HttpError(409, `${p.name} has played matches or entered an event: ban the account instead`);
+    for (const sql of ['DELETE FROM queue WHERE player_id = ?', 'DELETE FROM nonces WHERE player_id = ?', 'DELETE FROM integrity_reports WHERE player_id = ?',
+      'DELETE FROM lapses WHERE player_id = ?', 'DELETE FROM player_photos WHERE player_id = ?',
+      'DELETE FROM player_reports WHERE reporter_id = ? OR reported_id = ?', 'DELETE FROM players WHERE id = ?']) {
+      db.prepare(sql).run(...Array((sql.match(/\?/g) || []).length).fill(id));
+    }
+    return { deleted: p.id, name: p.name };
+  });
+}
+
 function setPlayerStatus(db, id, status) {
   if (!['active', 'pending', 'flagged', 'banned'].includes(status)) throw new HttpError(400, 'status must be active, pending, flagged or banned');
   if (!db.prepare('UPDATE players SET status = ? WHERE id = ?').run(status, id).changes) throw new HttpError(404, 'player not found');
@@ -1017,6 +1150,7 @@ function adminMatch(db, id) {
 module.exports = {
   registerPlayer, leaderboard, playerProfile, publicPlayer, updateSettings, setPlayerCard, adminPlayers,
   fileReport, listReports, closeReport, lapseCooldown, PENDING_MESSAGE,
+  deletePlayer, updateProfile, uploadPhoto, deletePhoto, photoFile, pendingPhotos, reviewPhoto, clearProfile, photoMime, BIO_MAX, PHOTO_MAX_BYTES,
   submitIntegrity, joinQueue, leaveQueue, queueStatus, runMatchmaker,
   getMatch, setLobby, setLink, submitReport, resolveDispute, sweepStaleMatches, recentMatches,
   putBaseline, listBaselines, setBaselineActive, addApprovedMods, listApprovedMods, removeApprovedMod, retireMods, capFindings,

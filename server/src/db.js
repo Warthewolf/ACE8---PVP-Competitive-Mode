@@ -174,7 +174,20 @@ CREATE TABLE IF NOT EXISTS series (
   UNIQUE (tournament_id, round, slot)
 );
 
+-- Profile photos. A new upload waits (pending) until an admin approves it; the approved one is what the website
+-- shows (players.photo_id points at it). A rejected upload keeps its row, without the image, so its pilot is told.
+CREATE TABLE IF NOT EXISTS player_photos (
+  id          INTEGER PRIMARY KEY,
+  player_id   INTEGER NOT NULL,
+  state       TEXT NOT NULL,            -- pending | approved | rejected
+  mime        TEXT NOT NULL,            -- image/jpeg | image/png | image/webp
+  data        TEXT NOT NULL,            -- base64 ('' once rejected)
+  created_at  INTEGER NOT NULL,
+  reviewed_at INTEGER
+);
+
 CREATE INDEX IF NOT EXISTS idx_players_rating ON players(rating DESC);
+CREATE INDEX IF NOT EXISTS idx_player_photos ON player_photos(player_id, state);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_players_key ON players(api_key_hash);
 CREATE INDEX IF NOT EXISTS idx_nonces_seen ON nonces(seen_at);
 CREATE INDEX IF NOT EXISTS idx_matches_state ON matches(state);
@@ -203,6 +216,9 @@ const ADDED_COLUMNS = [
   ['players', 'hide_rating', 'INTEGER NOT NULL DEFAULT 0'],
   ['players', 'casual_rating', 'REAL'],
   ['players', 'casual_games', 'INTEGER NOT NULL DEFAULT 0'],
+  // The profile: a short bio (shown right away) and the approved photo's row id (player_photos)
+  ['players', 'bio', "TEXT NOT NULL DEFAULT ''"],
+  ['players', 'photo_id', 'INTEGER'],
   ['queue', 'mode', "TEXT NOT NULL DEFAULT 'ranked'"],
   ['matches', 'mode', "TEXT NOT NULL DEFAULT 'ranked'"],
   ['matches', 'casual_delta_a', 'REAL'], ['matches', 'casual_delta_b', 'REAL'],

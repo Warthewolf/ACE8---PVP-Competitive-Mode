@@ -1,0 +1,50 @@
+RVNG {{RVNG}} - 1v1 PvP for ACE COMBAT 8
+=========================================
+Private, invite-only mod. For ACE COMBAT 8 on Steam, game build {{GAME}}.
+Website: {{SITE}}
+
+WHAT YOU NEED
+  - ACE COMBAT 8 on Steam, fully updated.
+  - Node.js 22 or newer (the installer offers to install it for you).
+  - An RVNG account (free, made on the website).
+
+INSTALL (once)
+  1. Unzip this whole folder somewhere you'll keep it, e.g. Documents\RVNG.
+     Don't run it from inside the zip.
+  2. Go to {{SITE}}, click Sign up, pick a pilot name, and click
+     "Download credentials.json". It is shown only once - keep that file safe,
+     it's your login.
+  3. Close the game, then double-click "Install RVNG.cmd" and answer the questions.
+     It finds the game through Steam, installs UE4SS and RVNG, and picks up
+     credentials.json from your Downloads folder.
+     If Windows shows "Windows protected your PC", click More info > Run anyway.
+
+PLAY (every time)
+  1. Double-click "Start RVNG.cmd". It checks your game files and shows the
+     verdict, then keeps running. Leave that window open.
+  2. Start ACE COMBAT 8 from Steam as usual.
+  3. In the main menu, pick RVNG and queue. You get matched with another pilot.
+
+IF THE SCAN SAYS SOMETHING OTHER THAN CLEAN
+  The lines under the verdict name each problem file. Usually it's another mod
+  or a tool's leftover file: run "Install RVNG.cmd" again and let it move them
+  to the backup folder, or delete them yourself.
+  "game files missing or changed": in Steam, right-click ACE COMBAT 8 >
+  Properties > Installed Files > Verify integrity of game files, then install
+  RVNG again.
+  "build" / "version" problems: the game got a patch. Wait for a new RVNG package.
+
+RULES
+  - No other mods, trainers or injected tools while playing RVNG. Cosmetic mods
+    only if the admin approved them.
+  - Your account is yours: don't share credentials.json.
+
+UNINSTALL
+  Double-click "Uninstall RVNG.cmd". It removes UE4SS and RVNG and puts back
+  anything the installer moved to the backup folder.
+
+WHAT'S IN HERE
+  files\       the UE4SS loader (MIT licence, ue4ss\LICENSE) and the RVNG mod
+  companion\   the RVNG companion app (talks to the server for you)
+  scripts\     the install / start / uninstall scripts
+  backup\      anything the installer moved out of your game folder

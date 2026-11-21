@@ -48,7 +48,7 @@ async function show() {
   if (!token) return signOut();
   $('login').hidden = true; $('signout').hidden = false;
   document.querySelectorAll('[data-tab]').forEach((a) => a.classList.toggle('active', a.dataset.tab === tab()));
-  const views = { disputes, players, reports, scans, build };
+  const views = { disputes, players, photos, reports, scans, build };
   try { $('panel').innerHTML = await (views[tab()] || disputes)(); } catch (e) { if (e.message !== 'signed out') say(e.message, true); }
 }
 
@@ -97,11 +97,23 @@ async function players() {
     <div class="cat"><div class="tabs">${tabs}</div></div>
     ${rows.length ? `<table class="admin-table"><thead><tr><th>Pilot</th><th>Status</th><th>Rating</th><th>Record</th><th>Lapses</th><th>Reports</th><th>Joined</th><th></th></tr></thead><tbody>
     ${rows.map((p) => `<tr data-player="${p.id}">
-      <td><a href="/#/player/${p.id}">${esc(p.name)}</a><br><small>${esc(p.role)}${p.note ? ': ' + esc(p.note) : ''}</small></td>
+      <td><a href="/#/player/${p.id}">${esc(p.name)}</a><br><small>${esc(p.role)}${p.note ? ': ' + esc(p.note) : ''}</small>${p.bio ? `<br><small class="admin-bio">“${esc(p.bio)}”</small>` : ''}</td>
       <td><span class="badge ${esc(p.status)}">${esc(p.status)}</span></td><td>${esc(p.rating)}</td><td>${p.wins}-${p.losses}${p.draws ? '-' + p.draws : ''}</td>
       <td>${p.lapses}</td><td>${p.open_reports}</td><td>${when(p.created_at)}</td>
       <td class="admin-actions">${STATUSES.filter((s) => s !== p.status).map((s) => `<button type="button" data-status="${s}">${s === 'active' ? 'let in' : s}</button>`).join('')}
-        <button type="button" data-card>role / note</button></td></tr>`).join('')}</tbody></table>` : '<div class="empty">No players.</div>'}`;
+        <button type="button" data-card>role / note</button>${p.bio ? '<button type="button" data-clear="bio">clear bio</button>' : ''}${p.photo_id ? '<button type="button" data-clear="photo">remove photo</button>' : ''}${p.wins + p.losses + p.draws ? '' : '<button type="button" data-delete>delete</button>'}</td></tr>`).join('')}</tbody></table>` : '<div class="empty">No players.</div>'}`;
+}
+
+// ---- profile photos waiting for approval
+async function photos() {
+  const rows = await call('GET', '/api/admin/photos');
+  return `<div class="ttl"><h1>Photos</h1><div class="note">New profile photos show on the website only once you approve them. Approving one replaces the pilot's current photo.</div></div>
+    ${rows.length ? `<div class="admin-photos">${rows.map((r) => `<section class="admin-card" data-photo="${r.id}">
+      <img src="${esc(/^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(r.image) ? r.image : '')}" alt="Photo from ${esc(r.name)}">
+      <h2><a href="/#/player/${r.playerId}">${esc(r.name)}</a></h2>
+      <p class="admin-flags">${when(r.createdAt)}${r.replaces ? ' · replaces their current photo' : ''}</p>
+      <p class="admin-actions"><button type="button" data-review="1">approve</button><button type="button" data-review="0">reject</button></p></section>`).join('')}</div>`
+    : '<div class="empty">No photos waiting.</div>'}`;
 }
 
 // ---- player reports
@@ -188,6 +200,22 @@ document.addEventListener('click', async (e) => {
     const note = prompt('Note on the pilot\'s card (empty clears it):');
     if (note === null) return;
     await act(() => call('POST', `/api/admin/players/${id}/role`, { ...(role.trim() ? { role: role.trim() } : {}), note }), 'Card updated.');
+  } else if (b.dataset.review) {
+    const pid = b.closest('[data-photo]').dataset.photo;
+    const ok = b.dataset.review === '1';
+    await act(() => call('POST', `/api/admin/photos/${pid}/review`, { approve: ok }), ok ? 'Photo approved.' : 'Photo rejected.');
+  } else if (b.hasAttribute('data-delete')) {
+    const row = b.closest('[data-player]');
+    const name = row.querySelector('a').textContent;
+    if (confirm(`Delete ${name}? The account and its scans are removed for good, and its credentials.json stops working. (Only for accounts that never played.)`)) {
+      await act(() => call('DELETE', `/api/admin/players/${row.dataset.player}`), `${name} deleted.`);
+    }
+  } else if (b.dataset.clear) {
+    const id = b.closest('[data-player]').dataset.player;
+    const what = b.dataset.clear;
+    if (confirm(what === 'bio' ? "Clear this pilot's bio?" : "Remove this pilot's photo?")) {
+      await act(() => call('POST', `/api/admin/players/${id}/profile`, { [what]: true }), what === 'bio' ? 'Bio cleared.' : 'Photo removed.');
+    }
   } else if (b.dataset.buildActive) {
     const v = b.closest('[data-build]').dataset.build;
     const on = b.dataset.buildActive === '1';

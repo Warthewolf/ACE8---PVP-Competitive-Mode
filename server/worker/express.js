@@ -103,6 +103,12 @@ function makeRes() {
     status(n) { res.statusCode = n; return res; },
     set(k, v) { res.headers[k.toLowerCase()] = String(v); return res; },
     get(k) { return res.headers[k.toLowerCase()]; },
+    // bytes (a photo) or text, with the content type the route set
+    send(body) {
+      res.body = typeof body === 'string' || body instanceof Uint8Array ? body : String(body ?? '');
+      res.sent = true;
+      return res;
+    },
     json(obj) {
       res.headers['content-type'] = 'application/json; charset=utf-8';
       res.body = JSON.stringify(obj === undefined ? null : obj);

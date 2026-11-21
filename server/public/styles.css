@@ -316,3 +316,26 @@ button.totop { cursor: pointer; padding: 0; }
   .admin-table td { border: 0; padding: 2px 0; }
   body.admin .gnav nav { flex-wrap: wrap; gap: 8px 16px; }
 }
+
+/* ---------- profiles: photo and bio ---------- */
+.avatar { display: block; width: 100%; height: 100%; object-fit: cover; background: var(--sheet); }
+.avatar.letter { display: grid; place-items: center; font: 400 18px/1 var(--mono); color: var(--ink-strong); border: 1px solid var(--line); }
+.avatar.big { width: 160px; height: 160px; flex: none; border: 1px solid var(--line); padding: 4px; background: #fff; box-shadow: 0 1px 2px rgba(0, 0, 0, .08); }
+.avatar.big.letter { font-size: 64px; }
+.thumb .avatar.sq { aspect-ratio: 1; }
+.profile-head { display: flex; gap: 32px; align-items: flex-start; margin-bottom: 40px; }
+.profile-head .ttl { margin-bottom: 16px; }
+.bio { max-width: 620px; white-space: pre-line; overflow-wrap: anywhere; color: var(--ink); line-height: 1.6; }
+.form textarea { font: 400 16px/1.5 var(--sans); color: var(--ink-strong); background: #fff; border: 1px solid #999; padding: 10px; resize: vertical; text-transform: none; letter-spacing: 0; }
+.form textarea:focus { border-color: var(--b-navy); outline: none; }
+.form .hint, .hint { margin: -12px 0 0; font-size: 13px; color: var(--ink); text-transform: none; letter-spacing: 0; font-weight: 400; }
+.form small { text-transform: none; letter-spacing: 0; font-weight: 400; color: var(--ink); }
+.ok-note { color: var(--b-green); font-weight: 500; }
+.gnav .side a[data-nav="me"] { margin-right: 14px; font-size: 14px; }
+.admin-photos { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 20px; }
+.admin-photos img { width: 100%; aspect-ratio: 1; object-fit: cover; border: 1px solid var(--line); display: block; }
+@media (max-width: 640px) {
+  .profile-head { flex-direction: column; gap: 20px; }
+  .avatar.big { width: 120px; height: 120px; }
+}
+.admin-bio { white-space: pre-line; color: var(--ink-soft); }

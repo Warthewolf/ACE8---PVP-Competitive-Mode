@@ -14,6 +14,12 @@ const who = (p) => `${esc(p.name)}${roleBadge(p.role)}`;
 // A pilot who hides their rating shows the tier only: the API sends no number for them.
 const ratingText = (p) => (p.rating == null ? esc(p.tier) : esc(p.rating));
 const pnote = (p) => (p.note ? `<p class="pnote">${esc(p.note)}</p>` : '');
+// The approved photo (the server's own /api/players/<id>/photo address, nothing else), or the callsign's letter.
+const photoSrc = (p) => (typeof p.photo === 'string' && /^\/api\/players\/\d+\/photo\?v=\d+$/.test(p.photo) ? p.photo : null);
+const avatar = (p, cls = '') => (photoSrc(p)
+  ? `<img class="avatar ${cls}" src="${esc(photoSrc(p))}" alt="${esc(p.name)}" width="256" height="256" loading="lazy">`
+  : `<span class="avatar letter ${cls}" aria-hidden="true">${esc((p.name || '?').charAt(0).toUpperCase())}</span>`);
+const bioText = (p) => (p.bio ? `<p class="bio">${esc(p.bio)}</p>` : '');
 
 // ---------- generated HUD artwork (no third-party game art) ----------
 const SVG = {
@@ -36,7 +42,7 @@ const cat = (base, active, items) => `<div class="cat"><div class="lbl">Category
 // ---------- reusable blocks ----------
 function pilotRow(p, i) {
   return `<div class="row" role="button" tabindex="0" aria-expanded="false" data-drawer="d${i}">
-      <div class="thumb">${tile({ art: '', big: esc((p.name || '?').charAt(0).toUpperCase()), cls: 'sq' })}</div>
+      <div class="thumb">${photoSrc(p) ? avatar(p, 'sq') : tile({ art: '', big: esc((p.name || '?').charAt(0).toUpperCase()), cls: 'sq' })}</div>
       <div class="yr">${p.rank}</div>
       <div class="name"><a href="#/player/${p.id}">${esc(p.name)}</a> ${badge(p.tier, p.tier)}${roleBadge(p.role)}</div>
       <div class="stats"><span><b>${ratingText(p)}</b>${p.rating == null ? 'Tier' : 'Rating'}</span><span><b>${record(p)}</b>Record</span>
@@ -119,7 +125,7 @@ const routes = {
       ? `<div class="chron"><div class="when">${ymd(p.integrity.at)}</div><p>Last scan ${badge(p.integrity.verdict)}</p>
          ${p.integrity.mods.length ? `<p>${p.integrity.mods.map((m) => `<span class="box">${esc(m.name)}${m.approved ? '' : ' · unapproved'}</span>`).join(' ')}${p.integrity.modsTotal > p.integrity.mods.length ? ` <span class="box">+${esc(p.integrity.modsTotal - p.integrity.mods.length)} more</span>` : ''}</p>` : '<p>No mods besides the competitive client.</p>'}</div>`
       : '<div class="chron"><p>No integrity scan submitted yet.</p></div>';
-    return sheet(`${title(esc(p.name), `${badge(p.tier, p.tier)}${roleBadge(p.role)} ${p.status !== 'active' ? badge(p.status) : ''}`)}${pnote(p)}
+    return sheet(`<div class="profile-head">${avatar(p, 'big')}<div>${title(esc(p.name), `${badge(p.tier, p.tier)}${roleBadge(p.role)} ${p.status !== 'active' ? badge(p.status) : ''}`)}${bioText(p)}</div></div>${pnote(p)}
       <div class="figures">${p.rating == null ? fig('Tier', p.tier) : `${fig('Rating', p.rating)}${fig('Peak', p.peakRating)}`}${fig('Wins', p.wins)}${fig('Losses', p.losses)}${p.draws ? fig('Draws', p.draws) : ''}${fig('K/D', p.kd)}</div>
       <div class="bar">Integrity <span class="i">i</span></div>${integ}
       <section>${title('Recent Matches', '', 'h2')}${matchGrid(p.matches.slice(0, 12))}</section>`);
@@ -197,6 +203,33 @@ const routes = {
       <div class="chron"><p>The match is marked ${badge('disputed')} and reviewed by an admin. It does not change anyone's rating, and an event series waits for the ruling. Tampered aircraft data or injected code in a pilot's own scan or log puts that account under review.</p></div></section>`);
   },
 
+  async me() {
+    if (!myCreds()) {
+      return sheet(`${title('My profile', 'Sign in with the credentials.json you downloaded when you signed up.')}
+        <form class="form" id="mesignin"><label>credentials.json<input type="file" id="credfile" accept=".json,application/json" required></label>
+        <p class="hint">It stays in this browser tab: it is never uploaded, and closing the tab signs you out. No account yet? <a href="#/register">Sign up</a>.</p>
+        <div id="meout"></div></form>`);
+    }
+    let me;
+    try { me = await signed('GET', '/api/me'); } catch (e) {
+      if (e.status === 401) { signOutMe(); return routes.me(); }
+      throw e;
+    }
+    const review = me.photoReview?.state === 'pending' ? '<p class="pending-note">Your new photo is waiting for an admin to approve it.</p>'
+      : me.photoReview?.state === 'rejected' ? '<p class="error">Your last photo was not approved. You can upload a different one.</p>' : '';
+    return sheet(`${title('My profile', `Signed in as <b>${esc(me.name)}</b> · <a href="#/player/${me.id}">see your public page</a>`)}
+      <div class="profile-head">${avatar(me, 'big')}<div class="form">
+        <label>Photo<input type="file" id="photofile" accept="image/jpeg,image/png,image/webp"></label>
+        <p class="hint">Cropped to a square and shrunk in your browser. An admin approves every new photo before it shows.</p>
+        ${review}${me.photo || me.photoReview?.state === 'pending' ? '<p><button type="button" id="photodel" class="btn-line">Remove photo</button></p>' : ''}
+      </div></div>
+      <form class="form" id="bioform"><label>Bio <small id="biocount"></small><textarea name="bio" id="bio" rows="5" maxlength="300">${esc(me.bio)}</textarea></label>
+        <p class="hint">Up to 300 characters. It shows on your public page right away.</p>
+        <button>Save bio</button></form>
+      <div id="meout" role="status"></div>
+      <p><button type="button" id="meout-signout" class="btn-line">Sign out</button></p>`);
+  },
+
   async register() {
     return sheet(`${title('Sign up', 'Create a pilot account, then run the companion app next to the game.')}
       <form class="form" id="reg"><label>Callsign<input name="name" required minlength="3" maxlength="24" pattern="[A-Za-z0-9_\\-][A-Za-z0-9_\\- ]*[A-Za-z0-9_\\-]" autocomplete="nickname"
@@ -263,6 +296,90 @@ document.addEventListener('submit', async (e) => {
     out.innerHTML = `<p class="error">${esc(err.message)}</p>`;
     controls.forEach((x) => { x.disabled = false; });
   } finally { delete form.dataset.busy; }
+});
+
+// ---------- the pilot's own profile: requests signed in the browser with credentials.json ----------
+// The same signature as the companion app (client/lib/sign.js). The secret never leaves this tab's sessionStorage.
+const CREDS_KEY = 'rvng.creds';
+function myCreds() {
+  try { const c = JSON.parse(sessionStorage.getItem(CREDS_KEY)); return c && c.apiKey && c.apiSecret ? c : null; } catch { return null; }
+}
+function signOutMe() { try { sessionStorage.removeItem(CREDS_KEY); } catch { /* */ } }
+const hex = (buf) => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
+const b64url = (bytes) => btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+async function signed(method, path, payload) {
+  const c = myCreds();
+  if (!c) throw Object.assign(new Error('signed out'), { status: 401 });
+  const enc = new TextEncoder();
+  const body = payload === undefined ? '' : JSON.stringify(payload);
+  const ts = String(Date.now());
+  const nonce = b64url(crypto.getRandomValues(new Uint8Array(16)));
+  const key = await crypto.subtle.importKey('raw', enc.encode(c.apiSecret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const canonical = [method, path, ts, nonce, hex(await crypto.subtle.digest('SHA-256', enc.encode(body)))].join('\n');
+  const sig = hex(await crypto.subtle.sign('HMAC', key, enc.encode(canonical)));
+  const r = await fetch(path, { method, body: body || undefined,
+    headers: { 'x-player-key': c.apiKey, 'x-timestamp': ts, 'x-nonce': nonce, 'x-signature': sig, ...(body ? { 'content-type': 'application/json' } : {}) } });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw Object.assign(new Error(d.error || `HTTP ${r.status}`), { status: r.status });
+  return d;
+}
+const meSay = (text, bad) => { const o = document.getElementById('meout'); if (o) o.innerHTML = `<p class="${bad ? 'error' : 'ok-note'}">${esc(text)}</p>`; };
+
+// A photo: center-cropped to a square, 320 px, as JPEG (smaller until it fits the server's 200 KB).
+async function squareJpeg(file) {
+  const img = await createImageBitmap(file);
+  const side = Math.min(img.width, img.height);
+  const canvas = document.createElement('canvas');
+  canvas.width = canvas.height = 320;
+  canvas.getContext('2d').drawImage(img, (img.width - side) / 2, (img.height - side) / 2, side, side, 0, 0, 320, 320);
+  for (const q of [0.88, 0.75, 0.6, 0.45]) {
+    const blob = await new Promise((r) => canvas.toBlob(r, 'image/jpeg', q));
+    if (blob && blob.size <= 190 * 1024) {
+      return new Promise((res, rej) => { const fr = new FileReader(); fr.onload = () => res(fr.result); fr.onerror = rej; fr.readAsDataURL(blob); });
+    }
+  }
+  throw new Error('That image is too big even after shrinking it.');
+}
+
+document.addEventListener('change', async (e) => {
+  if (e.target.id === 'credfile') {
+    const f = e.target.files[0];
+    if (!f) return;
+    try {
+      const c = JSON.parse(await f.text());
+      if (!c || typeof c.apiKey !== 'string' || typeof c.apiSecret !== 'string') throw new Error('x');
+      sessionStorage.setItem(CREDS_KEY, JSON.stringify({ apiKey: c.apiKey, apiSecret: c.apiSecret, name: c.name }));
+      render();
+    } catch { meSay("That isn't a credentials.json from this site.", true); }
+  } else if (e.target.id === 'photofile') {
+    const f = e.target.files[0];
+    if (!f) return;
+    try {
+      meSay('Uploading...');
+      await signed('PUT', '/api/me/photo', { image: await squareJpeg(f) });
+      await render();
+      meSay('Photo sent. It shows once an admin approves it.');
+    } catch (err) { meSay(err.message, true); }
+  }
+});
+document.addEventListener('input', (e) => {
+  if (e.target.id === 'bio') document.getElementById('biocount').textContent = `${[...e.target.value].length}/300`;
+});
+document.addEventListener('submit', async (e) => {
+  if (e.target.id === 'mesignin') { e.preventDefault(); return; }
+  if (e.target.id !== 'bioform') return;
+  e.preventDefault();
+  try {
+    const me = await signed('POST', '/api/me/profile', { bio: e.target.elements.bio.value });
+    e.target.elements.bio.value = me.bio;
+    meSay('Bio saved.');
+  } catch (err) { meSay(err.message, true); }
+});
+document.addEventListener('click', async (e) => {
+  if (e.target.id === 'meout-signout') { signOutMe(); render(); return; }
+  if (e.target.id === 'photodel' && confirm('Remove your photo?')) {
+    try { await signed('DELETE', '/api/me/photo'); await render(); meSay('Photo removed.'); } catch (err) { meSay(err.message, true); }
+  }
 });
 
 const totop = document.querySelector('.totop');

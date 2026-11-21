@@ -81,6 +81,8 @@ function createApp({ db = openDb(config.dbPath) } = {}) {
   };
   app.use(['/api/integrity/report', '/api/matches/:id/report', '/api/admin/baselines', '/api/admin/mods'],
     express.json({ limit: '4mb', verify }));
+  // a profile photo: at most 200 KB, sent as base64
+  app.use('/api/me/photo', express.json({ limit: '300kb', verify }));
   app.use(express.json({ limit: '64kb', verify }));
   app.use((req, res, next) => {
     res.set('X-Content-Type-Options', 'nosniff');
@@ -111,6 +113,14 @@ function createApp({ db = openDb(config.dbPath) } = {}) {
   app.get('/api/stats', wrap(() => svc.stats(db)));
   app.get('/api/leaderboard', wrap((req) => svc.leaderboard(db, { limit: int(req.query.limit, 100, 1, 500), offset: int(req.query.offset, 0, 0, 1e6) })));
   app.get('/api/players/:id', wrap((req) => svc.playerProfile(db, id(req.params.id))));
+  // The approved photo. Its type comes from its own bytes (checked on upload); nosniff is set for every response.
+  app.get('/api/players/:id/photo', wrap((req, res) => {
+    const ph = svc.photoFile(db, id(req.params.id));
+    res.set('Content-Type', ph.mime);
+    res.set('Cache-Control', 'public, max-age=3600');
+    res.set('Content-Disposition', 'inline');
+    res.send(ph.data);
+  }));
   app.get('/api/matches', wrap((req) => svc.recentMatches(db, { state: str(req.query.state), limit: int(req.query.limit, 50, 1, 200) })));
   app.get('/api/matches/:id/public', wrap((req) => svc.getMatch(db, req.params.id)));
   app.get('/api/tournaments', wrap(() => tournaments.list(db)));
@@ -130,6 +140,9 @@ function createApp({ db = openDb(config.dbPath) } = {}) {
   // ----- player (signed by client scanner / in-game mod) -----
   app.get('/api/me', player, wrap((req) => svc.playerProfile(db, req.player.id, { self: true })));
   app.post('/api/me/settings', player, wrap((req) => svc.updateSettings(db, req.player, req.body || {})));
+  app.post('/api/me/profile', player, wrap((req) => svc.updateProfile(db, req.player, req.body || {})));
+  app.put('/api/me/photo', player, wrap((req) => svc.uploadPhoto(db, req.player, req.body || {})));
+  app.delete('/api/me/photo', player, wrap((req) => svc.deletePhoto(db, req.player)));
   app.post('/api/integrity/report', player, wrap((req) => svc.submitIntegrity(db, req.player, req.body)));
   app.post('/api/queue/join', player, wrap((req) => svc.joinQueue(db, req.player, req.body || {})));
   app.post('/api/queue/leave', player, wrap((req) => { svc.leaveQueue(db, req.player); return svc.queueStatus(db, req.player); }));
@@ -156,6 +169,10 @@ function createApp({ db = openDb(config.dbPath) } = {}) {
   app.get('/api/admin/integrity', requireAdmin, wrap((req) => svc.integrityLog(db, { verdict: str(req.query.verdict), limit: int(req.query.limit, 50, 1, 200) })));
   app.get('/api/admin/players', requireAdmin, wrap((req) => svc.adminPlayers(db, { status: str(req.query.status), limit: int(req.query.limit, 100, 1, 500) })));
   app.post('/api/admin/players/:id/status', requireAdmin, wrap((req) => { svc.setPlayerStatus(db, id(req.params.id), (req.body || {}).status); return { ok: true }; }));
+  app.get('/api/admin/photos', requireAdmin, wrap(() => svc.pendingPhotos(db)));
+  app.post('/api/admin/photos/:id/review', requireAdmin, wrap((req) => svc.reviewPhoto(db, id(req.params.id), req.body || {})));
+  app.delete('/api/admin/players/:id', requireAdmin, wrap((req) => svc.deletePlayer(db, id(req.params.id))));
+  app.post('/api/admin/players/:id/profile', requireAdmin, wrap((req) => svc.clearProfile(db, id(req.params.id), req.body || {})));
   app.post('/api/admin/players/:id/role', requireAdmin, wrap((req) => svc.setPlayerCard(db, id(req.params.id), req.body || {})));
   app.get('/api/admin/reports', requireAdmin, wrap((req) => svc.listReports(db, { state: str(req.query.state), limit: int(req.query.limit, 100, 1, 500) })));
   app.post('/api/admin/reports/:id/close', requireAdmin, wrap((req) => svc.closeReport(db, id(req.params.id), req.body || {})));
