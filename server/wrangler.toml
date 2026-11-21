@@ -5,6 +5,14 @@ main = "worker/index.js"
 compatibility_date = "2026-09-01"
 compatibility_flags = ["nodejs_compat"]
 
+# The site's own address (the domain is on this Cloudflare account; Cloudflare makes the DNS records and certificate).
+# The workers.dev address keeps working too.
+workers_dev = true
+routes = [
+  { pattern = "playrvngpvp.org", custom_domain = true },
+  { pattern = "www.playrvngpvp.org", custom_domain = true },
+]
+
 # src/app.js requires Express; on Cloudflare that's worker/express.js (the same routes on the Fetch API)
 [alias]
 "express" = "./worker/express.js"
