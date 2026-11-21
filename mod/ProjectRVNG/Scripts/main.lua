@@ -11,6 +11,8 @@
 ]]
 
 local Json = require("json")
+local Ready = require("rvng_ready")       -- the ready-up screen (both pilots ready, then both launch at once)
+local Hangar = require("rvng_hangar")     -- the lobby in the stock hangar (STANDBY: READY UP, SORTIE, the opponent's plane)
 
 -- Path of the game root as seen from UE4SS's working directory (Binaries/Win64).
 local BRIDGE = rawget(_G, "RVNG_BRIDGE") or "../../../ProjectRVNG/bridge/"
@@ -107,11 +109,11 @@ local function writeRuntime()
 end
 
 -- ---- Main menu entry ----------------------------------------------------------------
--- Until the menu widget is hooked, F8 = queue, F9 = cancel.
-local function requestQueue()
+-- COMPETITIVE 1V1 on the main menu queues (rvng_menu.lua, below); F8 = queue and F9 = cancel stay as keys.
+local function requestQueue(mode)
   writeRuntime()
-  writeJson("request.json", { action = "queue" })
-  print("[ProjectRVNG] queue requested")
+  writeJson("request.json", { action = "queue", mode = mode })   -- (mode: "ranked" | "casual"; nil = the companion's)
+  print("[ProjectRVNG] queue requested" .. (mode and (" (" .. mode .. ")") or ""))
 end
 RegisterKeyBind(Key.F8, requestQueue)
 RegisterKeyBind(Key.F9, function() writeJson("request.json", { action = "cancel" }) end)
@@ -150,6 +152,84 @@ local function onLobbyReady(match)
     local ok, started = pcall(GAME.joinRoom, match.lobbyCode)
     if ok and started then state.joinedMatchId = match.id end
   end
+end
+
+-- ---- The two PCs' link (the native runtime's link.h: Steam, relay-only) ----------------------
+-- Each pilot's mod posts this PC's SteamID for the match (link.json; the companion sends it to the server, which shows
+-- it only to the opponent). Once the opponent's is there, the native runtime starts the link: the host is player 1,
+-- the guest player 2, the match id is its tag (a message from another match is dropped).
+local function onLink(match)
+  if type(rawget(_G, "RVNG_LinkSelf")) ~= "function" then return end   -- (no native runtime)
+  local L = state.link
+  if not L or L.matchId ~= match.id then
+    L = { matchId = match.id, at = nil, started = false }
+    state.link = L
+  end
+  local me = RVNG_LinkSelf()
+  if type(me) ~= "string" or me == "" then return end             -- (Steam not up yet: the next poll)
+  local link = type(match.link) == "table" and match.link or {}
+  if link.self ~= me and (not L.at or now() - L.at >= RETRY_SEC) then
+    writeJson("link.json", { matchId = match.id, steamId = me })   -- (a string: 17 digits don't fit a Lua number)
+    L.at = now()
+  end
+  if not L.started and type(link.peer) == "string" and link.peer ~= "" then
+    local player = match.role == "host" and 1 or 2
+    local opp = match.role == "host" and match.guest or match.host
+    local oppName = type(opp) == "table" and type(opp.name) == "string" and opp.name or nil
+    local mine = match.role == "host" and match.host or match.guest
+    local myName = type(mine) == "table" and type(mine.name) == "string" and mine.name or nil
+    if RVNG_LinkStart(link.peer, player, match.id) == 1 then
+      L.started = true
+      -- (the opponent's name in the match itself: the copy's name, from the server's match like the lobby's)
+      if type(rawget(_G, "RVNG_OppName")) == "function" then RVNG_OppName(oppName or "") end
+      Ready.begin(oppName, myName)                                -- (the ready-up screen: rvng_ready.lua)
+      Hangar.start()                                              -- (both PCs into the hangar: rvng_hangar.lua)
+      print(string.format("[ProjectRVNG] link to the opponent started as player %d\n", player))
+    end
+  end
+end
+
+-- ---- The native deathmatch's result, for the leaderboard (runtime 0.4.4, matchstats.h) ----------------------------
+-- The match is the game's own deathmatch on the two PCs. At its end (time-up, or the forced end after a lost link) the
+-- runtime has both scores (the host's ScoreUpdates make them the same on both PCs) and both pilots' deaths (each counted
+-- from the death messages both PCs handle); in a 1v1 a pilot's kills are the other's deaths. Written once per match as
+-- result.json, for the server match the link was started for; the companion sends it (POST /api/matches/:id/report).
+local function nativeResult()
+  if type(rawget(_G, "RVNG_MatchStat")) ~= "function" then return end
+  local n = RVNG_MatchStat(0)
+  if state.statsSeen == nil then state.statsSeen = n end
+  if n <= state.statsSeen then return end
+  state.statsSeen = n
+  local L = state.link
+  if not (L and L.matchId) or state.doneMatchId == L.matchId then return end
+  local myDeaths, oppDeaths = RVNG_MatchStat(1), RVNG_MatchStat(2)
+  local events = Json.array()
+  for i = 0, RVNG_MatchStat(5) - 1 do
+    local t, who = tostring(RVNG_MatchEvent(i) or ""):match("^([%d%.]+),(%d)$")
+    t = tonumber(t)
+    if t and who == "1" then
+      events[#events + 1] = { t = t, type = "kill", actor = "self" }
+      events[#events + 1] = { t = t, type = "death", actor = "opponent" }
+    elseif t then
+      events[#events + 1] = { t = t, type = "kill", actor = "opponent" }
+      events[#events + 1] = { t = t, type = "death", actor = "self" }
+    end
+  end
+  local myPlane = type(rawget(_G, "RVNG_HgInfo")) == "function" and RVNG_HgInfo(13) or -1
+  local oppPlane = type(rawget(_G, "RVNG_HgInfo")) == "function" and RVNG_HgInfo(8) or -1
+  writeJson("result.json", {
+    matchId = L.matchId,
+    format = "native_dm",                            -- (the game's own deathmatch: decided by score at time-up)
+    gameVersion = GAME_VERSION,
+    runtimeVersion = RVNG_Version(),
+    durationSec = RVNG_MatchStat(3),
+    endReason = RVNG_MatchStat(4) == 1 and "disconnect" or "time_limit",
+    self = { aircraftId = tostring(myPlane), kills = oppDeaths, deaths = myDeaths, score = (RVNG_ResultInfo(1) or 0) / 10 },
+    opponent = { aircraftId = tostring(oppPlane), kills = myDeaths, deaths = oppDeaths, score = (RVNG_ResultInfo(2) or 0) / 10 },
+    events = events,
+  })
+  state.doneMatchId = L.matchId
+  print(string.format("[ProjectRVNG] the match's result written for the leaderboard (%s)\n", tostring(L.matchId)))
 end
 
 -- ---- Match logging ------------------------------------------------------------------
@@ -275,24 +355,66 @@ pcall(RegisterHook, HOOKS.MatchEnd, function(ctx)
   })
   state.doneMatchId = log.matchId
   state.log, state.lobby = nil, nil
+  if state.link and state.link.started and type(rawget(_G, "RVNG_LinkStop")) == "function" then RVNG_LinkStop() end
 end)
 
 -- ---- Poll the companion ---------------------------------------------------------------
 local function poll()
+  nativeResult()                                      -- (a native match just ended: its result.json)
   local s = readJson("state.json")
   -- Act only on an open match we have not played yet. The companion keeps showing a finished match
   -- as "matched" for a moment (until its result is submitted), which must not trigger a rejoin.
   if s and s.state == "matched" and type(s.match) == "table" and s.match.id ~= state.doneMatchId
     and (s.match.state == "pending" or s.match.state == "live") then
     onMatched(s.match)
+    onLink(s.match)
     if s.match.lobbyCode then onLobbyReady(s.match) end
   end
+  Ready.queue(s)                                     -- (SEARCHING while queued: rvng_ready.lua)
   sampleStats()
 end
 
-LoopAsync(1000, function()
-  poll()
-  return false -- keep looping
-end)
+-- Everything runs on RVNG's one game-thread tick, once a second (rvng_tick.lua: Lua must not run on UE4SS's async
+-- thread and the game thread at once).
+local Tick = require("rvng_tick")
+Tick.add(poll)
 
+-- The native runtime's always-on tick: the web gates stay shut and the boot menu's login is ended (rvng_native.lua)
+require("rvng_native")
+
+-- RVNG's main menu (rvng_menu.lua): ACE COMBAT STORE taken off, ACE COMBAT ONLINE turned into COMPETITIVE 1V1, whose
+-- press queues (as F8; on the game thread)
+local Menu = require("rvng_menu")
+-- RVNG's pages (rvng_pages.lua): MULTIPLAYER > RANKED 1V1 / CASUAL 1V1 > LOBBY (the ready-up) > the match > the result.
+-- A press on the main menu's MULTIPLAYER row opens them; on a page the DLL takes every press and the pages decide.
+local Pages = require("rvng_pages")
+Menu.onPick = function() Pages.openMultiplayer() end
+Pages.onQueue = function(mode) requestQueue(mode) end
+Pages.onCancel = function() writeJson("request.json", { action = "cancel" }) end
+Hangar.onStart = function() Pages.stepAside() end      -- (the main menu goes with the travel into the hangar)
+Hangar.onLeave = function()                            -- (LEAVE THE HANGAR / QUIT MISSION / the opponent gone)
+  Ready.reset()
+  Pages.backFromHangar()                               -- (back on MULTIPLAYER, ready to queue again)
+  if type(rawget(_G, "RVNG_LinkStop")) == "function" then RVNG_LinkStop() end
+  writeJson("request.json", { action = "cancel" })
+end
+Pages.onLeave = function()                             -- (leaving the lobby after a match was found: the link ends)
+  if type(rawget(_G, "RVNG_LinkStop")) == "function" then RVNG_LinkStop() end
+  writeJson("request.json", { action = "cancel" })
+end
+-- both pilots ready: both PCs launch into the match at the agreed time
+Ready.onLaunch = function()
+  Hangar.stop()                                         -- (first: it puts the hangar's mission context back)
+  local ok = type(rawget(_G, "RVNG_TravelDM")) == "function" and RVNG_TravelDM() == 1
+  if not ok then
+    -- (0.4.1: a normal install arms the match itself, from the link: the DLL refuses only without the link up or with a
+    -- match hook or piece missing, and its log says which)
+    print("[ProjectRVNG] the launch could not start the match travel (see RVNG_*.log)\n")
+  end
+end
+
+-- The native runtime's in-game test logger (docs/IN_GAME_TESTS.md); a no-op without dlls/main.dll or rvng_test.ini.
+require("rvng_probe")
+
+Tick.start(1000)
 print("[ProjectRVNG] loaded")

@@ -128,7 +128,8 @@ function createApp({ db = openDb(config.dbPath) } = {}) {
   }));
 
   // ----- player (signed by client scanner / in-game mod) -----
-  app.get('/api/me', player, wrap((req) => svc.playerProfile(db, req.player.id)));
+  app.get('/api/me', player, wrap((req) => svc.playerProfile(db, req.player.id, { self: true })));
+  app.post('/api/me/settings', player, wrap((req) => svc.updateSettings(db, req.player, req.body || {})));
   app.post('/api/integrity/report', player, wrap((req) => svc.submitIntegrity(db, req.player, req.body)));
   app.post('/api/queue/join', player, wrap((req) => svc.joinQueue(db, req.player, req.body || {})));
   app.post('/api/queue/leave', player, wrap((req) => { svc.leaveQueue(db, req.player); return svc.queueStatus(db, req.player); }));
@@ -136,11 +137,13 @@ function createApp({ db = openDb(config.dbPath) } = {}) {
   app.get('/api/queue/status', player, wrap((req) => svc.queueStatus(db, req.player)));
   app.get('/api/matches/:id', player, wrap((req) => svc.getMatch(db, req.params.id, req.player.id)));
   app.post('/api/matches/:id/lobby', player, wrap((req) => svc.setLobby(db, req.player, req.params.id, (req.body || {}).lobbyCode)));
+  app.post('/api/matches/:id/link', player, wrap((req) => svc.setLink(db, req.player, req.params.id, (req.body || {}).steamId)));
   app.post('/api/matches/:id/report', player, wrap((req) => svc.submitReport(db, req.player, req.params.id, req.body)));
   app.post('/api/tournaments/:id/register', player, wrap((req) => {
     tournaments.register(db, id(req.params.id), req.player);
     return tournaments.get(db, id(req.params.id));
   }));
+  app.post('/api/reports', player, wrap((req, res) => { const r = svc.fileReport(db, req.player, req.body || {}); res.status(201); return r; }));
 
   // ----- admin -----
   app.put('/api/admin/baselines', requireAdmin, wrap((req) => svc.putBaseline(db, req.body || {})));
@@ -150,13 +153,20 @@ function createApp({ db = openDb(config.dbPath) } = {}) {
   app.post('/api/admin/mods/retire', requireAdmin, wrap((req) => svc.retireMods(db, req.body || {})));
   app.delete('/api/admin/mods/:id', requireAdmin, wrap((req) => svc.removeApprovedMod(db, id(req.params.id), { purge: str(req.query.purge) === '1' })));
   app.get('/api/admin/integrity', requireAdmin, wrap((req) => svc.integrityLog(db, { verdict: str(req.query.verdict), limit: int(req.query.limit, 50, 1, 200) })));
+  app.get('/api/admin/players', requireAdmin, wrap((req) => svc.adminPlayers(db, { status: str(req.query.status), limit: int(req.query.limit, 100, 1, 500) })));
   app.post('/api/admin/players/:id/status', requireAdmin, wrap((req) => { svc.setPlayerStatus(db, id(req.params.id), (req.body || {}).status); return { ok: true }; }));
+  app.post('/api/admin/players/:id/role', requireAdmin, wrap((req) => svc.setPlayerCard(db, id(req.params.id), req.body || {})));
+  app.get('/api/admin/reports', requireAdmin, wrap((req) => svc.listReports(db, { state: str(req.query.state), limit: int(req.query.limit, 100, 1, 500) })));
+  app.post('/api/admin/reports/:id/close', requireAdmin, wrap((req) => svc.closeReport(db, id(req.params.id), req.body || {})));
+  app.get('/api/admin/matches/:id', requireAdmin, wrap((req) => svc.adminMatch(db, req.params.id)));
   app.post('/api/admin/matches/:id/resolve', requireAdmin, wrap((req) => svc.resolveDispute(db, req.params.id, req.body || {})));
   app.post('/api/admin/tournaments', requireAdmin, wrap((req, res) => { res.status(201); return tournaments.create(db, req.body || {}); }));
   app.post('/api/admin/tournaments/:id/start', requireAdmin, wrap((req) => tournaments.start(db, id(req.params.id))));
   app.post('/api/admin/series/:id/forfeit', requireAdmin, wrap((req) => tournaments.forfeit(db, id(req.params.id), (req.body || {}).winner)));
 
-  app.use(express.static(path.join(__dirname, '..', 'public'), { extensions: ['html'] }));
+  // (On Cloudflare public/ is the Worker's static assets: worker/express.js's static() does nothing, and a bundled
+  // Worker may have no __dirname.)
+  app.use(express.static(typeof __dirname === 'string' ? path.join(__dirname, '..', 'public') : 'public', { extensions: ['html'] }));
 
   app.use('/api', (_req, res) => res.status(404).json({ error: 'not found' }));
   // eslint-disable-next-line no-unused-vars

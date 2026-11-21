@@ -6,10 +6,18 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node --disable-warning=ExperimentalWarning src/index.js",
-    "test": "node --disable-warning=ExperimentalWarning --test test/*.test.js"
+    "test": "node --disable-warning=ExperimentalWarning --test test/*.test.js",
+    "test:worker": "node --disable-warning=ExperimentalWarning test/run-worker-tests.js",
+    "deploy": "wrangler deploy",
+    "dev:worker": "wrangler dev --port 8787"
   },
-  "engines": { "node": ">=22.13" },
+  "engines": {
+    "node": ">=22.13"
+  },
   "dependencies": {
     "express": "^4.21.2"
+  },
+  "devDependencies": {
+    "wrangler": "^4.166.0"
   }
 }

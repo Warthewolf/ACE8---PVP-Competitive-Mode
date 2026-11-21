@@ -12,8 +12,9 @@ function kFactor(rating, gamesPlayed) {
   return c.kStandard;
 }
 
-// Games played, draws included (a draw-heavy pilot must not stay provisional forever).
-const played = (p) => p.wins + p.losses + (p.draws || 0);
+// Games played, draws included (a draw-heavy pilot must not stay provisional forever). `games` gives the count
+// directly (the hidden casual rating keeps its own count).
+const played = (p) => (Number.isSafeInteger(p.games) ? p.games : p.wins + p.losses + (p.draws || 0));
 
 // Returns rating deltas for winner/loser of a 1v1.
 function eloDeltas(winner, loser) {

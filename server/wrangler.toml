@@ -1,0 +1,29 @@
+# The RVNG server on Cloudflare (docs/CLOUDFLARE.md has the setup). Secrets are never written here: set them with
+# `npx wrangler secret put ADMIN_TOKEN`.
+name = "rvng-server"
+main = "worker/index.js"
+compatibility_date = "2026-09-01"
+compatibility_flags = ["nodejs_compat"]
+
+# src/app.js requires Express; on Cloudflare that's worker/express.js (the same routes on the Fetch API)
+[alias]
+"express" = "./worker/express.js"
+# (only the Node server opens a database file; the Worker's is the Durable Object's)
+"node:sqlite" = "./worker/no-sqlite.js"
+
+# The website: public/ (public/_headers adds the security headers)
+[assets]
+directory = "./public"
+binding = "ASSETS"
+
+# The database: one Durable Object with its own SQLite (free plan)
+[[durable_objects.bindings]]
+name = "RVNG"
+class_name = "RvngServer"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RvngServer"]
+
+[vars]
+# Optional server switches (see src/config.js): RVNG_INVITE_ONLY = "1", RVNG_RANKED = "0"

@@ -26,42 +26,103 @@ function registerPlayer(db, { name } = {}) {
   // A platform id (SteamID64) is not accepted from the client: it cannot be verified yet, and an unverified
   // unique id would let anyone reserve someone else's. See docs/SECURITY.md.
   const { apiKey, apiSecret } = newCredentials();
+  // Invite-only: the account exists, but it can do nothing that costs anyone else anything until an admin lets it in.
+  const status = config.access.inviteOnly ? 'pending' : 'active';
   try {
-    const r = db.prepare(`INSERT INTO players (name, api_key_hash, api_secret, rating, peak_rating, created_at)
-      VALUES (?, ?, ?, ?, ?, ?)`).run(n, sha256(apiKey), apiSecret, config.rating.initial, config.rating.initial, now());
-    return { id: Number(r.lastInsertRowid), name: n, apiKey, apiSecret };
+    const r = db.prepare(`INSERT INTO players (name, api_key_hash, api_secret, rating, peak_rating, status, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)`).run(n, sha256(apiKey), apiSecret, config.rating.initial, config.rating.initial, status, now());
+    return { id: Number(r.lastInsertRowid), name: n, apiKey, apiSecret, status };
   } catch (e) {
     if (/UNIQUE/.test(e.message)) throw new HttpError(409, 'callsign already registered');
     throw e;
   }
 }
 
-const publicPlayer = (p) => p && ({
-  id: p.id, name: p.name, rating: Math.round(p.rating), peakRating: Math.round(p.peak_rating),
-  tier: tierFor(p.rating), wins: p.wins, losses: p.losses, draws: p.draws || 0, kills: p.kills, deaths: p.deaths,
-  kd: p.deaths ? +(p.kills / p.deaths).toFixed(2) : p.kills, status: p.status,
-});
+// What a pending account is told wherever it tries to play.
+const PENDING_MESSAGE = 'your account is waiting for an admin to let you in (this server is invite-only)';
+// Scanning, queueing, event entry and reports: only for accounts that have been let in.
+function requireLetIn(player) {
+  if (player.status === 'pending') throw new HttpError(403, PENDING_MESSAGE);
+}
+
+// A pilot who hides their rating shows the tier only, everywhere but in their own signed view. Peak rating and
+// their own rating changes are hidden too (summing the changes would give the number back). The casual rating
+// is never part of any view.
+const publicPlayer = (p, { self = false } = {}) => {
+  if (!p) return p;
+  const hidden = !!p.hide_rating && !self;
+  return {
+    id: p.id, name: p.name, rating: hidden ? null : Math.round(p.rating), peakRating: hidden ? null : Math.round(p.peak_rating),
+    ratingHidden: !!p.hide_rating, tier: tierFor(p.rating), wins: p.wins, losses: p.losses, draws: p.draws || 0,
+    kills: p.kills, deaths: p.deaths, kd: p.deaths ? +(p.kills / p.deaths).toFixed(2) : p.kills, status: p.status,
+    role: p.role || 'player', note: p.note || '',
+  };
+};
 
 function leaderboard(db, { limit = 100, offset = 0 } = {}) {
   const lim = clampInt(limit, 100, 1, 500);
   const off = clampInt(offset, 0, 0, 1e6);
+  // Pilots who hide their rating keep their place in the order.
   const rows = db.prepare(`SELECT * FROM players WHERE status = 'active' AND (wins + losses + draws) > 0
     ORDER BY rating DESC, wins DESC, id ASC LIMIT ? OFFSET ?`).all(lim, off);
   return rows.map((p, i) => ({ rank: off + i + 1, ...publicPlayer(p) }));
 }
 
-function playerProfile(db, id) {
+function playerProfile(db, id, { self = false } = {}) {
   const p = db.prepare('SELECT * FROM players WHERE id = ?').get(id);
   if (!p) throw new HttpError(404, 'player not found');
-  const matches = recentMatches(db, { playerId: id, limit: 20 });
+  const matches = recentMatches(db, { playerId: id, limit: 20, viewerId: self ? id : undefined });
   const lastScan = db.prepare(`SELECT verdict, mods, created_at FROM integrity_reports WHERE player_id = ?
     ORDER BY id DESC LIMIT 1`).get(id);
   const mods = lastScan ? json(lastScan.mods, []) : [];
   return {
-    ...publicPlayer(p),
+    ...publicPlayer(p, { self }),
     integrity: lastScan ? { verdict: lastScan.verdict, mods: mods.slice(0, 50), modsTotal: mods.length, at: lastScan.created_at } : null,
     matches,
   };
+}
+
+// Player settings (signed). Only `hideRating` for now.
+function updateSettings(db, player, body = {}) {
+  if (!isPlainObject(body) || !Object.hasOwn(body, 'hideRating')) throw new HttpError(400, 'nothing to change: send { "hideRating": true | false }');
+  if (typeof body.hideRating !== 'boolean') throw new HttpError(400, 'hideRating must be true or false');
+  db.prepare('UPDATE players SET hide_rating = ? WHERE id = ?').run(body.hideRating ? 1 : 0, player.id);
+  return playerProfile(db, player.id, { self: true });
+}
+
+// Plain one-line text: no control characters, and no bidirectional overrides that would make a note or a
+// report read differently from what it holds. (The website escapes it as well.)
+const UNSAFE_TEXT = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/;
+
+// Admin: a player's role badge and the short note on their card. Either field may be left out.
+function setPlayerCard(db, id, body = {}) {
+  if (!isPlainObject(body) || (body.role === undefined && body.note === undefined)) throw new HttpError(400, 'send role and/or note');
+  const p = db.prepare('SELECT * FROM players WHERE id = ?').get(id);
+  if (!p) throw new HttpError(404, 'player not found');
+  const roles = config.players.roles;
+  if (body.role !== undefined && (typeof body.role !== 'string' || !roles.includes(body.role))) {
+    throw new HttpError(400, `role must be one of: ${roles.join(', ')}`);
+  }
+  let note;
+  if (body.note !== undefined) {
+    const max = config.players.maxNoteLength;
+    if (typeof body.note !== 'string' || body.note.length > max || UNSAFE_TEXT.test(body.note)) {
+      throw new HttpError(400, `note must be one line of plain text, at most ${max} characters`);
+    }
+    note = body.note.trim();
+  }
+  db.prepare('UPDATE players SET role = COALESCE(?, role), note = COALESCE(?, note) WHERE id = ?').run(body.role ?? null, note ?? null, p.id);
+  return publicPlayer(db.prepare('SELECT * FROM players WHERE id = ?').get(p.id));
+}
+
+// Admin: players by status (for example the pending sign-ups of an invite-only server), newest first.
+function adminPlayers(db, { status, limit = 100 } = {}) {
+  const s = typeof status === 'string' && status ? status : null;
+  return db.prepare(`SELECT p.id, p.name, p.status, p.role, p.note, p.hide_rating, p.rating, p.wins, p.losses, p.draws, p.created_at,
+      (SELECT COUNT(*) FROM lapses l WHERE l.player_id = p.id) lapses,
+      (SELECT COUNT(*) FROM player_reports r WHERE r.reported_id = p.id AND r.state = 'open') open_reports
+    FROM players p ${s ? 'WHERE p.status = ?' : ''} ORDER BY p.id DESC LIMIT ?`).all(...(s ? [s] : []), clampInt(limit, 100, 1, 500))
+    .map((r) => ({ ...r, rating: Math.round(r.rating), hide_rating: !!r.hide_rating }));
 }
 
 // ---------- integrity ----------
@@ -104,6 +165,7 @@ function capFindings(findings, n, budget = Infinity) {
 
 function submitIntegrity(db, player, report) {
   const c = config.integrity;
+  requireLetIn(player);
   if (!isPlainObject(report)) throw new HttpError(400, 'report must be an object');
   const rt = isPlainObject(report.runtime) ? report.runtime : {};
   const long = (v, max) => typeof v === 'string' && v.length > max;
@@ -162,15 +224,45 @@ function validIntegrity(db, player, token) {
 }
 
 // ---------- queue & matchmaking ----------
-function joinQueue(db, player, { integrityToken, region } = {}) {
+const MODES = ['ranked', 'casual'];
+
+// Repeated lapses (a matched host who never opened the room) within the window: a short queue cooldown after
+// the last one.
+function lapseCooldown(db, playerId, t = now()) {
+  const d = config.dodging;
+  if (!(d.lapses > 0) || !(d.cooldownMs > 0)) return null;
+  const r = db.prepare('SELECT COUNT(*) c, MAX(at) last FROM lapses WHERE player_id = ? AND at >= ?').get(playerId, t - d.windowMs);
+  if (r.c < d.lapses || t - r.last >= d.cooldownMs) return null;
+  return { lapses: r.c, untilMs: r.last + d.cooldownMs };
+}
+
+function joinQueue(db, player, { integrityToken, region, mode } = {}) {
+  requireLetIn(player);
   if (player.status !== 'active') throw new HttpError(403, `account is ${player.status}; competitive queue disabled`);
   const regions = config.matchmaking.regions;
   const reg = region == null || region === '' ? 'global' : region;
   if (typeof reg !== 'string' || !regions.includes(reg)) throw new HttpError(400, `region must be one of: ${regions.join(', ')}`);
+  if (mode != null && mode !== '' && (typeof mode !== 'string' || !MODES.includes(mode))) throw new HttpError(400, `mode must be one of: ${MODES.join(', ')}`);
+  // A join that names no mode is ranked, as before modes existed, or casual while the ranked queue is off. Event
+  // games are played through the ranked queue, also while it is off: a pilot who owes a series is then only ever
+  // paired with their series opponent.
+  let m = mode || 'ranked';
+  if (m === 'ranked' && !config.modes.ranked && !tournaments.openSeriesFor(db, player.id).length) {
+    if (mode) throw new HttpError(403, 'the ranked queue is turned off on this server: queue casual instead (mode "casual")');
+    m = 'casual';
+  }
   const scan = validIntegrity(db, player, integrityToken);
   if (openMatchFor(db, player.id)) throw new HttpError(409, 'you already have an open match');
-  db.prepare(`INSERT OR REPLACE INTO queue (player_id, rating, region, integrity_id, game_version, joined_at) VALUES (?, ?, ?, ?, ?, ?)`)
-    .run(player.id, player.rating, reg, scan.id, scan.game_version, now());
+  const cd = lapseCooldown(db, player.id);
+  if (cd) {
+    const hours = Math.round(config.dodging.windowMs / 3600000);
+    throw new HttpError(403, `queue cooldown: ${cd.lapses} of your matches lapsed in the last ${hours} h because the room was never opened; `
+      + `you can queue again in ${Math.ceil((cd.untilMs - now()) / 60000)} min`);
+  }
+  // Casual pairs on the hidden casual rating; a pilot new to casual starts from their ranked rating.
+  const rating = m === 'casual' ? (player.casual_rating ?? player.rating) : player.rating;
+  db.prepare(`INSERT OR REPLACE INTO queue (player_id, rating, region, integrity_id, game_version, mode, joined_at) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+    .run(player.id, rating, reg, scan.id, scan.game_version, m, now());
   runMatchmaker(db);
   return queueStatus(db, player);
 }
@@ -187,17 +279,26 @@ function openMatchFor(db, playerId) {
 function queueStatus(db, player) {
   const m = openMatchFor(db, player.id);
   if (m) return { state: 'matched', match: matchView(db, m, player.id) };
+  // While queued, nothing about other pilots is shown: the opponent is only named once the match is created.
   const q = db.prepare('SELECT * FROM queue WHERE player_id = ?').get(player.id);
-  if (q) return { state: 'queued', waitingSec: Math.round((now() - q.joined_at) / 1000) };
+  if (q) return { state: 'queued', mode: q.mode, waitingSec: Math.round((now() - q.joined_at) / 1000) };
   return { state: 'idle' };
 }
 
-function windowFor(entry, t) {
-  const c = config.matchmaking;
+// Matching parameters of a queue: ranked uses the top-level values, casual its own looser ones.
+const queueParams = (mode) => {
+  const mm = config.matchmaking;
+  return mode === 'casual' ? { ...mm, ...mm.casual } : mm;
+};
+
+function windowFor(entry, t, c = config.matchmaking) {
   return Math.min(c.maxWindow, c.baseWindow + c.windowGrowthPerSec * ((t - entry.joined_at) / 1000));
 }
 
-// Pairs queued players. Tournament opponents are paired first, then rating-based ranked matches.
+const pairKey = (a, b) => (a < b ? `${a}:${b}` : `${b}:${a}`);
+
+// Pairs queued players. Tournament opponents are paired first, then rating-based ranked matches, then casual
+// matches on the hidden casual rating. The two queues never pair with each other.
 // Runs from the background tick and when someone joins, never on status polls.
 function runMatchmaker(db, t = now()) {
   return tx(db, () => {
@@ -216,48 +317,69 @@ function runMatchmaker(db, t = now()) {
     const openSeries = db.prepare(tournaments.OPEN_SERIES_SQL);
     const rulesOf = db.prepare('SELECT rules FROM tournaments WHERE id = ?');
 
-    // 1. Tournament series: any open series whose opponent is queued on the same build.
+    // 1. Tournament series: any open series whose opponent is queued (ranked) on the same build. Casual entries
+    //    never play event games.
     for (const e of entries) {
+      if (e.mode === 'casual') continue;
       const open = openSeries.all(e.player_id, e.player_id);
       if (open.length) seriesBound.add(e.player_id);
       if (taken.has(e.player_id)) continue;
       for (const s of open) {
         const opp = s.player_a === e.player_id ? s.player_b : s.player_a;
         const o = byId.get(opp);
-        if (!o || taken.has(opp) || o.game_version !== e.game_version) continue;
+        if (!o || o.mode === 'casual' || taken.has(opp) || o.game_version !== e.game_version) continue;
         const rules = { ...config.match.defaultRules, ...json(rulesOf.get(s.tournament_id).rules, {}) };
-        created.push(createMatch(db, s.player_a, s.player_b, rules, s.id, e.game_version));
+        created.push(createMatch(db, s.player_a, s.player_b, rules, s.id, e.game_version, 'ranked'));
         taken.add(e.player_id); taken.add(opp);
         break;
       }
     }
 
-    // 2. Ranked: closest rating inside both players' windows, same build, same region unless both waited long.
-    //    Candidates are found by binary search on a rating-sorted pool, so a big queue stays cheap.
-    const pool = entries.filter((e) => !taken.has(e.player_id) && !seriesBound.has(e.player_id))
-      .sort((x, y) => x.rating - y.rating || x.player_id - y.player_id);
-    const firstAtLeast = (r) => {
-      let lo = 0; let hi = pool.length;
-      while (lo < hi) { const mid = (lo + hi) >> 1; if (pool[mid].rating < r) lo = mid + 1; else hi = mid; }
-      return lo;
-    };
-    for (const a of entries) { // oldest first
-      if (taken.has(a.player_id) || seriesBound.has(a.player_id)) continue;
-      let best = null;
-      for (let i = firstAtLeast(a.rating - mm.maxWindow); i < pool.length && pool[i].rating <= a.rating + mm.maxWindow; i++) {
-        const b = pool[i];
-        if (b.player_id === a.player_id || taken.has(b.player_id) || b.game_version !== a.game_version) continue;
-        const gap = Math.abs(a.rating - b.rating);
-        const win = Math.max(windowFor(a, t), windowFor(b, t));
-        const longWait = t - a.joined_at > mm.longWaitMs && t - b.joined_at > mm.longWaitMs;
-        if (gap > win || (a.region !== b.region && !longWait)) continue;
-        if (!best || gap < best.gap) best = { b, gap };
-      }
-      if (best) {
-        created.push(createMatch(db, a.player_id, best.b.player_id, config.match.defaultRules, null, a.game_version));
-        taken.add(a.player_id); taken.add(best.b.player_id);
+    // Pilots who met recently (any mode, also event games) are paired again only if neither has anyone else.
+    const recent = new Set();
+    if (mm.rematch.windowMs > 0) {
+      for (const r of db.prepare('SELECT player_a, player_b FROM matches WHERE created_at >= ?').all(t - mm.rematch.windowMs)) {
+        recent.add(pairKey(r.player_a, r.player_b));
       }
     }
+
+    // 2. Ranked (while it is on), then casual: closest rating inside both players' windows, same mode, same build,
+    //    same region unless both waited long. Candidates are found by binary search on a rating-sorted pool, so a
+    //    big queue stays cheap. A first pass pairs fresh opponents only; a second pass pairs whoever is left with a
+    //    recent opponent once both have waited the extra time, so a rematch only happens when there is no one else.
+    const ladder = (mode) => {
+      const c = queueParams(mode);
+      const queued = entries.filter((e) => e.mode === mode && !seriesBound.has(e.player_id)); // oldest first
+      const pool = [...queued].sort((x, y) => x.rating - y.rating || x.player_id - y.player_id);
+      const firstAtLeast = (r) => {
+        let lo = 0; let hi = pool.length;
+        while (lo < hi) { const mid = (lo + hi) >> 1; if (pool[mid].rating < r) lo = mid + 1; else hi = mid; }
+        return lo;
+      };
+      for (const rematches of [false, true]) {
+        for (const a of queued) {
+          if (taken.has(a.player_id)) continue;
+          let best = null;
+          for (let i = firstAtLeast(a.rating - c.maxWindow); i < pool.length && pool[i].rating <= a.rating + c.maxWindow; i++) {
+            const b = pool[i];
+            if (b.player_id === a.player_id || taken.has(b.player_id) || b.game_version !== a.game_version) continue;
+            if (recent.has(pairKey(a.player_id, b.player_id))
+              && (!rematches || t - a.joined_at < mm.rematch.waitMs || t - b.joined_at < mm.rematch.waitMs)) continue;
+            const gap = Math.abs(a.rating - b.rating);
+            const win = Math.max(windowFor(a, t, c), windowFor(b, t, c));
+            const longWait = t - a.joined_at > c.longWaitMs && t - b.joined_at > c.longWaitMs;
+            if (gap > win || (a.region !== b.region && !longWait)) continue;
+            if (!best || gap < best.gap) best = { b, gap };
+          }
+          if (best) {
+            created.push(createMatch(db, a.player_id, best.b.player_id, config.match.defaultRules, null, a.game_version, mode));
+            taken.add(a.player_id); taken.add(best.b.player_id);
+          }
+        }
+      }
+    };
+    if (config.modes.ranked) ladder('ranked');
+    ladder('casual');
     if (taken.size) {
       const del = db.prepare('DELETE FROM queue WHERE player_id = ?');
       for (const id of taken) del.run(id);
@@ -266,29 +388,38 @@ function runMatchmaker(db, t = now()) {
   });
 }
 
-function createMatch(db, a, b, rules, seriesId, gameVersion) {
+function createMatch(db, a, b, rules, seriesId, gameVersion, mode = 'ranked') {
   const id = 'm_' + crypto.randomBytes(9).toString('base64url');
   // The host creates the private room in-game; alternate who hosts at random.
   const [host, guest] = crypto.randomInt(2) ? [a, b] : [b, a];
-  db.prepare(`INSERT INTO matches (id, player_a, player_b, rules, game_version, state, series_id, created_at)
-    VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)`).run(id, host, guest, JSON.stringify(rules), gameVersion, seriesId, now());
+  db.prepare(`INSERT INTO matches (id, player_a, player_b, rules, game_version, mode, state, series_id, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)`).run(id, host, guest, JSON.stringify(rules), gameVersion, mode, seriesId, now());
   return id;
+}
+
+// Rating changes as shown: none for casual matches (those move the hidden casual rating only), and none for a
+// pilot who hides their rating, except to that pilot.
+function deltaView(m, hideA, hideB, viewerId) {
+  if (m.rating_delta_a == null) return null;
+  return { host: hideA && viewerId !== m.player_a ? null : m.rating_delta_a, guest: hideB && viewerId !== m.player_b ? null : m.rating_delta_b };
 }
 
 function matchView(db, m, viewerId) {
   const pa = db.prepare('SELECT * FROM players WHERE id = ?').get(m.player_a);
   const pb = db.prepare('SELECT * FROM players WHERE id = ?').get(m.player_b);
   const view = {
-    id: m.id, state: m.state, rules: json(m.rules, {}), gameVersion: m.game_version, seriesId: m.series_id,
-    host: publicPlayer(pa), guest: publicPlayer(pb),
+    id: m.id, state: m.state, mode: m.mode || 'ranked', rules: json(m.rules, {}), gameVersion: m.game_version, seriesId: m.series_id,
+    host: publicPlayer(pa, { self: viewerId === m.player_a }), guest: publicPlayer(pb, { self: viewerId === m.player_b }),
     score: m.score_a == null ? null : { host: m.score_a, guest: m.score_b },
-    winner: m.winner, ratingDelta: m.rating_delta_a == null ? null : { host: m.rating_delta_a, guest: m.rating_delta_b },
+    winner: m.winner, ratingDelta: deltaView(m, !!pa?.hide_rating, !!pb?.hide_rating, viewerId),
     flags: json(m.flags, []), createdAt: m.created_at, verifiedAt: m.verified_at,
   };
-  // The room code is only revealed to the two participants.
+  // The room code and the link ids are only revealed to the two participants.
   if (viewerId === m.player_a || viewerId === m.player_b) {
     view.lobbyCode = m.lobby_code;
     view.role = viewerId === m.player_a ? 'host' : 'guest';
+    const host = viewerId === m.player_a;
+    view.link = { self: (host ? m.link_a : m.link_b) || null, peer: (host ? m.link_b : m.link_a) || null };
   }
   return view;
 }
@@ -307,6 +438,31 @@ function setLobby(db, player, matchId, lobbyCode) {
   if (typeof lobbyCode !== 'string' || !/^[A-Za-z0-9_-]{3,64}$/.test(lobbyCode)) throw new HttpError(400, 'invalid lobby code');
   db.prepare("UPDATE matches SET lobby_code = ?, state = 'live', live_at = ? WHERE id = ?").run(lobbyCode, now(), matchId);
   return getMatch(db, matchId, player.id);
+}
+
+// The two PCs' link (the mod's relay-only Steam P2P, 2026-11-19): each pilot's mod posts its own SteamID64 for the
+// match; each of the two then sees the other's (matchView), nobody else sees either. Valve's relays carry the traffic,
+// so neither pilot learns the other's IP address. The host's post opens the match, as the room code does. An id
+// can't change once posted (a restart posts the same one), and both pilots on one Steam account are refused.
+const STEAM_ID64 = /^7656119\d{10}$/;
+function setLink(db, player, matchId, steamId) {
+  const m = db.prepare('SELECT * FROM matches WHERE id = ?').get(String(matchId));
+  if (!m) throw new HttpError(404, 'match not found');
+  const side = m.player_a === player.id ? 'a' : m.player_b === player.id ? 'b' : null;
+  if (!side) throw new HttpError(403, 'not a player of this match');
+  if (m.state !== 'pending' && m.state !== 'live') throw new HttpError(409, 'match already over');
+  if (typeof steamId !== 'string' || !STEAM_ID64.test(steamId)) throw new HttpError(400, 'invalid steam id');
+  const mine = side === 'a' ? m.link_a : m.link_b;
+  const other = side === 'a' ? m.link_b : m.link_a;
+  if (mine === steamId) return getMatch(db, m.id, player.id);
+  if (mine) throw new HttpError(409, 'link already set');
+  if (other === steamId) throw new HttpError(400, 'both pilots on one Steam account');
+  if (side === 'a') {
+    db.prepare(`UPDATE matches SET link_a = ?, state = 'live', live_at = COALESCE(live_at, ?) WHERE id = ?`).run(steamId, now(), m.id);
+  } else {
+    db.prepare('UPDATE matches SET link_b = ? WHERE id = ?').run(steamId, m.id);
+  }
+  return getMatch(db, m.id, player.id);
 }
 
 // ---------- match reports ----------
@@ -354,6 +510,20 @@ function submitReport(db, player, matchId, report) {
 function resolveMatch(db, m, reports) {
   const repA = json(reports.find((r) => r.player_id === m.player_a).report);
   const repB = json(reports.find((r) => r.player_id === m.player_b).report);
+  // The game's own deathmatch (RVNG runtime 0.4.4): decided by score; its own checks (matchlog.reconcileNativeDm).
+  if (repA.format === 'native_dm' || repB.format === 'native_dm') {
+    const res = matchlog.reconcileNativeDm(repA, repB, {
+      rules: json(m.rules, {}), playerA: m.player_a, playerB: m.player_b, minDurationSec: config.match.minDurationSec,
+    });
+    if (res.flags.length) {
+      db.prepare("UPDATE matches SET state = 'disputed', score_a = ?, score_b = ?, flags = ? WHERE id = ?")
+        .run(res.scoreA, res.scoreB, JSON.stringify(res.flags), m.id);
+      return;
+    }
+    db.prepare("UPDATE matches SET flags = '[]' WHERE id = ?").run(m.id);
+    applyResult(db, m, res.outcome, res.scoreA, res.scoreB, repA, repB);
+    return;
+  }
   // The build comes from both players' clean scans (stored on the match), never from the logs themselves.
   const baseline = baselineFor(db, m.game_version, { activeOnly: false });
   const extra = [];
@@ -388,6 +558,7 @@ function applyResult(db, m, outcome, scoreA, scoreB, repA, repB) {
   const pa = db.prepare('SELECT * FROM players WHERE id = ?').get(m.player_a);
   const pb = db.prepare('SELECT * FROM players WHERE id = ?').get(m.player_b);
   const s = outcome === 'a' ? 1 : outcome === 'b' ? 0 : 0.5;
+  if (m.mode === 'casual') return applyCasualResult(db, m, pa, pb, s, scoreA, scoreB);
   const d = eloUpdate(pa, pb, s);
   const ka = repA ? repA.self.kills : scoreA; const da = repA ? repA.self.deaths : scoreB;
   const kb = repB ? repB.self.kills : scoreB; const dbb = repB ? repB.self.deaths : scoreA;
@@ -402,9 +573,27 @@ function applyResult(db, m, outcome, scoreA, scoreB, repA, repB) {
   if (m.series_id && winner) tournaments.recordSeriesResult(db, m.series_id, winner);
 }
 
+// A verified casual match moves only the hidden casual rating (seeded from the ranked rating the first time a
+// pilot plays casual). Ranked rating, record, K/D and events are untouched; the change is kept on the match
+// (casual_delta_*) so a void can undo it, and is never shown.
+function applyCasualResult(db, m, pa, pb, s, scoreA, scoreB) {
+  const side = (p) => ({ rating: p.casual_rating ?? p.rating, games: p.casual_games || 0 });
+  const d = eloUpdate(side(pa), side(pb), s);
+  const upd = db.prepare('UPDATE players SET casual_rating = COALESCE(casual_rating, rating) + ?, casual_games = casual_games + 1 WHERE id = ?');
+  upd.run(d.a, pa.id); upd.run(d.b, pb.id);
+  const winner = s === 1 ? pa.id : s === 0 ? pb.id : null;
+  db.prepare(`UPDATE matches SET state = 'verified', winner = ?, score_a = ?, score_b = ?, casual_delta_a = ?, casual_delta_b = ?,
+    verified_at = ? WHERE id = ?`).run(winner, scoreA, scoreB, d.a, d.b, now(), m.id);
+}
+
 // Undo a verified result: rating deltas, record, credited K/D and the series game. peak_rating is not
 // recomputed (see docs/SECURITY.md).
 function revertResult(db, m) {
+  if (m.mode === 'casual') {
+    const upd = db.prepare('UPDATE players SET casual_rating = casual_rating - ?, casual_games = MAX(0, casual_games - 1) WHERE id = ?');
+    upd.run(m.casual_delta_a || 0, m.player_a); upd.run(m.casual_delta_b || 0, m.player_b);
+    return undefined;
+  }
   const series = m.series_id && m.winner ? tournaments.revertSeriesResult(db, m.series_id, m.winner) : undefined;
   const s = m.winner == null ? 0.5 : m.winner === m.player_a ? 1 : 0;
   const upd = db.prepare(`UPDATE players SET rating = rating - ?, wins = MAX(0, wins - ?), losses = MAX(0, losses - ?),
@@ -431,7 +620,8 @@ function resolveDispute(db, matchId, { winner, scoreHost = 0, scoreGuest = 0, vo
         ...(m.state === 'verified' ? { reverted: { winner: m.winner, score: [m.score_a, m.score_b], ratingDelta: [m.rating_delta_a, m.rating_delta_b] } } : {}),
         ...(series ? { series } : {}) }];
       db.prepare(`UPDATE matches SET state = 'void', winner = NULL, score_a = NULL, score_b = NULL, rating_delta_a = NULL,
-        rating_delta_b = NULL, kills_a = NULL, deaths_a = NULL, kills_b = NULL, deaths_b = NULL, flags = ? WHERE id = ?`)
+        rating_delta_b = NULL, casual_delta_a = NULL, casual_delta_b = NULL, kills_a = NULL, deaths_a = NULL, kills_b = NULL,
+        deaths_b = NULL, flags = ? WHERE id = ?`)
         .run(JSON.stringify(flags), m.id);
     } else {
       if (!open) throw new HttpError(409, `match is ${m.state}`);
@@ -453,8 +643,15 @@ function sweepStaleMatches(db, t = now()) {
     AND (SELECT MIN(received_at) FROM match_reports r WHERE r.match_id = m.id) < ?`).all(t - c.reportWindowMs);
   const upd = db.prepare("UPDATE matches SET state = 'disputed', flags = ?, swept_at = ? WHERE id = ?");
   for (const { id } of stale) upd.run(JSON.stringify([{ code: 'missing_opponent_report' }]), t, id);
-  // Rooms never created within the window are voided.
-  db.prepare("UPDATE matches SET state = 'void' WHERE state = 'pending' AND created_at < ?").run(t - c.reportWindowMs);
+  // Rooms never created within the window are voided. Only the host can open the room, so the lapse is the
+  // host's: it is recorded, and repeated lapses mean a queue cooldown (config.dodging). A guest who never joins an
+  // opened room cannot be told apart from a host who posted a fake code, so that is not counted.
+  tx(db, () => {
+    const lapsed = db.prepare("SELECT id, player_a FROM matches WHERE state = 'pending' AND created_at < ?").all(t - c.reportWindowMs);
+    const voidIt = db.prepare("UPDATE matches SET state = 'void' WHERE id = ? AND state = 'pending'");
+    const record = db.prepare('INSERT OR IGNORE INTO lapses (match_id, player_id, at) VALUES (?, ?, ?)');
+    for (const m of lapsed) if (voidIt.run(m.id).changes) record.run(m.id, m.player_a, t);
+  });
   // Rooms that went live but got no report from anyone are closed once the match must be over, so a guest who
   // never joined (or a fake room code) cannot lock both pilots out of the queue. A ranked room is voided. An
   // event game goes to an admin instead: voiding it would hand the series a rematch, and a pilot who is losing
@@ -474,17 +671,18 @@ function sweepStaleMatches(db, t = now()) {
   return stale.length + closed;
 }
 
-function recentMatches(db, { playerId, state, limit = 50 } = {}) {
+function recentMatches(db, { playerId, state, limit = 50, viewerId } = {}) {
   const where = []; const args = [];
   if (playerId) { where.push('(m.player_a = ? OR m.player_b = ?)'); args.push(playerId, playerId); }
   if (typeof state === 'string' && state) { where.push('m.state = ?'); args.push(state); }
-  const rows = db.prepare(`SELECT m.*, pa.name a_name, pb.name b_name FROM matches m
-    JOIN players pa ON pa.id = m.player_a JOIN players pb ON pb.id = m.player_b
+  const rows = db.prepare(`SELECT m.*, pa.name a_name, pb.name b_name, pa.role a_role, pb.role b_role, pa.hide_rating a_hide, pb.hide_rating b_hide
+    FROM matches m JOIN players pa ON pa.id = m.player_a JOIN players pb ON pb.id = m.player_b
     ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY m.created_at DESC LIMIT ?`).all(...args, clampInt(limit, 50, 1, 200));
   return rows.map((m) => ({
-    id: m.id, state: m.state, host: { id: m.player_a, name: m.a_name }, guest: { id: m.player_b, name: m.b_name },
+    id: m.id, state: m.state, mode: m.mode || 'ranked',
+    host: { id: m.player_a, name: m.a_name, role: m.a_role || 'player' }, guest: { id: m.player_b, name: m.b_name, role: m.b_role || 'player' },
     score: m.score_a == null ? null : { host: m.score_a, guest: m.score_b }, winner: m.winner,
-    ratingDelta: m.rating_delta_a == null ? null : { host: m.rating_delta_a, guest: m.rating_delta_b },
+    ratingDelta: deltaView(m, !!m.a_hide, !!m.b_hide, viewerId),
     seriesId: m.series_id, flags: json(m.flags, []), createdAt: m.created_at,
   }));
 }
@@ -659,10 +857,90 @@ function retireMods(db, { name, version = '', ids } = {}) {
   return listApprovedMods(db);
 }
 
+// 'active' lets a pending (invite-only) sign-up in; 'pending' takes an account back out of play.
 function setPlayerStatus(db, id, status) {
-  if (!['active', 'flagged', 'banned'].includes(status)) throw new HttpError(400, 'bad status');
-  db.prepare('UPDATE players SET status = ? WHERE id = ?').run(status, id);
+  if (!['active', 'pending', 'flagged', 'banned'].includes(status)) throw new HttpError(400, 'status must be active, pending, flagged or banned');
+  if (!db.prepare('UPDATE players SET status = ? WHERE id = ?').run(status, id).changes) throw new HttpError(404, 'player not found');
   if (status !== 'active') db.prepare('DELETE FROM queue WHERE player_id = ?').run(id);
+}
+
+// ---------- player reports ----------
+// A pilot reports another pilot to the admins. Reports never change a rating, record or status by themselves.
+// Limits: no self-reports, the reported pilot must exist, a match must be one the two played against each other,
+// one open report per reporter, reported pilot and match, and config.reports.maxPerWindow per reporter.
+function fileReport(db, player, body = {}) {
+  requireLetIn(player);
+  const c = config.reports;
+  if (!isPlainObject(body)) throw new HttpError(400, 'report must be an object');
+  const { playerId, matchId, reason } = body;
+  if (!Number.isSafeInteger(playerId) || playerId < 1) throw new HttpError(400, 'playerId must be the id of the pilot you report');
+  if (playerId === player.id) throw new HttpError(400, 'you cannot report yourself');
+  if (typeof reason !== 'string' || !c.reasons.includes(reason)) throw new HttpError(400, `reason must be one of: ${c.reasons.join(', ')}`);
+  const raw = body.details ?? '';
+  // Multi-line text is fine here (tabs and line breaks), other control characters are not.
+  const details = typeof raw === 'string' ? raw.replace(/\r\n?/g, '\n') : null;
+  if (details == null || details.length > c.maxDetails || UNSAFE_TEXT.test(details.replace(/[\n\t]/g, ' '))) {
+    throw new HttpError(400, `details must be plain text of at most ${c.maxDetails} characters`);
+  }
+  if (matchId != null && (typeof matchId !== 'string' || matchId.length > 64)) throw new HttpError(400, 'matchId must be a match id');
+  return tx(db, () => {
+    if (!db.prepare('SELECT 1 FROM players WHERE id = ?').get(playerId)) throw new HttpError(404, 'player not found');
+    if (matchId != null) {
+      const m = db.prepare('SELECT player_a, player_b FROM matches WHERE id = ?').get(matchId);
+      if (!m) throw new HttpError(404, 'match not found');
+      const pair = [m.player_a, m.player_b];
+      if (!pair.includes(player.id) || !pair.includes(playerId)) throw new HttpError(403, 'you can only attach a match you played against this pilot');
+    }
+    const t = now();
+    const recent = db.prepare('SELECT COUNT(*) c, MIN(created_at) first FROM player_reports WHERE reporter_id = ? AND created_at > ?').get(player.id, t - c.windowMs);
+    if (recent.c >= c.maxPerWindow) {
+      const per = c.windowMs === 3600000 ? 'hour' : `${Math.round(c.windowMs / 60000)} min`;
+      throw new HttpError(429, `too many reports: at most ${c.maxPerWindow} per ${per}; try again in ${Math.ceil((recent.first + c.windowMs - t) / 60000)} min`);
+    }
+    if (db.prepare(`SELECT 1 FROM player_reports WHERE reporter_id = ? AND reported_id = ? AND COALESCE(match_id, '') = ? AND state = 'open'`)
+      .get(player.id, playerId, matchId ?? '')) {
+      throw new HttpError(409, matchId != null ? 'you already have an open report on this pilot for this match' : 'you already have an open report on this pilot');
+    }
+    const r = db.prepare('INSERT INTO player_reports (reporter_id, reported_id, match_id, reason, details, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(player.id, playerId, matchId ?? null, reason, details.trim(), t);
+    return { id: Number(r.lastInsertRowid), state: 'open', reportedId: playerId, matchId: matchId ?? null, reason, createdAt: t };
+  });
+}
+
+const REPORT_STATES = ['open', 'resolved', 'dismissed'];
+const reportView = (r) => ({
+  id: r.id, state: r.state, reason: r.reason, details: r.details, matchId: r.match_id, resolution: r.resolution,
+  reporter: { id: r.reporter_id, name: r.reporter_name, status: r.reporter_status },
+  reported: { id: r.reported_id, name: r.reported_name, status: r.reported_status, openReports: r.reported_open },
+  createdAt: r.created_at, closedAt: r.closed_at,
+});
+const REPORT_SQL = `SELECT r.*, a.name reporter_name, a.status reporter_status, b.name reported_name, b.status reported_status,
+    (SELECT COUNT(*) FROM player_reports o WHERE o.reported_id = r.reported_id AND o.state = 'open') reported_open
+  FROM player_reports r JOIN players a ON a.id = r.reporter_id JOIN players b ON b.id = r.reported_id`;
+
+// Admin: reports by state (open by default, oldest first so nothing waits forever; closed ones newest first).
+function listReports(db, { state = 'open', limit = 100 } = {}) {
+  const st = typeof state === 'string' && state ? state : 'open';
+  if (st !== 'all' && !REPORT_STATES.includes(st)) throw new HttpError(400, `state must be one of: ${[...REPORT_STATES, 'all'].join(', ')}`);
+  const where = st === 'all' ? '' : 'WHERE r.state = ?';
+  const order = st === 'open' ? 'r.id ASC' : 'r.id DESC';
+  return db.prepare(`${REPORT_SQL} ${where} ORDER BY ${order} LIMIT ?`).all(...(st === 'all' ? [] : [st]), clampInt(limit, 100, 1, 500)).map(reportView);
+}
+
+// Admin: close a report as resolved (acted on) or dismissed, with an optional note. Any action against the pilot
+// (status, match void) is taken separately: closing a report changes nothing else.
+function closeReport(db, id, { state, note = '' } = {}) {
+  if (!['resolved', 'dismissed'].includes(state)) throw new HttpError(400, 'state must be resolved or dismissed');
+  if (typeof note !== 'string' || note.length > config.reports.maxDetails || UNSAFE_TEXT.test(note)) {
+    throw new HttpError(400, `note must be one line of plain text, at most ${config.reports.maxDetails} characters`);
+  }
+  return tx(db, () => {
+    const r = db.prepare('SELECT * FROM player_reports WHERE id = ?').get(id);
+    if (!r) throw new HttpError(404, 'report not found');
+    if (r.state !== 'open') throw new HttpError(409, `report is already ${r.state}`);
+    db.prepare('UPDATE player_reports SET state = ?, resolution = ?, closed_at = ? WHERE id = ?').run(state, note.trim(), now(), id);
+    return reportView(db.prepare(`${REPORT_SQL} WHERE r.id = ?`).get(id));
+  });
 }
 
 function integrityLog(db, { limit = 50, verdict } = {}) {
@@ -679,13 +957,24 @@ function stats(db) {
     matches: db.prepare("SELECT COUNT(*) c FROM matches WHERE state = 'verified'").get().c,
     inQueue: db.prepare('SELECT COUNT(*) c FROM queue').get().c,
     live: db.prepare("SELECT COUNT(*) c FROM matches WHERE state IN ('pending','live','awaiting_reports')").get().c,
+    // Which queues this server runs (the ranked ladder can be switched off with RVNG_RANKED=0).
+    queues: { ranked: !!config.modes.ranked, casual: true },
   };
 }
 
+// Admin: a match with both pilots' logs as they were sent (the admin page's dispute view: what each log said).
+function adminMatch(db, id) {
+  const m = getMatch(db, id);
+  const reports = db.prepare('SELECT player_id, report, received_at FROM match_reports WHERE match_id = ? ORDER BY received_at')
+    .all(String(id)).map((r) => ({ side: r.player_id === m.host.id ? 'host' : 'guest', receivedAt: r.received_at, report: json(r.report, null) }));
+  return { ...m, reports };
+}
+
 module.exports = {
-  registerPlayer, leaderboard, playerProfile, publicPlayer,
+  registerPlayer, leaderboard, playerProfile, publicPlayer, updateSettings, setPlayerCard, adminPlayers,
+  fileReport, listReports, closeReport, lapseCooldown, PENDING_MESSAGE,
   submitIntegrity, joinQueue, leaveQueue, queueStatus, runMatchmaker,
-  getMatch, setLobby, submitReport, resolveDispute, sweepStaleMatches, recentMatches,
+  getMatch, setLobby, setLink, submitReport, resolveDispute, sweepStaleMatches, recentMatches,
   putBaseline, setBaselineActive, addApprovedMods, listApprovedMods, removeApprovedMod, retireMods, capFindings,
-  setPlayerStatus, integrityLog, stats,
+  setPlayerStatus, integrityLog, stats, adminMatch,
 };

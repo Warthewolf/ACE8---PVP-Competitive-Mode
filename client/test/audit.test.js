@@ -94,12 +94,15 @@ test('bridge keeps result.json and lobby.json until the server accepts them', as
   const game = tree({ 'ACE8/Content/Paks/a.pak': 'x' });
   try {
     let reportStatus = 503;
+    let linkStatus = 503;
+    const linkBodies = [];
     const srv = fakeServer({
       'POST /api/matches/m_1/report': () => {
         if (reportStatus) throw httpError(reportStatus, reportStatus === 409 ? 'report already submitted' : undefined);
         return { state: 'verified' };
       },
       'POST /api/matches/m_1/lobby': () => { throw httpError(409, 'match already started'); },
+      'POST /api/matches/m_1/link': (b) => { linkBodies.push(b); if (linkStatus) throw httpError(linkStatus); return { ...MATCH }; },
     });
     const bridge = createBridge({ game, call: srv.call });
     const f = (n) => path.join(bridge.dir, n);
@@ -127,6 +130,22 @@ test('bridge keeps result.json and lobby.json until the server accepts them', as
     writeJson(f('lobby.json'), { matchId: 'm_1', lobbyCode: 'ROOM' });
     await bridge.tick();
     assert.ok(!fs.existsSync(f('lobby.json')), 'a 409 on the lobby means it was already posted');
+
+    writeJson(f('link.json'), { matchId: 'm_1', steamId: '76561190000000202' });
+    await assert.rejects(bridge.tick(), /503/);
+    assert.ok(fs.existsSync(f('link.json')), 'link.json kept after a 5xx');
+    linkStatus = 0;
+    await bridge.tick();
+    assert.ok(!fs.existsSync(f('link.json')), 'link.json deleted once the server took it');
+    assert.deepEqual(linkBodies.at(-1), { steamId: '76561190000000202' }, 'the SteamID sent as a string');
+    linkStatus = 409;
+    writeJson(f('link.json'), { matchId: 'm_1', steamId: '76561190000000202' });
+    await bridge.tick();
+    assert.ok(!fs.existsSync(f('link.json')), 'a 409 on the link: already set or the match is over');
+    linkStatus = 400;
+    writeJson(f('link.json'), { matchId: 'm_1', steamId: 'x' });
+    await bridge.tick().catch(() => {});
+    assert.ok(fs.existsSync(f('link.json.failed')), 'a 400 is a permanent rejection');
   } finally { fs.rmSync(game, { recursive: true }); }
 });
 

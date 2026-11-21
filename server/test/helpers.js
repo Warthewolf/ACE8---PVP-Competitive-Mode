@@ -1,5 +1,7 @@
 'use strict';
 process.env.ADMIN_TOKEN = 'test-admin';
+// (first: it points require('express') at worker/express.js before src/app.js loads)
+if (process.env.RVNG_TEST_WORKER === '1') require('./worker-env');
 const config = require('../src/config');
 // Tests scan and register many times in quick succession.
 config.integrity.minIntervalMs = 0;
@@ -17,9 +19,13 @@ const MOD_FILE = { path: 'ACE8/Binaries/Win64/ue4ss/Mods/ProjectRVNG/Scripts/mai
 const AIRCRAFT = { f22a: { maxSpeed: 2400, turnRate: 30, hp: 100 }, su57: { maxSpeed: 2450, turnRate: 32, hp: 100 } };
 
 async function setup() {
-  const db = openDb(':memory:');
+  // RVNG_TEST_WORKER=1: the same tests through the Cloudflare build (worker/express.js and worker/sqlstore.js on a
+  // stand-in for the Durable Object's SQLite), test/worker-env.js
+  const viaWorker = process.env.RVNG_TEST_WORKER === '1';
+  const db = viaWorker ? require('./worker-env').workerDb() : openDb(':memory:');
   const app = createApp({ db });
-  const server = await new Promise((r) => { const s = app.listen(0, () => r(s)); });
+  const server = viaWorker ? await require('./worker-env').listen(app)
+    : await new Promise((r) => { const s = app.listen(0, () => r(s)); });
   const url = `http://127.0.0.1:${server.address().port}`;
   const admin = async (method, path, body) => {
     const res = await fetch(url + path, { method, headers: { authorization: 'Bearer test-admin', 'content-type': 'application/json' }, body: body && JSON.stringify(body) });

@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex">
+  <title>RVNG Admin</title>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@300;400;600&family=Jost:wght@400;500;600&family=Share+Tech+Mono&display=swap">
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/admin.js" defer></script>
+</head>
+<body class="admin">
+  <header class="gnav">
+    <a class="logo" href="/">PROJECT <span>RVNG</span></a>
+    <nav aria-label="Admin">
+      <a href="#disputes" data-tab="disputes">Disputes</a>
+      <a href="#players" data-tab="players">Players</a>
+      <a href="#reports" data-tab="reports">Reports</a>
+      <a href="#scans" data-tab="scans">Scans</a>
+      <a href="#build" data-tab="build">Build &amp; mods</a>
+    </nav>
+    <div class="side"><button class="btn-line" type="button" id="signout" hidden>Sign out</button></div>
+  </header>
+
+  <main class="sheet admin-sheet">
+    <form id="login" class="admin-login" hidden>
+      <div class="ttl"><h1>Admin</h1></div>
+      <label>Admin token <input id="token" type="password" autocomplete="current-password" required></label>
+      <button class="btn-line" type="submit">Sign in</button>
+      <p class="admin-hint">The token is the server's ADMIN_TOKEN. It's kept only in this browser tab, and sent only to this server.</p>
+    </form>
+    <p id="msg" class="admin-msg" role="status"></p>
+    <div id="panel"></div>
+  </main>
+</body>
+</html>

@@ -1,0 +1,2084 @@
+[
+ {
+  "key": "matching",
+  "title": "Matchmaking screen",
+  "map": {
+   "screen": "Matchmaking group, key \"matching\": ELiveNUIMenuType::Matching (0x18) = WBP_Menu_Matching_000, the \"SET SELECT\" aircraft-set screen. Also covers the native search driver behind it (ULiveNUIMatchMaker → NetworkManager → Chronicle) and ModeSelect (WBP_Menu_Mode_000).",
+   "summary": "The \"Matching\" menu is not a search screen. It is the game's SET SELECT screen [V]. It opens after a match is found: each player picks an aircraft set against a countdown, waits for the others, and then sorties. The screen is the native class ULiveNUIMenuMatchingRootWidget, and its Blueprint only holds the layout [V]. It has offline branches for almost everything. Only two things reach the online side: an \"I am in-game\" status to the Strix Messenger (skipped when the messenger client is null), and the aircraft-set message to the Strix room (only sent when StrixManager+0x1fa is set; otherwise the pick is written locally). The one real blocker is in its tick: state 3 waits for StrixManager+0x1fa, unless the mission's game mode is OnlineTutorials, so offline it stalls on \"waiting\" [V]. The search itself (ULiveNUIMatchMaker → NetworkManager 0x1474af800 → Chronicle WebSocket) must not run offline: D5 and D7 do not block it [I]. But the MatchMaker's result call 0x1477e80d0 can be driven directly; the game's own OnlineTutorials path already does this, and it is what opens SET SELECT [V]. Verdict: RVNG can reuse this screen with a few hooks (open it via the result call, relay the pick, release the state-3 wait). The native search must be replaced by RVNG's own queue and its own \"searching\" display. Correction to earlier notes: 0x1474af800 starts a search; it is not CancelMatch. The real cancel is NetworkManager 0x1474b1180 [V].",
+   "nativeClasses": [
+    {
+     "name": "ULiveNUIMenuMatchingRootWidget (/Script/LiveLobby; parent of WBP_Menu_Matching_000_C)",
+     "label": "[V] parent class from the package import map. Vtable 0x14cc652a0 confirmed: the gen.cpp destructor 0x1480d8750 (right after Z_Construct 0x1480d8720) installs it. Size 0x540; constructor 0x1480db1b0 jumps into VM-protected code. Fields: InitSortieTimerValue +0x468, footer +0x4a0, ListCategory +0x4a8, Description +0x4b0, Time_000 +0x4b8, PreviewModeAll +0x4e0, PreviewParty +0x4e8, OpenStepProcessor +0x538, state byte +0x4f9, elapsed +0x4fc, mission +0x500, airset array +0x508 (stride 0x88), airset ids +0x518, default id +0x528, tab +0x4fa",
+     "vtable": "0x14cc652a0",
+     "keyFunctions": [
+      "setup (vslot 0x4b8) 0x148185530: loads airsets, sets timer header, binds MissionRoomMemberManager+0xf0, sends Strix Messenger status",
+      "cleanup (vslot 0x4c0) 0x148185e00: calls MRMM 0x147491760 with 'MatchingRootWidget Cleanup'",
+      "tick (vslot 0x518) 0x1481851f0, state machine on +0x4f9: 1 = selecting (auto-decides when the timer ends), 3 = waiting for room (0x14818538b), 4 = InitSortieTimerValue delay, 5 = close, 6 = failed",
+      "pre-tick 0x148189fd0: if UDM+0xed4 != 0, go to state 6 and show the failure dialog 0x14818a410",
+      "state 1 is set by open-step lambdas 0x1481ac1a0 / 0x1481ac200",
+      "decide airset 0x148189d80 (sets state 3, shows the 'Waiting' description); also called from the list callback 0x1481b11b4",
+      "apply airset 0x14818a8c0: writes MRMM selector; in a room → 0x14749b0b0 (AircraftSelect message), else → local 0x147491460",
+      "input (vslot 0x4f8) 0x148189600; tab cycle 0x14818a730",
+      "close (vslot 0x528) 0x1481861e0 → 0x148188300",
+      "open sequence (vslot 0x570) 0x148186e70; IsOnline helper 0x14818a6d0 (StrixManager+0x1fa) picks the online/offline branches"
+     ]
+    },
+    {
+     "name": "ULiveNUILobbyPartManager (/Script/Live)",
+     "label": "[V] StaticClass 0x146f3a700, constructor 0x146f3a930. Fields: MenuManager +0x548, MatchingStepProcessor +0x560, MatchMaker +0x570, MatchWidgetHelper +0x578, lobby state +0x680. Listener sub-object +0x4a8 (vtable 0x14c8fead0); 0x1477e9b54 stores it into MatchMaker+0x40",
+     "vtable": "0x14c8fe4d0",
+     "keyFunctions": [
+      "listener slot +0x10 0x1477f3a20 = on match result: result 0 → 0x1477f2c40 then starts +0x560; results 1 and 2 → 0x1477ec840",
+      "0x1477f2c40 builds the MatchingStepProcessor steps",
+      "step 0x1477f3640: sets +0x680 = 7, then MenuManager(+0x548) 0x14767edb0(mm, 0x18 Matching, 0, 0)",
+      "getter 0x14757e510 (via NUIManager GI+0x980, class-checked)"
+     ]
+    },
+    {
+     "name": "ULiveNUIMatchMaker (/Script/Live)",
+     "label": "[V] StaticClass 0x146f3a5a0; constructor 0x146f3ef50 sets +0x38 = -1. No virtual overrides. Fields: ForceAllowSortieGameModeList +0x28, state +0x38, sub-state +0x3c, listener +0x40, flags +0x48/+0x49/+0x4a, handle on NM+0x5f8 at +0x50. Class identity of the functions is [I] from the field layout",
+     "vtable": "0x14c8fd838",
+     "keyFunctions": [
+      "update 0x1477e74d0 (state +0x38: 0 → start; 233; 234 → wait; 236 → wait/cancel)",
+      "start 0x1477e77d0: UDM+0xed8 = now; returns early if mode == OnlineTutorials (0x1477e7900); binds error callback on NM+0x5f8; UDM+0xed3 = 1; calls NM 0x1474af800",
+      "progress 0x1477e7d90 (sub-state +0x3c: 237 controller alive, 238/239 waiting for room, 240 waiting for selector count)",
+      "finish 0x1477e80d0(mm, {u8 result, int code}): UDM+0xed3 = 0, then listener+0x10",
+      "error callback 0x1477e7cc0: UDM+0xed4 = code, then finish {2, code}"
+     ]
+    },
+    {
+     "name": "ULiveNetworkManager (GI+0x928), matchmaking part",
+     "label": "[V] addresses; names [I]",
+     "keyFunctions": [
+      "0x1474af800 start-search request (earlier notes called it CancelMatch; it is not). Its 'CancelMatch' text only labels the branch taken when a Game controller already exists (0x1474b1410, code 0x10c8e1)",
+      "0x1474b0980 → 0x1474b00d0 builds the apply arguments, gets the controller, starts the RTT probe",
+      "0x1474af750 = does a Game controller exist (via 0x14748cc20)",
+      "0x1474b1180 real cancel",
+      "0x1474b22bc ConfirmMatch caller",
+      "0x1474ae800 AircraftSelectStart receiver",
+      "0x1474b2310 SetConfirmed (from earlier docs)"
+     ]
+    },
+    {
+     "name": "ULiveMatchmakerManager (GI+0x918) / ULiveMatchmakerClientController",
+     "label": "[V] Manager StaticClass 0x146ea60e0, controller StaticClass 0x146ea4350 (both constructors VM-protected). Map at manager+0x118; controller+0x40 = UChronicleMatchmakerClient",
+     "keyFunctions": [
+      "find controller 0x14748cc20",
+      "create controller 0x14748cb00",
+      "cancel by type 0x14748d220",
+      "controller cancel 0x14748bc90 → 0x145401600 or Close 0x145402150",
+      "controller connect/apply variants 0x14748ae00 / 0x14748b4c0 / 0x14748b9c0 → 0x145401040"
+     ]
+    },
+    {
+     "name": "UChronicleMatchmakerClient (Chronicle plugin)",
+     "label": "[V] StaticClass 0x1453fa680, constructor 0x1453ffde0; native name/thunk table at 0x14bfde190",
+     "vtable": "0x14bfdda00",
+     "keyFunctions": [
+      "WebSocket connect/send 0x145401040 ('WebSockets', 'wss', 'matchmaking')",
+      "CancelMatch 0x145401600",
+      "ConfirmMatch 0x1454019d0",
+      "StopWaiting 0x145401d90",
+      "GetAllMasterServerRTTs 0x1454004d0 [I: first jump of thunk 0x1453fc060]"
+     ]
+    },
+    {
+     "name": "ULiveNUIMenuModeSelectWidget (/Script/Live; parent of WBP_Menu_Mode_000_C = ModeSelect, title 'MODE SELECT')",
+     "label": "[V] parent class and header only; its decide path was not traced",
+     "keyFunctions": []
+    },
+    {
+     "name": "ULiveNUIMatchWidgetHelper",
+     "label": "[V] maps ELiveRequestMatchingError to text ids (MatchingRequestErrorTextIdMap +0x38)",
+     "vtable": "0x14c8fb688",
+     "keyFunctions": []
+    },
+    {
+     "name": "BP_GFL_Matching_C",
+     "label": "[V] empty subclass of ULiveNUIKeyGuideFooterLayout (no properties, no graph)",
+     "keyFunctions": []
+    }
+   ],
+   "howOpened": "[V] WBP_NUILobbyMenuManager (ULiveNUIMenuManager) has a MenuParamMap entry ELiveNUIMenuType::Matching (0x18) → /Game/OnlineMode/UI/NUI/Matching/WBP_Menu_Matching_000, header \"SET SELECT\". It also has ModeSelect → /Game/OnlineMode/UI/NUI/Mode/WBP_Menu_Mode_000, header \"MODE SELECT\".\n\nNative chain [V]:\n1. The MatchMaker reports success with 0x1477e80d0(mm, {0, 0}).\n2. That calls the lobby part manager's listener 0x1477f3a20.\n3. The listener calls 0x1477f2c40, which fills the MatchingStepProcessor (LobbyPartManager+0x560), and starts it.\n4. Step 0x1477f3640 calls MenuManager(+0x548) 0x14767edb0(mm, 0x18, 0, 0).\n\nOnline, the success comes after the MatchMaker's sub-state machine sees the room joined and all aircraft selectors present. For OnlineTutorials missions, the MatchMaker skips the Chronicle call and reports success directly (0x1477e7559 → 0x1477e7619 → 0x1477e769e) [V].\n\nOutside the online lobby [V/?]: the widget null-checks the lobby part manager (0x148185b03, 0x148185b29, 0x148185ef7), so it tolerates its absence. But the native opener belongs to ULiveNUILobbyPartManager, and WBP_NUILobbyMenuManager is the only menu manager verified to have a Matching entry. Whether either exists on the offline main menu is not verified.",
+   "displays": [
+    "[V] Header title 'SET SELECT' (Online_SetSelect_Title), from the WBP_NUILobbyMenuManager MenuParamMap",
+    "[V] Countdown (Time_000 +0x4b8, header 'Online_SetSelect_Limit_Header'). Timer setter 0x147520410 is called at 0x148187c8f with MatchingSelectTime and MatchingSelectTime + MatchingDisconnectTime, from ULiveNUIDeveloperSettings.DevelopParameters.LobbyParameters (CDO+0x80; built-in defaults 60 s and 20 s; a config override was not checked). Clock: local timer 0x147907660 plus an offset struct at 0x14e5101b8 (0x147907550)",
+    "[V] Aircraft-set list (ListCategory +0x4a8), copied from UDM+0x1050->+0x10 (stride 0x88) into +0x508. Default = UDM+0xfd0->+0x50. Filtered by mission-program flags when the UDM+0x10e0 table has an entry (0x1481858b1..0x148185c97); otherwise falls back to the empty static at 0x14dd89eb0",
+    "[V] Previews of the focused set (aircraft/ability/parts/ammo, +0x4c0..+0x4d8). The offline branch (IsOnline false at 0x148186c6d) reads UDM+0xfd0",
+    "[V read / I meaning] Mode panel (PreviewModeAll +0x4e0, +0x438 cached at +0x4f0); mission = UDM+0xf38, stored at +0x500 via 0x147ec9cc0",
+    "[V] Party panel (PreviewParty +0x4e8): 'GridPanel_Title' shown; contents not traced",
+    "[V] After a pick, Description (+0x4b0) shows 'Online_SetSelect_SelectAircraftSet_Waiting_Description'",
+    "[V] Failure dialog 'Online_Common_Dialog_MatchingFailure_Message' (0x14818a410) when UDM+0xed4 != 0",
+    "[V call / I meaning] Radio voice lines through LiveRadioWorldSubsystem (0x14712fff0 → 0x14780fa00 / 0x147810410) on entering state 4",
+    "[V] Footer BP_GFL_Matching (empty subclass of ULiveNUIKeyGuideFooterLayout)",
+    "[V/I] Not on this screen: search timer, players found, search status. The search state lives in the MatchMaker and UDM (UDM+0xed3 searching flag, +0xed8 start time, +0xed4 error); where the lobby displays them was not analysed"
+   ],
+   "dependencies": [
+    {
+     "addr": "0x1481856ef (call 0x1474f0a70)",
+     "what": "Screen setup sends an 'I am in-game' status to the Strix Messenger (GI+0x920 → messenger client +0xf8 → 0x1454240a0)",
+     "service": "strix",
+     "label": "[V]",
+     "alreadyBlockedBy": "Null-client guard: 0x1474f0a7a returns when StrixMessenger+0xf8 == 0 [V]; that the client is null offline is [I] (earlier RE)",
+     "dataNeeded": "none",
+     "standIn": "none; keep the messenger client null",
+     "risk": "low; the GI+0x920 object itself is dereferenced with no check at 0x1481856e4"
+    },
+    {
+     "addr": "0x14818aabc → 0x14818ab70 (0x14749b0b0 → Send 0x1474a2190)",
+     "what": "Picking an airset sends FLiveMessageAircraftSelect on selector+0x188 to the Strix room, but only when StrixManager+0x1fa is set",
+     "service": "strix",
+     "label": "[V]",
+     "alreadyBlockedBy": "StrixManager+0x1fa = 0 offline sends it down the local branch MRMM 0x147491460 [V]; RVNG's Send replacement would also see it [I]",
+     "dataNeeded": "the opponent's pick (airset number, flags, parts list, as written at 0x14818ab17..0x14818ab54)",
+     "standIn": "RVNG sends the local pick over its own link and fills the peer's selector (MRMM+0x40) itself",
+     "risk": "medium"
+    },
+    {
+     "addr": "0x148185378..0x14818539f (tick state 3)",
+     "what": "After the pick, the tick waits for (StrixManager+0x1fa AND ULiveRandomEventSubsystem+0x31) or mission mode == OnlineTutorials (0x147ec9d20 == 0xa) before going to state 4 / sortie",
+     "service": "online_flag",
+     "label": "[V]",
+     "alreadyBlockedBy": "not blocked: offline the screen stays on 'waiting' forever",
+     "dataNeeded": "an 'everyone has picked' signal",
+     "standIn": "RVNG hook at 0x14818538b, or a detour of 0x1481851f0, moves state 3 to 4 (+0x4fc = 0) when its link reports both picks. Do not set StrixManager+0x1fa",
+     "risk": "medium; the meaning of RandomEventSubsystem+0x31 is unknown"
+    },
+    {
+     "addr": "0x148189ffb / 0x14818835a (reads); writer 0x1477e7d57",
+     "what": "UDM+0xed4 = matchmaking error code. Non-zero sends the screen to state 6 and shows the failure dialog. It is written by the MatchMaker's error callback 0x1477e7cc0, bound to NM+0x5f8 and fired by the Chronicle error path",
+     "service": "chronicle",
+     "label": "[V]",
+     "alreadyBlockedBy": "[I] nothing writes it offline as long as the native search never starts",
+     "dataNeeded": "0 = no error",
+     "standIn": "Keep 0. RVNG can write a non-zero code on lost link to get the native failure dialog [I]",
+     "risk": "low"
+    },
+    {
+     "addr": "0x1477e7afa (0x1477e77d0 → NM 0x1474af800 → 0x1474b0980 → 0x1474b00d0)",
+     "what": "Native search start: 0x1474ae300 (GI+0x918) → 0x14748cb00 creates a ULiveMatchmakerClientController + Chronicle client → 0x1454004d0 RTT probe on controller+0x40. ApplyMatch/JoinLobby variants end in the WebSocket connect 0x145401040 ('wss', 'matchmaking'). Also reads LiveWebAPI (GI+0x970)+0x1b0",
+     "service": "chronicle",
+     "label": "[V] chain; [I] that D5/D7 do not cover it (no web gate seen on the path)",
+     "alreadyBlockedBy": "none found. Skipped only when the mission mode is OnlineTutorials (0x1477e7900) [V]",
+     "dataNeeded": "a matched/confirmed result",
+     "standIn": "Never call it. RVNG runs its own queue and feeds the result in (see stubPlan)",
+     "risk": "high: would try to reach Bandai's matchmaker if its URLs are set"
+    },
+    {
+     "addr": "0x1474af87f (inside 0x1474af800)",
+     "what": "Branch on NetworkCheatManager (GI+0x938) +0x78/+0x79 with the text 'client error : Restrictions by easy anti cheat'",
+     "service": "anticheat_not_analysed",
+     "label": "anti-cheat call at 0x1474af87f: not analysed",
+     "alreadyBlockedBy": "n/a",
+     "dataNeeded": "n/a",
+     "standIn": "n/a: RVNG never calls 0x1474af800",
+     "risk": "not analysed"
+    },
+    {
+     "addr": "0x1474b22bc → 0x1454019d0; NM 0x1474b2310",
+     "what": "Chronicle callbacks (OnMatched/OnConfirmed/OnAllPlayersConfirmed, controller UFunctions 0x146ea4400..0x146ea5c60) and ConfirmMatch on the client. The confirmed result fills NM+0x3d8 / +0x410 through SetConfirmed 0x1474b2310",
+     "service": "chronicle",
+     "label": "[V] addresses; [V] SetConfirmed from DEATHMATCH_NATIVE.md 9.4",
+     "alreadyBlockedBy": "[I] never fires offline",
+     "dataNeeded": "FChronicleMatchmakerConfirmedResult {MatchmakingId, Players=2, Members[2]{userId, Username, Team, ...}, MissionProgramId}",
+     "standIn": "RVNG calls 0x1474b2310 with a locally built result (already done in test 3), then creates the selectors with MRMM 0x147490bc0",
+     "risk": "low (path already proven)"
+    },
+    {
+     "addr": "0x1477e7d90 (0x1477e7e5e, 0x1477e7e85..0x1477e7f83)",
+     "what": "MatchMaker progress waits, in order: Game controller exists → NM+0x4c9 / StrixManager+0x1fa / StrixManager+0x30 (room joined) → MRMM 0x147493cb0() == NM+0x3d8 (all selectors present)",
+     "service": "online_flag",
+     "label": "[V]",
+     "alreadyBlockedBy": "not blocked: offline it stalls at sub-state 238",
+     "dataNeeded": "room joined; selector count == player count",
+     "standIn": "Bypass: call finish 0x1477e80d0(MatchMaker, {0, 0}) directly, the same call the OnlineTutorials branch makes at 0x1477e769e",
+     "risk": "medium: the MatchMaker state must stay consistent (+0x38 to -1, UDM+0xed3 cleared by finish)"
+    },
+    {
+     "addr": "NM 0x1474b1180 → 0x14748d220 → 0x14748bc90 → 0x145401600 / 0x145402150",
+     "what": "Real cancel. Callers: MatchMaker 0x1477e75f4 (cancel flag +0x49), 0x14756ff49, PartyManager 0x1474de243, result game mode 0x1480ee18a",
+     "service": "chronicle",
+     "label": "[V]",
+     "alreadyBlockedBy": "guarded: does nothing unless a Game controller exists (0x1474b11ae → 0x1474af750) [V]",
+     "dataNeeded": "none",
+     "standIn": "RVNG cancel = cancel on its own link + MatchMaker finish with result 1 [I: result 1 assumed to mean cancel]",
+     "risk": "low"
+    },
+    {
+     "addr": "0x1477e767c / 0x1477e7684 → 0x1474f29e0 → 0x1454227f0",
+     "what": "On the MatchMaker success path, Strix Messenger channel unsubscribe",
+     "service": "strix",
+     "label": "[V]",
+     "alreadyBlockedBy": "null-client guard at 0x1474f2b02 [V]",
+     "dataNeeded": "none",
+     "standIn": "none",
+     "risk": "low"
+    },
+    {
+     "addr": "SystemObject handler 0x1474d0820 → NM 0x1474ae800",
+     "what": "Server message AircraftSelectStart: sets NM+0x614 from the game constant 'AIRCRAFT_SET_CLIENT_RECV_TIMEOUT_SEC' (default 30) and NM+0x710/+0x718",
+     "service": "strix",
+     "label": "[V] code; [I] that the screen never reads NM+0x614 (no reference found in its code region)",
+     "alreadyBlockedBy": "never arrives offline",
+     "dataNeeded": "optional",
+     "standIn": "optional: the RVNG host can inject it through the router as the server",
+     "risk": "low"
+    },
+    {
+     "addr": "0x148185881..0x1481859e2 (reads UDM+0x1050, +0xfd0, +0x1000 at 0x14818a9de)",
+     "what": "Aircraft-set list, default set and parts list the screen shows and selects from",
+     "service": "unknown",
+     "label": "[V] reads; [?] whether offline data is filled (save vs web API)",
+     "alreadyBlockedBy": "n/a",
+     "dataNeeded": "the player's aircraft sets (stride 0x88, first int = set number) and the default set number",
+     "standIn": "If empty offline, RVNG must fill them from the offline hangar/loadout [?]",
+     "risk": "medium: with an empty list, decide picks nothing (0x148189dde)"
+    },
+    {
+     "addr": "0x14818580a (UDM+0xf38), 0x1473549c0 / 0x14734cac0 (InformationManager GI+0x878), 0x1481858a4..0x1481858df (UDM+0xf48 / +0x10e0)",
+     "what": "Mission/mode info for the mode panel and for the set filter",
+     "service": "unknown",
+     "label": "[V] reads; [?] data source",
+     "alreadyBlockedBy": "falls back to the empty static at 0x14dd89eb0 when not found [V]",
+     "dataNeeded": "UDM+0xf38 = the deathmatch MissionProgramId",
+     "standIn": "RVNG already sets the MissionID (DEATHMATCH_NATIVE.md)",
+     "risk": "low"
+    },
+    {
+     "addr": "0x14818a9aa..0x14818ab88 (MRMM GI+0x958 +0x40)",
+     "what": "The pick is written into the local aircraft selector, which must exist",
+     "service": "local_only",
+     "label": "[V]",
+     "alreadyBlockedBy": "n/a",
+     "dataNeeded": "selectors for both members (created from NM+0x410)",
+     "standIn": "RVNG creates them with MRMM 0x147490bc0 (deep_pass plan)",
+     "risk": "low"
+    },
+    {
+     "addr": "0x147907550 / 0x147907660",
+     "what": "Clock for the countdown start (+0x400) and NM match times",
+     "service": "local_only",
+     "label": "[V] local timer; [?] whether the offset struct at 0x14e5101b8 is synced from a server online",
+     "alreadyBlockedBy": "n/a",
+     "dataNeeded": "none",
+     "standIn": "none",
+     "risk": "low"
+    }
+   ],
+   "verdict": "usable_needs_data",
+   "stubPlan": [
+    "1. Never start the native search: do not drive ULiveNUIMatchMaker+0x38 to 0, and never call 0x1477e77d0 or NM 0x1474af800. RVNG runs its own queue (searching / found / connecting / cancelled) and its own searching display, because this screen has none.",
+    "2. On 'found': set UDM+0xf38 to the deathmatch MissionProgramId. Fill the NM room tables with SetConfirmed 0x1474b2310 (local FChronicleMatchmakerConfirmedResult, Players=2) and create both aircraft selectors with MRMM 0x147490bc0, as the deathmatch plan already does.",
+    "3. Open SET SELECT natively with 0x1477e80d0(LobbyPartManager+0x570, {result 0, code 0}). That is the OnlineTutorials success call; the lobby listener 0x1477f3a20 then builds the MatchingStepProcessor sequence and step 0x1477f3640 opens menu 0x18. If no lobby part manager exists, call 0x14767edb0(menuManager, 0x18, 0, 0) on a menu manager that has a Matching entry.",
+    "4. Keep StrixManager+0x1fa = 0 so the screen uses its offline branches: local selector write 0x147491460, IsOnline 0x14818a6d0 false paths, no AircraftSelect send.",
+    "5. Hook the pick (after 0x14818a8c0 writes the local selector): send {set number, flags, parts list} to the peer; on receipt, write the peer's selector in MRMM+0x40.",
+    "6. Release the state-3 wait: detour at 0x14818538b (or wrap 0x1481851f0) so state 3 goes to 4 (+0x4fc = 0) when both picks are in. The native code then waits InitSortieTimerValue, plays its radio line and closes through vslot 0x528.",
+    "7. Errors: keep UDM+0xed4 = 0. On lost link, write a non-zero code to get the native failure dialog and close. To cancel before SET SELECT opens, call finish with result 1 (meaning of 1 inferred).",
+    "8. After the screen closes, use RVNG's existing MissionID + travel path; D6 still covers the Result map.",
+    "9. No stand-ins needed for the Strix Messenger calls (null client guards at 0x1474f0a7a and 0x1474f2b02) or for the Chronicle cancel (guarded on a controller existing at 0x1474b11ae)."
+   ],
+   "openQuestions": [
+    "Do ULiveNUILobbyPartManager and WBP_NUILobbyMenuManager exist outside the online lobby map, for example on the offline main menu? Not verified; this decides how RVNG can open the screen.",
+    "Where do UDM+0x1050 (aircraft-set list), UDM+0xfd0->+0x50 (default set) and UDM+0x1000 (parts list) come from offline: save data or web API? If empty, the list is empty and no set can be picked.",
+    "What is ULiveRandomEventSubsystem+0x31? It is half of the online state-3 condition.",
+    "Does a config file override MatchingSelectTime / MatchingDisconnectTime? Only the built-in defaults (60 s / 20 s) were read; no config was read.",
+    "Which step processor runs the open-step lambdas 0x1481ac1a0 / 0x1481ac200 that set state 1 (OpenStepProcessor +0x538 or the processor at +0x430)? Not traced.",
+    "Result codes for 0x1477e80d0 / 0x1477f3a20: 0 = success and 2 = error are verified; 1 = cancel is inferred.",
+    "What does ModeSelect (ULiveNUIMenuModeSelectWidget, WBP_Menu_Mode_000) call when a mode is chosen? Presumably the MatchMaker start; not traced.",
+    "Where does the lobby show the native search state (UDM+0xed3 searching, +0xed8 start time)? Possibly the lobby HUD; not analysed.",
+    "Which class owns 0x14756f8f0, the second search starter that logs 'Matchmaking...' / ' MissionID = {0}' (reached through the delegate vtable at 0x14cb6f1c0)? Possibly the debug menu.",
+    "Is the StrixMessenger object (GI+0x920) always present offline? The setup dereferences it without a check at 0x1481856e4; earlier RE says it exists.",
+    "Would the Chronicle controller have real server URLs offline, so that starting a search would actually connect? Not verified; treat the native search as unsafe.",
+    "The earlier label 'CancelMatch 0x1474af800' in DEATHMATCH_NATIVE.md / deep_pass.json should be corrected: it starts a search. The real cancel is 0x1474b1180."
+   ],
+   "assets": [
+    "/Game/OnlineMode/UI/NUI/Matching/WBP_Menu_Matching_000 (layout only; parent class ULiveNUIMenuMatchingRootWidget)",
+    "/Game/NUI/System/GuideFooter/Layout/BP_GFL_Matching (empty subclass of ULiveNUIKeyGuideFooterLayout)",
+    "/Game/OnlineMode/UI/NUI/System/MenuManager/WBP_NUILobbyMenuManager (MenuParamMap: Matching → WBP_Menu_Matching_000 'SET SELECT'; ModeSelect → WBP_Menu_Mode_000 'MODE SELECT')",
+    "/Game/OnlineMode/UI/NUI/Mode/WBP_Menu_Mode_000 (newly extracted; parent class ULiveNUIMenuModeSelectWidget)"
+   ],
+   "evidenceFiles": [
+    "<scratchpad>/lobby_ui/matching/w_4b8.txt",
+    "<scratchpad>/lobby_ui/matching/w_tick.txt",
+    "<scratchpad>/lobby_ui/matching/w_others.txt",
+    "<scratchpad>/lobby_ui/matching/w_decide.txt",
+    "<scratchpad>/lobby_ui/matching/w_select.txt",
+    "<scratchpad>/lobby_ui/matching/w_virt.txt",
+    "<scratchpad>/lobby_ui/matching/region.txt",
+    "<scratchpad>/lobby_ui/matching/lambdas.txt",
+    "<scratchpad>/lobby_ui/matching/f_1474af800.txt",
+    "<scratchpad>/lobby_ui/matching/f_1474b00d0.txt",
+    "<scratchpad>/lobby_ui/matching/f_1477e77d0.txt",
+    "<scratchpad>/lobby_ui/matching/f_1477e77d0_b.txt",
+    "<scratchpad>/lobby_ui/matching/f_1477e74d0.txt",
+    "<scratchpad>/lobby_ui/matching/mm_code.txt",
+    "<scratchpad>/lobby_ui/matching/f_1477f2c40.txt",
+    "<scratchpad>/lobby_ui/matching/f_1477f3a20.txt",
+    "<scratchpad>/lobby_ui/matching/lobbypart_region.txt",
+    "<scratchpad>/lobby_ui/matching/f_ctrl.txt",
+    "<scratchpad>/lobby_ui/matching/menumgr_props.txt",
+    "<scratchpad>/lobby_ui/matching/vt_rootuser_cands.txt",
+    "<scratchpad>/lobby_ui/matching/names_wbp.txt",
+    "<scratchpad>/lobby_ui/OnlineMode/UI/NUI/Mode/WBP_Menu_Mode_000",
+    "E:/ACE8 Survival Mode/build/liveproject/Source/LiveLobby/Public/LiveNUIMenuMatchingRootWidget.h (read only)",
+    "E:/ACE8 Survival Mode/build/liveproject/Source/Live/Public/LiveNUILobbyPartManager.h (read only)",
+    "E:/ACE8 Survival Mode/build/liveproject/Source/ChronicleMatchmaker/Public/ChronicleMatchmakerClient.h (read only)",
+    "E:/ACE8 Survival Mode/build/liveproject/Source/Live/Public/LiveNUIDevelopLobbyParameters.h (read only)",
+    "E:/ACE8 PVP/docs/re/DEATHMATCH_NATIVE.md",
+    "E:/ACE8 PVP/docs/re/deathmatch/deep_pass.json"
+   ]
+  },
+  "verify": {
+   "screen": "Matchmaking group (key \"matching\"): ELiveNUIMenuType::Matching 0x18 = WBP_Menu_Matching_000, the SET SELECT screen (native ULiveNUIMenuMatchingRootWidget), plus the search driver behind it (ULiveNUIMatchMaker, then NetworkManager, then Chronicle) and ModeSelect.",
+   "claimsChecked": [
+    {
+     "claim": "The Matching menu is SET SELECT (pick an aircraft set against a countdown after a match is found), not a search screen; its Blueprint only holds the layout.",
+     "verdict": "confirmed",
+     "evidence": "[V] ELiveNUIMenuType.h: Matching is entry 24 = 0x18. The WBP_Menu_Matching_000 name table and exports have no Ubergraph or K2 function nodes, only layout, animations and parts widgets. Setup 0x148185530 loads 'Online_SetSelect_Limit_Header'. Decide 0x148189d80 shows 'Online_SetSelect_SelectAircraftSet_Waiting_Description'."
+    },
+    {
+     "claim": "Native class ULiveNUIMenuMatchingRootWidget (/Script/LiveLobby): size 0x540, ctor 0x1480db1b0 is VM-protected, vtable 0x14cc652a0, with the listed vslots (setup 0x4b8, cleanup 0x4c0, input 0x4f8, tick 0x518, close 0x528, open 0x570).",
+     "verdict": "confirmed",
+     "evidence": "[V] StaticClass 0x1480d8670 uses name 'LiveNUIMenuMatchingRootWidget', package '/Script/LiveLobby', size 0x540 and ctor 0x1480db1b0 (jmp 0x15ccb6850). Dtor 0x1480d8750 stores 0x14cc652a0. Vtable reads: +0x4b8=0x148185530, +0x4c0=0x148185e00, +0x4f8=0x148189600, +0x518=0x1481851f0, +0x528=0x1481861e0, +0x570=0x148186e70."
+    },
+    {
+     "claim": "Tick state 3 waits for StrixManager+0x1fa AND ULiveRandomEventSubsystem+0x31, or mission mode == OnlineTutorials. Offline it stalls on 'waiting'.",
+     "verdict": "confirmed",
+     "evidence": "[V] 0x148185378: NM(GI+0x928) is passed to 0x1474ae240, which returns GI+0x910 (StrixManager). Then cmp [rax+0x1fa] at 0x148185384. 0x147ecd400 gets the GI subsystem of class 0x146fb0830 = 'LiveRandomEventSubsystem', and cmp +0x31 is at 0x148185395. Else cmp bpl,0xa at 0x14818539b, where bpl comes from 0x147ec9d20 = InformationManager(GI+0x878) 0x14734cac0(UDM+0xf38). ELiveGameModeType.h: OnlineTutorials = 10. State 4 adds dt to +0x4fc and compares it with +0x468, then sets state 5 and calls vslot 0x528."
+    },
+    {
+     "claim": "Pre-tick 0x148189fd0: UDM+0xed4 != 0 sends the screen to state 6 with the failure dialog 0x14818a410.",
+     "verdict": "confirmed",
+     "evidence": "[V] cmp [UDM+0xed4],0 at 0x148189ffb, then state 6 at 0x14818a02b. 0x14818a410 loads 'Online_Common_Dialog_MatchingFailure_Message' (0x14818a475)."
+    },
+    {
+     "claim": "Setup sends an 'I am in-game' status to the Strix Messenger (GI+0x920), skipped when messenger+0xf8 is null.",
+     "verdict": "confirmed",
+     "evidence": "[V] 0x1481856e4 loads [GI+0x920] with no null check and calls 0x1474f0a70. That function tests [rcx+0xf8] at 0x1474f0a7a and returns if it is 0; otherwise it calls plugin 0x1454240a0. That GI+0x920 is the StrixMessenger is [I] from earlier RE."
+    },
+    {
+     "claim": "Apply 0x14818a8c0 sends FLiveMessageAircraftSelect (selector+0x188 -> 0x14749b0b0 -> Send) only when SM+0x1fa is set; otherwise the pick is written locally through MRMM 0x147491460.",
+     "verdict": "partly",
+     "evidence": "[V] The branch at 0x14818aabc, the online path 0x14818ab70 and the offline path 0x14818ab88 are as described. The local selector must exist in MRMM+0x40, keyed by the UDM+0xfd0 userId; otherwise 0x14818aa99 skips both paths.",
+     "correction": "Offline, 0x147491460(MRMM, &userId, flag) is not passed the picked set number. It copies UDM's current loadout (UDM+0xd28, +0xdd0, +0xdcc, +0xd30, +0xd2c/+0xd2d, +0xd48.., +0xd38, +0xfd0+0x78/+0x7c, and +0x1038 via 0x1479d68a0) into the selector and sets +0x60 = flag. Decide calls apply at 0x148189df6 before 0x1476088b0 writes the chosen set into those UDM fields (0x148189e1d). So offline the selector carries the previous loadout [I effect]. The focus callback 0x148186b60 also calls apply with flag 0 on every focus move."
+    },
+    {
+     "claim": "MatchMaker: start 0x1477e77d0 sets UDM+0xed8 = now, returns early for OnlineTutorials, binds the error callback on NM+0x5f8, sets UDM+0xed3 = 1 and calls NM 0x1474af800. The error callback 0x1477e7cc0 sets UDM+0xed4 = code and then calls finish {2, code}.",
+     "verdict": "confirmed",
+     "evidence": "[V] UDM+0xed8 store at 0x1477e78e7. cmp al,0xa / je at 0x1477e7900. Bind into NM+0x5f8 at 0x1477e79c5..0x1477e7a87. UDM+0xed3=1 and +0xed4=0 at 0x1477e7ac9. Listener vslot +0x8 is called at 0x1477e7ae1. call 0x1474af800 at 0x1477e7afa. In 0x1477e7cc0, finish {2, code} runs only if UDM+0xed3 is set (0x1477e7d50)."
+    },
+    {
+     "claim": "The update state machine: 0 -> start; 233; 234 -> wait; 236 -> wait/cancel. In OnlineTutorials the success call finish(mm, {0,0}) is made at 0x1477e769e.",
+     "verdict": "confirmed",
+     "evidence": "[V] Decoded jump table at 0x1477e76d4/0x1477e76b8: 0 -> 0x1477e750a, 233 -> 0x1477e7511, 234 -> 0x1477e754a, 235 -> 0x1477e7607, 236 -> 0x1477e756d. Mode 0xa at 0x1477e755e jumps to 0x1477e7619, which calls finish at 0x1477e769e. Cancel: NM 0x1474b1180 with code 0x124f82 at 0x1477e75f4."
+    },
+    {
+     "claim": "Progress 0x1477e7d90: 237 controller alive, 238/239 waiting for room, 240 waiting for selector count. Offline it stalls at 238.",
+     "verdict": "confirmed",
+     "evidence": "[V] 0x1474af750 true sets 0xed (0x1477e7e6c). With NM+0x4c9 == 0 and SM+0x1fa == 0 it sets 0xee (0x1477e7ead). SM+0x30 == 0 also gives 0xee. SM+0x1fa == 0 gives 0xef. MRMM 0x147493cb0 != NM+0x3d8 gives 0xf0. Returning false means done."
+    },
+    {
+     "claim": "finish 0x1477e80d0: result 0 = success, 2 = error, 1 = cancel (inferred). The MatchMaker state must be kept consistent (+0x38 to -1, UDM+0xed3 cleared by finish).",
+     "verdict": "partly",
+     "evidence": "[V] finish clears UDM+0xed3 (0x1477e8129) and +0x4a, then calls listener+0x10.",
+     "correction": "For result 0, finish only sets +0x48 = 1. It does not set +0x38 = -1 or unbind the +0x50 handle; the -1 comes from the caller at 0x1477e76a3. Result 1 is not only 'cancel': the NM result lambda 0x1477e7b60 maps codes 0x124f81..0x124f87 to 1 and all other codes to 2 (0x1477e7c94..0x1477e7caf). The MatchMaker's own cancel code is 0x124f82."
+    },
+    {
+     "claim": "The lobby part manager listener 0x1477f3a20 (listener sub-object at +0x4a8, vtable 0x14c8fead0) is stored into MatchMaker+0x40 at 0x1477e9b54. Result 0 -> 0x1477f2c40 and then starts +0x560; results 1/2 -> 0x1477ec840.",
+     "verdict": "confirmed",
+     "evidence": "[V] Ctor 0x146f3a930 stores vtable 0x14c8fe4d0 and listener vtable 0x14c8fead0 at +0x4a8. StaticClass 0x146f3a700 is 'LiveNUILobbyPartManager', size 0x718. 0x1477e9b4d stores the MatchMaker at +0x570, and 0x1477e9b54 stores the listener in mm+0x40. 0x14c8fead0+0x10 = 0x1477f3a20. Result 0 path: 0x1477f3dfe calls 0x1477f2c40, then 0x1475e3280 on +0x560. Note: MenuManager (+0x548) is dereferenced without a check at 0x1477f3a72/0x1477f3a7c."
+    },
+    {
+     "claim": "Step 0x1477f3640 sets +0x680 = 7 and opens menu 0x18 through MenuManager 0x14767edb0(mm, 0x18, 0, 0).",
+     "verdict": "confirmed",
+     "evidence": "[V] Its lambda text is 'ULiveNUILobbyPartManager::PushTaskMatchingSuccess::<lambda_7>'. +0x680 = 7 at 0x1477f36ac. mov dl,0x18 and call 0x14767edb0 at 0x1477f37a4. Missed: when mode == OnlineTutorials it also calls NM 0x1474b5650 (Strix room leave, 0x1477f3778). Its plugin calls 0x145239880/0x1452392f0 test the Strix global 0x14e4c5818 (0x145239884)."
+    },
+    {
+     "claim": "0x1474af800 starts a search; it is not CancelMatch. The real cancel is NM 0x1474b1180, guarded by 'Game controller exists' (0x1474af750).",
+     "verdict": "confirmed",
+     "evidence": "[V] 0x1474af800 calls 0x1474b0980 at 0x1474afb41. The 'CancelMatch' text only feeds 0x1474b1410 in the branch after 0x1474af750 (0x1474af898). Its callers are MatchMaker start 0x1477e7afa and 0x14756faa7 (which logs 'Matchmaking...' and ' MissionID = {0}'). 0x1474b1180 calls 0x1474af750 at 0x1474b11ae and only reaches 0x14748d220 when it is true. The EAC-labelled branch inside 0x1474af800: anti-cheat call at 0x1474af87f: not analysed."
+    },
+    {
+     "claim": "The Strix Messenger unsubscribe on the MatchMaker success path is null-guarded.",
+     "verdict": "confirmed",
+     "evidence": "[V] The success path calls 0x1474f2880 and 0x1474f25f0. Both reach 0x1474f29e0, which tests [+0xf8] at 0x1474f2af3/0x1474f2b05 before calling 0x1454227f0."
+    },
+    {
+     "claim": "Countdown: setter 0x147520410 is called at 0x148187c8f with MatchingSelectTime and MatchingSelectTime + MatchingDisconnectTime from DevelopParameters.LobbyParameters (defaults 60 s and 20 s).",
+     "verdict": "partly",
+     "evidence": "[V] 0x148187c5a/0x148187c66 call 0x1475b1880 and pass lanes [1] and [1]+[2] of FLiveNUIDevelopLobbyParameters (EmergencyStartDelayTime, MatchingSelectTime, MatchingDisconnectTime ...). The setter writes +0x408/+0x418 (select) and +0x410/+0x420 (select+disconnect) and uses clock 0x147907550/0x147907660. I did not check the 60/20 defaults.",
+     "correction": "Missed: the same step binds Time_000+0x448 to 0x148188010 (0x148187cb0..0x148187d6d). That handler sets state 6 and shows 'Online_Common_Dialog_MatchingMember_Disconnection_Message'. So a second failure path exists: state 3 has to be released before select+disconnect time runs out [I: +0x448 fires at the second limit]."
+    },
+    {
+     "claim": "Aircraft-set list from UDM+0x1050->+0x10 (stride 0x88); default from UDM+0xfd0->+0x50; filtered by UDM+0x10e0; whether the offline data is filled is unknown.",
+     "verdict": "partly",
+     "evidence": "[V] Reads at 0x148185881, 0x1481858b1 and 0x14818591a; UDM+0x1000 at 0x14818a9de. UDM+0x1050, +0x10e0 and +0x1000 are dereferenced without null checks, so a null pointer would crash. The UDM ctor 0x147990ab0 zeroes them (0x147990e41/e87/f05).",
+     "correction": "[I] The sets look web-sourced. The only add-site of an airset entry (0x147933e30) is at 0x14792cbe9, inside 0x14792cb20, which first checks a response status == 0xc8 (HTTP 200) at 0x14792cb42/0x14792cb58."
+    },
+    {
+     "claim": "Mission is UDM+0xf38, stored at +0x500.",
+     "verdict": "confirmed",
+     "evidence": "[V] 0x147ec9cc0 returns [GI+0x8e0]+0xf38, stored at 0x14818580f. The close path uses +0x500 for LevelRow 0x14734d370 at 0x148188ad6 and then RequestChangeMap 0x147901bf0 at 0x148188b3d. So the screen does the sortie travel itself (missed by the map)."
+    },
+    {
+     "claim": "Cleanup 0x148185e00 calls MRMM 0x147491760 with 'MatchingRootWidget Cleanup'.",
+     "verdict": "confirmed",
+     "evidence": "[V] String at 0x148185eae, call at 0x148185ee7. Missed: 0x147491760 calls 0x1474a1ab0 (network object unregister) for every selector whose +0x188 is set, then clears +0x188 (0x14749191f/0x14749192d)."
+    },
+    {
+     "claim": "Only WBP_NUILobbyMenuManager is verified to have a Matching entry; whether it or the lobby part manager exists on the offline main menu is unverified. Fallback: call 0x14767edb0(menuManager, 0x18, 0, 0) on a manager that has a Matching entry.",
+     "verdict": "partly",
+     "evidence": "[V] WBP_NUICampaignMainMenuManager's name table lists only Top, Shop2 and System* menu types, with no ELiveNUIMenuType::Matching. WBP_NUIManager PartUIList maps Lobby to WBP_NUILobbyPart and CampaignMainMenu to WBP_NUICampaignMainMenuPart. DebugLevelUIPartMap maps PL_LOB_Lobby01_Season01 to Lobby.",
+     "correction": "On the offline main menu, no menu manager has a Matching entry. The native opener needs the Lobby part, which belongs to the online lobby map, and DEATHMATCH_NATIVE.md 6.2.4 forbids the OnlineLobby travel. The fallback in stub-plan step 3 therefore has no target at the main menu."
+    },
+    {
+     "claim": "Stub plan step 2: on 'found', create both aircraft selectors with MRMM 0x147490bc0, then open SET SELECT.",
+     "verdict": "wrong",
+     "evidence": "[V] With IsOnline false, the open sequence queues lambda 0x1481ac810 (0x1481871e5/0x1481871f3), which runs MRMM 0x1474910d0. That function calls 0x14748d870 (VM-protected, not analysed), empties MRMM+0x30, zeroes +0xe4 and creates one new local selector keyed by the UDM+0xfd0 userId (0x14749118f, TMap add 0x147491439). It also copies UDM+0xfb8 (login object) +0x28/+0x38 into selector +0x128/+0x138.",
+     "correction": "Create or refill the opponent selector, and refill the local one, after the open sequence has run (after state 1 is set by lambda 0x1481ac1a0/0x1481ac200), not before. Whether 0x14748d870 also clears MRMM+0x40 is [?]."
+    },
+    {
+     "claim": "The online-only open steps and the IsOnline helper 0x14818a6d0 (SM+0x1fa) choose the online/offline branches.",
+     "verdict": "confirmed",
+     "evidence": "[V] 0x14818a6d0 returns [GI+0x910]+0x1fa. At 0x14818703e, test r12b skips steps 0x14cc7b028 (MRMM 0x1474909d0) and 0x14cc7afc0 (0x1481875e0, which calls 0x14749b240 on selector+0x188 and 0x1474dd080) when offline."
+    },
+    {
+     "claim": "ModeSelect = WBP_Menu_Mode_000 with parent ULiveNUIMenuModeSelectWidget; its decide path was not traced.",
+     "verdict": "unverifiable",
+     "evidence": "[V] StaticClass 0x146f520c0 ('LiveNUIMenuModeSelectWidget', size 0x5e0); ctor 0x146f57390 jumps into VM code. I did not find its vtable or decide path either."
+    }
+   ],
+   "missedDependencies": [
+    {
+     "addr": "0x1481871f3 -> lambda 0x1481ac810 -> MRMM 0x1474910d0 (0x1474910ee calls 0x14748d870)",
+     "what": "The offline open step rebuilds MRMM: it calls VM-protected 0x14748d870, empties MRMM+0x30, zeroes +0xe4 and creates one local ULiveAircraftSelector keyed by the UDM+0xfd0 userId. Selectors RVNG made earlier are reset or replaced.",
+     "service": "local_only",
+     "evidence": "[V] f_1474910d0.txt: 0x1474910fa clear, 0x14749110b, 0x14749118f NewObject, 0x1474913c0 +0x58=1, 0x1474913cc +0x120=1, 0x147491439 TMap add. What 0x14748d870 does is [?] (VM-protected, not analysed)."
+    },
+    {
+     "addr": "0x1474913d6 / 0x1474913e6 (inside MRMM 0x1474910d0)",
+     "what": "The offline open step copies two strings from UDM+0xfb8 (the GeneralAPIController login object) +0x28/+0x38 into selector +0x128/+0x138. They come from web login and are empty offline [I]. UDM+0xfb8 is dereferenced without a check.",
+     "service": "login",
+     "evidence": "[V] mov rdx,[rdi+0xfb8]; add rdx,0x28 / 0x38; call 0x1416e0b60. That the object exists offline is [I], from test 1 (UDM+0xfb0 set at boot)."
+    },
+    {
+     "addr": "0x148187820 (common open step): 0x1481878ce NM 0x1474ae080, 0x1481878f7 NM 0x1474b6700",
+     "what": "The screen re-seeds factions. Offline, 0x1474ae080 seeds NM+0x4d0 with the local user as Alpha (DEATHMATCH_NATIVE.md), then the step reads NM+0x4d0 and NM+0x410. RVNG's NM+0x4d0 overwrite (host 1, guest 2) is undone and must be applied again after SET SELECT opens.",
+     "service": "local_only",
+     "evidence": "[V] s_148187820.txt. MRMM 0x14748e170 returns 1 offline at 0x14748e3a1 (SM+0x1fa test at 0x14748e1d8), so this path always runs offline."
+    },
+    {
+     "addr": "0x148187cb0..0x148187d6d (binds Time_000+0x448) -> 0x148188010",
+     "what": "Timeout failure: when the countdown's second limit (MatchingSelectTime + MatchingDisconnectTime) runs out, the screen goes to state 6 and shows 'Online_Common_Dialog_MatchingMember_Disconnection_Message'. RVNG has to move state 3 to 4 before then, or lean on this as its 'peer lost' exit.",
+     "service": "online_flag",
+     "evidence": "[V] Lambda vtable 0x14cc799d0 is installed at 0x148187d03 and points to 0x1481b1310 -> 0x148188010. State 6 is set at 0x148188038, the string loads at 0x148188097, and 0x1475a6fc0 is called. That +0x448 fires at the second limit is [I]."
+    },
+    {
+     "addr": "0x148188930: 0x148188ad6 (0x14734d370) and 0x148188b3d (RequestChangeMap 0x147901bf0)",
+     "what": "The close path does the sortie travel itself: LevelRow(GI+0x878, widget+0x500) and then RequestChangeMap(GI+0x888, &row+0x48). D6's RequestChangeMap hook will see this call, and RVNG's own travel must not run as well.",
+     "service": "local_only",
+     "evidence": "[V] close.txt"
+    },
+    {
+     "addr": "0x148189df6 (apply) before 0x148189e1d (0x1476088b0)",
+     "what": "Offline the pick is applied to the local selector (0x147491460, which copies UDM's current loadout) before 0x1476088b0 writes the chosen set into UDM+0xd28.. So the selector holds the previous loadout. RVNG should refill the local selector after decide, or relay the chosen set's data itself.",
+     "service": "save",
+     "evidence": "[V] decide.txt, apply.txt, f_1476088b0.txt. The consequence is [I]."
+    },
+    {
+     "addr": "0x148185881 (UDM+0x1050), 0x1481858b1 (UDM+0x10e0), 0x14818a9de (UDM+0x1000)",
+     "what": "Pointers dereferenced with no null check; the UDM ctor 0x147990ab0 zeroes them. The aircraft-set entries look web-sourced: the only add-site 0x147933e30 is in an HTTP-200 handler 0x14792cb20. Offline the list may be empty (nothing can be picked; decide skips at 0x148189dde), or a null pointer would crash.",
+     "service": "web_api",
+     "evidence": "[V] Reads and the handler status check at 0x14792cb42/0x14792cb58. The data source is [I]."
+    },
+    {
+     "addr": "0x1477f3a72 / 0x1477f3a7c (listener 0x1477f3a20)",
+     "what": "The success listener reads LobbyPartManager+0x548 (MenuManager) +0x530/+0x528 with no null check. Calling finish 0x1477e80d0 only works inside a real ULiveNUILobbyPartManager, which is only on the online lobby UI part.",
+     "service": "local_only",
+     "evidence": "[V] lis.txt. Name tables: WBP_NUICampaignMainMenuManager has no Matching entry; only WBP_NUILobbyMenuManager does."
+    },
+    {
+     "addr": "0x1477f3778 -> NM 0x1474b5650 (in step 0x1477f3640, only when mode == OnlineTutorials)",
+     "what": "On the OnlineTutorials success path the step tears down the Strix room: it resets SM+0x30/+0x1f9/+0x1fa/+0x1f8 and calls StrixLibraryInterface 0x145239880/0x1452392f0 on SM+0x28. It is guarded by the Strix global 0x14e4c5818 null check at 0x145239884. It only matters if RVNG fakes mode 10.",
+     "service": "strix",
+     "evidence": "[V] 0x1451fbf90 = StaticClass 'StrixLibraryInterface' (/Script/StrixSDK)."
+    },
+    {
+     "addr": "0x148185ee7 -> MRMM 0x147491760 -> 0x1474a1ab0 (0x14749191f)",
+     "what": "Screen cleanup unregisters every selector's network object (selector+0x188) and clears the pointer. If RVNG gives selectors network objects, they are removed when SET SELECT closes, before the DM map.",
+     "service": "local_only",
+     "evidence": "[V] Read from 0x147491760."
+    }
+   ],
+   "verdictAgrees": true,
+   "correctedVerdict": "usable_needs_data",
+   "notes": "My verdict matches the map's, \"usable, needs data\", but the map's stub plan is wrong in three places and leaves out the biggest blocker.\n\n**The screen itself is mostly offline-safe [V].**\n- When StrixManager+0x1fa is 0, it takes offline branches.\n- The Strix Messenger calls stop on null checks (0x1474f0a7a, 0x1474f2b05).\n- It never calls the Chronicle search, the web gates A/B, EOS (GI+0x930) or the anti-cheat manager (GI+0x988). My two-level call walk from every screen function and open/close step found none of these.\n- It shows no search timer, no player count and no searching/found/cancelled states. RVNG's queue display has to be its own.\n\n**The biggest blocker: where the screen can be opened.**\n- Only WBP_NUILobbyMenuManager, inside the Lobby UI part (the online lobby map), has a Matching entry [V].\n- The offline main menu's WBP_NUICampaignMainMenuManager has no Matching entry [V].\n- The native success listener dereferences the lobby part's MenuManager without a check [V].\n- So the screen cannot be opened at the main menu the native way, and the online lobby map is off-limits under DEATHMATCH_NATIVE.md 6.2.4 and was not analysed. Creating the widget by hand outside a menu manager is untested [?].\n\n**Corrections to the stub plan:**\n- **Step 2 (make both selectors on \"found\"):** wrong. The offline open step 0x1474910d0 rebuilds MRMM with one local selector, so the opponent selector has to be filled after the open sequence.\n- **Step 3 fallback (open via any menu manager):** has no target at the main menu.\n- **Step 5 (relay the pick):** the offline local write copies the old UDM loadout. The chosen set is written to UDM only after apply. So relay the chosen set's data, not the selector's.\n\n**What the map missed:**\n- The common open step calls NM 0x1474ae080, which re-seeds NM+0x4d0 factions. RVNG must re-apply host = 1 and guest = 2 afterwards.\n- A timeout on Time_000+0x448 sends the screen to state 6 with the \"MatchingMember_Disconnection\" dialog.\n- The close path does its own travel: LevelRow, then RequestChangeMap 0x147901bf0 at 0x148188b3d. RVNG's own travel must not run as well.\n- The offline open step reads two login strings from UDM+0xfb8.\n- Cleanup unregisters the selectors' network objects.\n- finish 0x1477e80d0 with result 0 does not reset MatchMaker+0x38; the caller does.\n- Result 1 means error codes 0x124f81..0x124f87, which include the cancel code 0x124f82; all other codes give 2.\n\n**Data RVNG must supply:**\n- Aircraft sets in UDM+0x1050. They look web-sourced [I], and UDM+0x1050/+0x10e0/+0x1000 are dereferenced without null checks.\n- UDM+0xf38 = the DM MissionProgramId, set before the screen opens.\n- The opponent's selector contents.\n- A release of state 3 to state 4 before select + disconnect time runs out.\n\n**Not analysed:** MRMM 0x14748d870 and the ModeSelect ctor 0x146f57390 are VM-protected. Anti-cheat call at 0x1474af87f: not analysed. The ModeSelect decide path is untraced.\n\nNotes and dumps are in <scratchpad>/lobby_ui/matching_verify/ (notes.txt, setup.txt, tick.txt, open.txt, close.txt, f_1474910d0.txt, walk.py)."
+  }
+ },
+ {
+  "key": "result",
+  "title": "Online results screen",
+  "map": {
+   "screen": "Online results screen (key \"result\"): Result map + WBP_Menu_Result_000 + ALiveResultAvatarGameMode",
+   "summary": "The online Result screen is a separate map. The match's Ended state travels to it (0x1471c5f0e). It loads ALiveResultAvatarGameMode, the 3D avatar sublevel and the NUI \"Result\" part, whose root widget (ULiveNUIMenuResultRootWidget) is native code with no Blueprint logic. The widget code makes no web calls itself. It only shows one finished result record that Bandai's Result API returns after a match, stored in UserDataManager at *(UDM+0x1228). It does not read the match's own EvaluationList or ScoreUpdate data. Offline that record does not exist, so the widget fills placeholder data instead (rand() plus hard-coded Ace Pass points 5590/8020). That placeholder Ace Pass builder divides by the season's PointPerTier. The season lookup's clock is LiveWebAPI+0x1b0, a server time that is never set offline, so the lookup finds no season and the game crashes with a divide by zero at 0x147725a84. So \"removing the Bandai calls\" is mostly done already (D5, the online flag and the null Strix client block them). What is missing is data: the screen can run offline only if RVNG adds a small crash guard and builds a fake result record in a layout that is still largely unknown. The cheaper path is to keep D6 and give RVNG its own result screen.",
+   "nativeClasses": [
+    {
+     "name": "ULiveNUIMenuResultRootWidget",
+     "label": "[V] root widget of WBP_Menu_Result_000 (package parent class). Vtable found from its property params at 0x14c9438f0..0x14c943e50, the object size 0x538 (destructor 0x146f5c090) and the member offsets slot 151 uses",
+     "vtable": "0x14c943f60",
+     "keyFunctions": [
+      "0x147704430 = vtable slot 151 (at 0x14c944418) [V]: screen setup. Gets the ULiveNUIMenuResultContext (0x1477e3030), takes the last entry of *(UDM+0x1228) or the empty default 0x14e33bc20 and the MissionID UDM+0xf38. If the entry's +0 FString is empty (Num<=1, at 0x14770480d) it sets ctx+0x71=1 and runs the placeholder builders 0x147724250, 0x147724f30, 0x147725720 and 0x1477259e0. Then 0x147723be0 / 0x147723e20 and the header setup 0x147703900 [V]",
+      "members [V]: +0x4c0/+0x4c8 dialog classes, +0x4d0 OfflineGameModeType, +0x4e8 PreviewBaseR, +0x4f0 PreviewPlayersR, +0x4f8 PreviewPersonalR, +0x500 PreviewDropR, +0x508 Time, +0x510 GuideFooter, +0x518 GridPanel_Header, +0x520 Text_Header, +0x528 Player_Canvas, +0x530 Player_PResult"
+     ]
+    },
+    {
+     "name": "ULiveNUIMenuResultContext",
+     "label": "[V] StaticClass 0x146f5c740 (name string 'LiveNUIMenuResultContext', size 0x430): the screen's working data",
+     "keyFunctions": [
+      "+0x71 placeholder flag [V], +0x78 placeholder record [V]",
+      "0x147723700 GetResultEntry [V]: returns ctx+0x78 if ctx+0x71, else the last *(UDM+0x1228) entry, else 0x14e33bc20",
+      "0x147725720 [V]: random pilot/aircraft levels (rand, IAT 0x14ab063d8) into +0x3a8..+0x3d0",
+      "0x147724250 [V]: placeholder record built with rand (7 calls)",
+      "0x1477259e0 [V]: placeholder Ace Pass progress into +0x3e0..+0x424, CRASH SITE 0x147725a84 (idiv) and 0x147725aaf"
+     ]
+    },
+    {
+     "name": "Ace Pass season lookup (free function)",
+     "label": "[V] 0x14771a280(worldCtx, out): finds the AcePassDataMap_ row whose StartDateGMT..EndDateGMT holds 'now'; returns false and leaves out zeroed when none matches. Its only caller is 0x147725a57 [V xref], and that caller ignores the return value",
+     "keyFunctions": [
+      "clock [V]: GAC(UDM+0xfb0)+0x108 ? [GAC+0x108]+0x1b0 : local SYSTEMTIME (IAT 0x14ab04900 -> 0x1417fcee0)",
+      "table [V]: GI+0x878 InformationManager_ +0x1468 = AcePassDataMap_ (reflection), row FLiveAcePassTable: +0x28 AcePassId, +0x34 PointPerTier (the divisor), +0x40/+0x50 Free/PaidRewardArray"
+     ]
+    },
+    {
+     "name": "ULiveNUIMenuResultView{Base,Top,Players,Personal,Drop}",
+     "label": "[V] StaticClass Base 0x146f5c7f0, Top 0x146f5d180, Players 0x146f5cfd0, Personal 0x146f5ce70, Drop 0x146f5cd90 (ELiveNUIMenuResultProcNo Base/Players/Personal/Drop)",
+     "vtable": "0x14c942dc0 (Top or Players; execvt gives both the same vtable [?])",
+     "keyFunctions": [
+      "0x14772db60 = slot 93 [V]: step machine for the views. Sets NUIManager(GI+0x980)+0x478 bit 2 [V]. Switches on ELiveGameModeType (2 CompetitiveCoop, 3 Deathmatch, 4 TDM, 5 PvPvE, 7 Boss, 8 Ace) and calls part builders 0x147730040, 0x147730910, 0x147730c00, 0x14772ed20, 0x14772f4e0, 0x14772efc0, 0x14772ea00, 0x14771bc10, 0x14771c190, 0x14771c900 [V]. All of them read the same *(UDM+0x1228) record or UDM+0xfd0 [V]"
+     ]
+    },
+    {
+     "name": "ULiveNUIMenuResultPlayerHeaderWidget (and the PreviewBase*/Personal*/Drop*/Dialog widgets)",
+     "label": "[V] native parents of all ~30 WBP_Menu_Result_* parts (package imports). Only Score_001, DopRItem_000 and PersonalRMedal_000 have small PreConstruct graphs",
+     "keyFunctions": [
+      "0x147703900 [V]: player header (name/callsign/emblem/platform/MVP/score). Uses MissionRoomMemberManager GI+0x958 through 0x147492a00, 0x147493650 (emblem id -> InformationManager 0x14734eb90), 0x1474939d0 and 0x147493910, plus UDM+0x1240 model +0x21 (name-hiding flag [I]). The placeholder path uses emblem 0x55f3 [V]"
+     ]
+    },
+    {
+     "name": "ALiveResultAvatarGameMode",
+     "label": "[V] StaticClass 0x1480dbec0. Constructor 0x1480e9030 jumps to protected code 0x15ccfc4c0, which stores vtable 0x14cc6bca0 (at 0x15ccfc4da). Size 0x428",
+     "vtable": "0x14cc6bca0",
+     "keyFunctions": [
+      "overrides vs ALiveAvatarGameModeBase vtable 0x14cc1be90 [V]: slots 114, 115, 300, 301 (and 0/304)",
+      "slot 114 0x1480f2150 [V]: begin. Calls Super 0x1480ec640, 0x1480f4340(this,5), NetworkResultManager(GI+0x960) 0x1474c9c70 (walks MRMM+0x40), 0x1480f3810 (registers a callback on NRM+0x78)",
+      "slot 300 0x1480f3d30 [V]: GM+0x420=1, timeout GM+0x424 from a setting (0x147ecc0d0, default 5)",
+      "slot 301 0x1480f3de0 [V]: state 1 sets my ResultState=2 in NM+0x2b0 (0x1474cc910). It sends to NM+0x4c0 (0x1474cdf20) only if SM+0x1fa. State 2 waits until CountAtLeast(NM+0x2b0,2) >= MemberCount (0x1474b39e0, 0 offline) or timeout, then 0x1475e23b0(NUIManager,1)",
+      "slot 115 0x1480f2310 -> 0x1480ee060 [V]: leave room 0x1474b5650 only if SM+0x1fa or SM+0x30",
+      "UFUNCTION link arrays 0x14cc6bc10 / 0x14cc6bc48 [V]: OnResultCameraAnimationSequenceFinished, SetAvatarDisplayModeParam, SetResultAvatarDisplayMode (thunks near 0x1480dc240..0x1480dc560; which are thunks is not checked)",
+      "does NOT run the base slot 301 0x1480ecce0 (messenger/party/anti-cheat-gated code): overridden, and the only xref is a thunk in another vtable [V]"
+     ]
+    },
+    {
+     "name": "ULiveNUIResultPartManager",
+     "label": "[V] StaticClass 0x146f72fc0. Parent of WBP_NUIResultPart, which WBP_NUIManager maps to ELiveNUIPartType::Result",
+     "keyFunctions": []
+    },
+    {
+     "name": "ALiveLobbyAvatarGameMode (correction)",
+     "label": "[I] vtable 0x14cc380e0 (destructor 0x1480cb8f0 sits next to a StaticClass, the same pattern as Guild 0x14cc3f468 / Result). 0x1480f1e50, given as a Result GM function in the task, belongs to this class's request chain, not the Result GM [V chain]",
+     "vtable": "0x14cc380e0",
+     "keyFunctions": [
+      "slot 302 0x1480f1490 -> 0x1480f1800 -> callback 0x1480f1e50 (delegate thunks 0x148110031/0x148110054) -> 0x1479b43b0([UDM+0x12a0]) and messenger 0x1480ecb40 [V]"
+     ]
+    }
+   ],
+   "howOpened": "[V] The online mission GM's Ended state (19), through +0xb18 0x1471c5d20, calls RequestChangeMap 0x147901bf0 at 0x1471c5f0e with the soft path at GM+0x380 (/Game/OnlineMode/Maps/Menu/Result per the 2026-11-18 run log). It is a full map travel, not a lobby menu. Result.umap holds LiveWorldSettings (its DefaultGameMode is an imported object, [I] BP_ResultAvatarGameMode_C) and the always-loaded sublevel SL_ResultAvatar. That sublevel's level Blueprint casts the GM to LiveResultAvatarGameMode and calls SetAvatarDisplayModeParam with 1/4/8 avatar/banner sets [V names]. The UI is the NUI Part type ELiveNUIPartType::Result -> WBP_NUIResultPart (ULiveNUIResultPartManager) [V WBP_NUIManager names] -> WBP_Menu_Result_000 [I link]. It is not one of the lobby menu manager's ELiveNUIMenuType entries. GM slot 300/301 runs the ResultState sync, then sets NUIManager(GI+0x980)+0x478 bit 1; the root view step 0x14772db60 sets bit 2; with both set, 0x147ec9660 -> 0x1475bf170 -> 0x147a388d0 runs ([I] releases the screen). Outside the lobby: [I] yes. It needs no lobby map, only GI-held state (UDM result model, MRMM members, NM tables), so RVNG could travel to it from the deathmatch. Today D6 sends that travel to the main menu instead.",
+   "dependencies": [
+    {
+     "addr": "0x147704607 (read of *(UDM+0x1228)); consumers 0x147723700, 0x147723750, 0x1477239a0, 0x147723be0, 0x147723e20, 0x14772a7b0, 0x14772db60, 0x14772ed20, 0x14772f4e0, 0x147730040, 0x147730910, 0x147730c00",
+     "what": "The screen's only real data: the last entry (stride 0xc8) in the Result API model array at *(UDM+0x1228). UDM+0x1220 is ResultAPIController [V reflection], and 0x14799b680 clears the model arrays at +0 and +0x10 [V]",
+     "service": "webapi",
+     "label": "[V] read path; [I] online the Bandai Result API response fills it (no writer found)",
+     "alreadyBlockedBy": "D5 (no Result API request ever leaves) and the online flags; offline the array is empty, so the screen takes the placeholder path",
+     "dataNeeded": "Record +0x00 FString result id, non-empty (the real vs placeholder switch) [V]; +0x20 FString MVP/top user id (0x147723e20 compares it) [V offset, I meaning]; +0x30 TArray of teams (stride 0x28), each with a users TArray at +0x18 (stride 0x170, +0 FString userId) [V]. Score/kills/deaths/rank/reward fields: unknown",
+     "standIn": "RVNG pushes one synthesized record: id 'RVNG', MVP = the winner's id, one team (DM) with two users (host, guest) holding score/kills/deaths. Reward fields zero. Layout still needs RE",
+     "risk": "high: unreflected structs; a wrong layout could crash or show garbage"
+    },
+    {
+     "addr": "0x14771a280 (called at 0x147725a57); crash 0x147725a84 / 0x147725aaf in 0x1477259e0",
+     "what": "Ace Pass season lookup for the placeholder battle-pass progress",
+     "service": "webapi",
+     "label": "[V] the clock is [GAC+0x108]+0x1b0. Web gate B caches GI+0x970 (LiveWebAPI) into GAC+0x108 at 0x1479594fb/0x147959504, and D5 calls the original gate before answering 0 (rvng_rt.c Gate()). So the clock is a server time; [I] it is 0 offline, no row matches, out+0x34 PointPerTier=0, divide by zero",
+     "alreadyBlockedBy": "D5 blocks the request but not this read; D6 avoids the map",
+     "dataNeeded": "A season row whose StartDateGMT<=now<=EndDateGMT and a non-zero PointPerTier",
+     "standIn": "Detour 0x1477259e0 to return early (or to call 0x14771a280 and return when it is false), so the Ace Pass part stays 0. Alternative: a hook that gives 0x14771a280 the local DT row 100001 (PointPerTier 100)",
+     "risk": "low: the function has one caller and only writes ctx+0x3e0..0x424"
+    },
+    {
+     "addr": "0x1478ca0a5 -> 0x147331d00 -> 0x14733ac60 (settings+0x200); second loader caller 0x1479a275b",
+     "what": "AcePassDataMap_ (InformationManager GI+0x878 +0x1468) loaded at GameInstance init from local data",
+     "service": "local_only",
+     "label": "[V] loader chain; [V] local DT_AcePass row 100001: 2024-08-01 00:00 to 2026-12-01 08:00 GMT, PointPerTier 100, MaxTier 100; [I] settings+0x200 is DT_AcePass; [?] what the 0x1479a275b reload (web code range) does",
+     "alreadyBlockedBy": "n/a (local)",
+     "dataNeeded": "none if the placeholder Ace Pass builder is skipped",
+     "standIn": "none; note that even with local time the row ends on 2026-12-01",
+     "risk": "low"
+    },
+    {
+     "addr": "UDM+0xfd0 read in 0x147723be0, 0x147723750, 0x1477239a0, 0x14772efc0, 0x147723f00, 0x147723660",
+     "what": "The local player's user id (FString at *(UDM+0xfd0)), used to find 'me' among the record's users",
+     "service": "login_state",
+     "label": "[V] reads; [I] it is the User API model filled by login, empty offline",
+     "alreadyBlockedBy": "D7 ends the login as failed, so it is never filled [I]",
+     "dataNeeded": "FString equal to the local user's id in the record",
+     "standIn": "RVNG writes the same id it puts in the synthesized record (e.g. host 'RVNG_HOST', guest 'RVNG_GUEST')",
+     "risk": "medium: the object layout behind the pointer is not verified"
+    },
+    {
+     "addr": "0x147703900 / 0x14771ea20 -> MRMM (GI+0x958) 0x147492a00, 0x147493650, 0x1474939d0, 0x147493910",
+     "what": "Per-player name, callsign, emblem, platform and flags for the player rows/headers",
+     "service": "strix",
+     "label": "[V] calls on GI+0x958 with the user id; [I] filled online from the room (Chronicle/Strix); RVNG already fills the room tables for the opponent",
+     "alreadyBlockedBy": "null Strix client / offline flags (nothing is fetched); RVNG supplies members itself",
+     "dataNeeded": "Member entries keyed by the same user ids as the record",
+     "standIn": "Keep RVNG's two MRMM members (host and guest gamer tags) alive through the travel",
+     "risk": "medium: lifetime across travel unverified"
+    },
+    {
+     "addr": "0x1474c9c70 (from GM slot 114 0x1480f22d2)",
+     "what": "NetworkResultManager (GI+0x960) builds per-member result objects (avatars) from MRMM+0x40",
+     "service": "local_only",
+     "label": "[V] call and MRMM+0x40 walk; [I] avatar/aircraft look comes from these",
+     "alreadyBlockedBy": "n/a",
+     "dataNeeded": "MRMM+0x40 AircraftSelector entries for both pilots",
+     "standIn": "RVNG's existing selector fill",
+     "risk": "low-medium"
+    },
+    {
+     "addr": "0x1480f3e65 MemberCount 0x1474b39e0, 0x1480f3f88 SetTableState 0x1474cc910, 0x1480f3fac send 0x1474cdf20",
+     "what": "ResultState sync between room members (NM+0x2b0)",
+     "service": "online_flag",
+     "label": "[V] the send runs only if SM+0x1fa; MemberCount is 0 offline so the wait ends at once",
+     "alreadyBlockedBy": "SM+0x1fa = 0 / null Strix client",
+     "dataNeeded": "none",
+     "standIn": "none (each PC goes on by itself)",
+     "risk": "low"
+    },
+    {
+     "addr": "0x1480ee0c3..0x1480ee18a in 0x1480ee060 (GM slot 115)",
+     "what": "On leaving: leave room 0x1474b5650 (only if SM+0x1fa or SM+0x30), then 0x1474af750 and 0x1474b1180(NM,1,0x124f86)",
+     "service": "strix",
+     "label": "[V] online guard; [?] what 0x1474b1180 travels to",
+     "alreadyBlockedBy": "offline flags; D6 OnlineLobby redirect for the following travel",
+     "dataNeeded": "none",
+     "standIn": "keep D6's OnlineLobby half",
+     "risk": "low"
+    },
+    {
+     "addr": "0x147703b4e / 0x14771eccf (UDM+0x1240 model +0x21)",
+     "what": "Header flag that switches to an alternate name string",
+     "service": "webapi",
+     "label": "[V] read; [I] settings model, default 0 offline",
+     "alreadyBlockedBy": "D5",
+     "dataNeeded": "none",
+     "standIn": "leave default",
+     "risk": "low"
+    },
+    {
+     "addr": "0x1471c5f0e RequestChangeMap 0x147901bf0",
+     "what": "Ended's travel to the Result map",
+     "service": "local_only",
+     "label": "[V]",
+     "alreadyBlockedBy": "D6 (Result half) sends it to the main menu",
+     "dataNeeded": "n/a",
+     "standIn": "lift D6's Result half only after the record and crash guard exist",
+     "risk": "low"
+    },
+    {
+     "addr": "0x1480f1e50 -> 0x1479b43b0 (gate A check at 0x1479b43cc) on [UDM+0x12a0]; messenger 0x1480ecb40 -> 0x1474f2880",
+     "what": "Web request and messenger call in the (Lobby) avatar GM callback chain. The task listed it as Result GM, but it is reached from vtable 0x14cc380e0 slot 302, not from the Result GM",
+     "service": "webapi",
+     "label": "[V] gate A guard and chain; [I] owner is ALiveLobbyAvatarGameMode; note UDM+0x12a0 is PenaltyAPIController in reflection [V]",
+     "alreadyBlockedBy": "D5 (gate A answers false)",
+     "dataNeeded": "none for the Result screen",
+     "standIn": "none",
+     "risk": "low"
+    },
+    {
+     "addr": "0x1480ecce0 (base avatar GM slot 301): messenger 0x1480ed0dd/0x1480ed0fd, party invite 0x1480ed786",
+     "what": "Messenger/party code in ALiveAvatarGameModeBase's tick",
+     "service": "eos",
+     "label": "[V] not reached by the Result GM (slot 301 overridden by 0x1480f3de0; no xref)",
+     "alreadyBlockedBy": "not reached; messenger null-guarded, no login (per deep_pass)",
+     "dataNeeded": "none",
+     "standIn": "none",
+     "risk": "low"
+    },
+    {
+     "addr": "0x1480eceff",
+     "what": "anti-cheat call at 0x1480eceff: not analysed (inside base avatar GM 0x1480ecce0, which the Result GM does not run)",
+     "service": "anticheat_not_analysed",
+     "label": "[V] address from deep_pass; not analysed by rule",
+     "alreadyBlockedBy": "not reached from the Result GM vtable [V]"
+    },
+    {
+     "addr": "Personal/Drop views and dialogs (0x14772ea00, 0x14772efc0, 0x14772f990, 0x14772fd10; reward dialog)",
+     "what": "Rewards: Zoll, Ace Pass points/tier, aircraft proficiency/level, pilot XP/rank, medals, drop crates, reward breakdown (FLiveOnlineGameResultRewardDetail)",
+     "service": "webapi",
+     "label": "[V] header fields; [I] values come from the same server record (0 or absent offline)",
+     "alreadyBlockedBy": "D5 (no data ever arrives)",
+     "dataNeeded": "reward fields in the record",
+     "standIn": "zeros; hide the views if a skip exists",
+     "risk": "medium: unknown whether zero values skip or animate cleanly"
+    }
+   ],
+   "verdict": "usable_needs_data",
+   "stubPlan": [
+    "1. Keep D5, D7 and both halves of D6 as they are until steps 2-6 exist (the screen crashes offline today).",
+    "2. Crash guard: detour 0x1477259e0 (placeholder Ace Pass builder) to return at once, or to call 0x14771a280 itself and return when it fails, so 0x147725a84 can never divide by zero. Its one caller is 0x147704864 [V].",
+    "3. Real-path record: before the travel at 0x1471c5f0e, append one 0xc8-byte record to the array at *(UDM+0x1228)+0: +0 FString 'RVNG...' (non-empty, so ctx+0x71 becomes 0), +0x20 FString winner id, +0x30 TArray with one team (0x28 bytes) whose +0x18 TArray holds two 0x170-byte user records (+0 FString userId) with score/kills/deaths. Needs RE of the record layout first: the copy routine 0x1479be550, the consumers 0x147730040 / 0x147730910 / 0x147730c00 / 0x14772ed20, and the /results/get parser (string 0x14beebfa0, no direct xref).",
+    "4. Local id: make *(UDM+0xfd0)'s FString equal to the local user's id in the record (host and guest each set their own).",
+    "5. Names/emblems: keep both pilots' MRMM (GI+0x958) entries, including MRMM+0x40 selectors, through the travel. They are keyed by the same ids, so 0x147492a00/0x147493650/0x147493910 and NetworkResultManager 0x1474c9c70 resolve them.",
+    "6. Neutral rewards: leave all reward fields 0 (Zoll, pass points, XP, drops). If the step machine 0x14772db60 can skip the Personal/Drop steps, skip them; otherwise they show zeros.",
+    "7. Lift only D6's Result half once 2-6 pass a logged test (check ctx+0x71 == 0, no crash, rows show both pilots). Keep D6's OnlineLobby half for the exit travel after 0x1480ee060.",
+    "8. Nothing to stub for the ResultState sync, leave-room or ResultState send: SM+0x1fa = 0 and MemberCount 0 already make them local no-ops [V].",
+    "Cheaper alternative (recommended): keep D6 and draw RVNG's own result panel (both pilots, score, kills, deaths, winner) from RVNG's own match data; the stock screen never reads EvaluationList/ScoreUpdate anyway."
+   ],
+   "openQuestions": [
+    "The full layout of the 0xc8 result record and the 0x170 user record (score, kills, deaths, standing, MVP flag, rewards) is unknown. No writer of *(UDM+0x1228) was found, and the '/results/get' string 0x14beebfa0 has no direct xref (it may be used from protected code).",
+    "Is LiveWebAPI(GI+0x970)+0x1b0 really 0 offline? This is inferred from the crash plus the local DT row covering 2026-11-18. It was not read at run time.",
+    "Is *(UDM+0xfd0) (the local user id) empty offline, and what object layout sits behind that pointer?",
+    "What does the second InformationManager table loader at 0x1479a275b (web code range) do, and does it run offline or replace AcePassDataMap_?",
+    "Which code picks ELiveNUIPartType::Result on map load, and what exactly does the NUIManager+0x478 two-bit gate release (0x147ec9660 -> 0x1475bf170 -> 0x147a388d0)?",
+    "Which view class owns vtable 0x14c942dc0 (execvt gives the same vtable for ViewTop and ViewPlayers)? Do the real-path Personal/Drop builders read further server data (e.g. Ace Pass tiers from the record) outside the scanned range 0x147700000-0x147740000?",
+    "Do MRMM member entries and NetworkResultManager objects survive the map travel, and are MRMM members keyed by the same user-id strings as the record?",
+    "What do 0x1474af750 and 0x1474b1180(NM,1,0x124f86) on leaving do (a travel target)?",
+    "Correction to check: in reflection UDM+0x12a0 is PenaltyAPIController, not 'LiveWebAPI'; the LiveWebAPI is GI+0x970 (cached as GAC+0x108).",
+    "The local Ace Pass row ends 2026-12-01 08:00 GMT. Any path that falls back to local time will also find no season after that date."
+   ],
+   "displays": [
+    "Header: Text_Header (+0x520), GridPanel_Header (+0x518), auto-advance timer WBP_Menu_Common_Parts_Time_000 (+0x508, timings from ULiveNUIResultParam TimeLimit*) [V header/offsets]",
+    "Base view (PreviewBaseR, +0x4e8): one layout per mode: Coop (Score/Rank/Team/PlayerList8), PvTDM (Team/PlayerList8), DM (MVP part + PlayerList8 'DM01'), Boss, Ace [V header]. Rows show Text_Rank, Text_Player, Text_CallSign, Text_Score, Img_Emblem, Img_Platform, Img_MVP [V]. Source: the record's +0x30 teams/users and +0x20 MVP id (Result API, web) [V offsets, I meaning]. Names/emblem/platform come from MRMM GI+0x958, the emblem image from the InformationManager table (0x14734eb90) [V calls]",
+    "Players view (PreviewPlayersR, +0x4f0): 8 player headers T01..B04 plus activity/medal headers [V header]. Source: the same record [I]",
+    "Personal view (PreviewPersonalR, +0x4f8): Basic result, medals/activity, Zoll, Ace (battle) Pass gauge, aircraft level gauge, pilot rank [V header]. Source: server reward data in the record [I]. In the offline placeholder path: random levels (0x147725720) and hard-coded pass points 5590 -> 8020 (+2430), with tiers divided by the Ace Pass season's PointPerTier (the crash) [V]",
+    "Drop view (PreviewDropR, +0x500): crate/item drops [V header]. Source: server record [I]",
+    "Player result header (+0x530 Player_PResult, 0x147703900): my name, callsign, rank, emblem, platform, MVP, score [V]",
+    "Dialogs: score detail (kill list: NPC kill/damage, player elimination/damage, decoy, indirect kill, EW scores) and reward detail (FLiveOnlineGameResultRewardDetail Total, Bonus, Mission, Standing, rank, Mvp, score, TopAce, Boost, PassPoint, AcePass, Penalty ...) [V headers]; source: server record [I]",
+    "3D scene: SL_ResultAvatar with 1/4/8 avatar and banner sets placed through SetAvatarDisplayModeParam [V names]; per-member avatars from NetworkResultManager/MRMM [I]",
+    "Not shown from match data: no NetworkManager (GI+0x928) read in the 49 Result widget functions scanned (depth 3) [V within scope], so EvaluationList/ScoreUpdate never reach this screen"
+   ],
+   "assets": [
+    "/Game/OnlineMode/Maps/Menu/Result (Result.umap: LiveWorldSettings, sublevel SL_ResultAvatar)",
+    "/Game/OnlineMode/Maps/Menu/Result/SL_ResultAvatar (level BP: InitializeGameMode, SetAvatarDisplayModeParam, LiveResultAvatarData)",
+    "/Game/OnlineMode/Maps/Menu/Result/BP_ResultAvatarGameMode (parent LiveResultAvatarGameMode)",
+    "/Game/OnlineMode/Maps/Menu/Result/BP_ResultAvatar (parent LiveResultAvatar)",
+    "/Game/OnlineMode/Maps/Menu/Result/BP_ResultBanner (Actor + WidgetComponent)",
+    "/Game/OnlineMode/UI/NUI/System/Part/WBP_NUIResultPart (parent LiveNUIResultPartManager, ResourceBank AD_Part_Result_ResourceBank)",
+    "/Game/OnlineMode/UI/NUI/Result/WBP_Menu_Result_000 (parent LiveNUIMenuResultRootWidget, no graph)",
+    "/Game/OnlineMode/UI/NUI/Result/WBP_Menu_Result_Parts_* (28 parts, each a native LiveNUIMenuResult* parent; see nativeClasses)",
+    "/Game/OnlineMode/UI/NUI/Result/WBP_Menu_Result_Dialog_Parts_{Reward_000,Score_000,Score_001}",
+    "/Game/OnlineMode/DataTables/QuestData/DT_AcePass (row 100001: 2024-08-01..2026-12-01 08:00 GMT, PointPerTier 100, MaxTier 100)"
+   ],
+   "evidenceFiles": [
+    "E:/ACE8 PVP/docs/re/DEATHMATCH_NATIVE.md (section 9.1, test 2 run C crash)",
+    "E:/ACE8 PVP/native/rvng_rt.c (Gate(): D5 calls the original gate, then returns 0; D6 Result half)",
+    "E:/ACE8 PVP/docs/re/deathmatch/deep_pass.json (Result GM/messenger/party notes, checked against the vtables)",
+    "E:/ACE8 Survival Mode/build/liveproject/Source/Live/Public/LiveNUIMenuResultRootWidget.h, LiveNUIMenuResult*.h, LiveNUIResultParam.h, LiveOnlineGameResultRewardDetail.h, LiveAcePassTable.h, LiveInformationManager.h, LiveUserDataManager.h, LiveGeneralAPIController.h, ELiveGameModeType.h, ELiveNUIMenuResultProcNo.h (read only)",
+    "E:/ACE8 Survival Mode/build/liveproject/Source/LiveLobby/Public/LiveResultAvatarGameMode.h (read only)",
+    "<scratchpad>/lobby_ui/result/pk/ (extracted Result map, GM, avatar, banner, NUIResultPart, all WBP_Menu_Result_* parts, DT_AcePass)",
+    "<scratchpad>/lobby_ui/result/names.txt",
+    "<scratchpad>/lobby_ui/result/re_scripts/dis_rootslot151.txt (0x147704430)",
+    "<scratchpad>/lobby_ui/result/re_scripts/dis_builders.txt, dis_real.txt, dis_readers.txt, dis_view93.txt, dis_03900.txt, dis_24250.txt, dis_gac_range.txt, dis_result_range.txt",
+    "<scratchpad>/lobby_ui/result/re_scripts/lib.py, reach.py (static helpers on E:/ACE8 PVP/tools/re/exe.py)"
+   ]
+  },
+  "verify": {
+   "screen": "Online results screen (key \"result\"): Result map + WBP_Menu_Result_000 (ULiveNUIMenuResultRootWidget) + views + ALiveResultAvatarGameMode",
+   "claimsChecked": [
+    {
+     "claim": "Crash site: 0x147725a84 (and 0x147725aaf) idiv 5590/8020 by out+0x34 PointPerTier of the struct 0x14771a280 fills, inside placeholder Ace Pass builder 0x1477259e0, whose only caller is 0x147704864",
+     "verdict": "confirmed",
+     "evidence": "[V] disasm 0x1477259e0..0x147725ad4: call 0x14771a280 at 0x147725a57, movsxd rcx,[rbp-0x15] (= out+0x34), mov eax,0x15d6, idiv rcx at 0x147725a84, 0x1f54 idiv at 0x147725aaf; out+0x28 -> ctx+0x3e0. xref 0x1477259e0 -> only 0x147704864; xref 0x14771a280 -> only 0x147725a57, return value not tested. 0x1477259e0 is a 16-byte pdata chunk, body chunk starts 0x147725a06 (the doc's 'function 0x147725a06')."
+    },
+    {
+     "claim": "0x14771a280 clock = [GAC(UDM+0xfb0)+0x108]+0x1b0 if non-null, else local SYSTEMTIME; table = InfoMgr(GI+0x878)+0x1468, rows matched on StartDateGMT..EndDateGMT",
+     "verdict": "confirmed",
+     "evidence": "[V] 0x14771a31f..0x14771a347 (GI+0x8e0 -> +0xfb0 -> +0x108 -> +0x1b0), fallback IAT 0x14ab04900 = KERNEL32!GetLocalTime (local time, not GMT) then 0x1417fcee0; r14 = [GI+0x878]+0x1468; compare at 0x14771a529/0x14771a52f against row +0x8/+0x10 (FLiveAcePassTable: StartDateGMT +8, EndDateGMT +0x10, AcePassId +0x28, PointPerTier +0x34 per LiveAcePassTable.h)."
+    },
+    {
+     "claim": "Gate B caches GI+0x970 (LiveWebAPI) into GAC+0x108 and D5 calls the original gate before answering 0, so the clock is the server time, not local time",
+     "verdict": "confirmed",
+     "evidence": "[V] 0x147959480: mov [rdi+0x108], rsi at 0x1479594fb/0x147959504 with rsi = GI+0x970; also caches GI+0x8e0 at +0x110; returns [GAC+0xf8]!=0. rvng_rt.c Gate() line 1762 calls g_origGate first, returns 0. So under RVNG the GetLocalTime fallback never runs once gate B ran on that GAC."
+    },
+    {
+     "claim": "LiveWebAPI+0x1b0 is 0 offline, so no season matches and PointPerTier stays 0",
+     "verdict": "unverifiable",
+     "evidence": "[I] Runtime value not readable statically. Consistent with the crash: the table is filled from a local DataTable ([V] 0x14733ac60 writes InfoMgr+0x1468, called at 0x147332481 with settings+0x200) and the run date 2026-11-18 is inside the DT row the map quotes, so the clock cannot have been local time."
+    },
+    {
+     "claim": "AcePassDataMap_ is loaded at GameInstance init from local data via 0x1478ca0a5 -> 0x147331d00 -> 0x14733ac60 (settings+0x200); second loader caller 0x1479a275b",
+     "verdict": "partly",
+     "evidence": "[V] xref 0x147331d00 = {0x1478ca0a5, 0x1479a275b}; 0x147332481 calls 0x14733ac60(InfoMgr, [rsi+0x200]) which writes r15+0x1468 (0x14733acb1, 0x14733b333). [not checked] that 0x1478c9ac1 is GI init and that settings+0x200 is DT_AcePass."
+    },
+    {
+     "claim": "Root widget ULiveNUIMenuResultRootWidget: vtable 0x14c943f60, size/dtor 0x146f5c090, slot 151 = 0x147704430",
+     "verdict": "confirmed",
+     "evidence": "[V] registry entry {Z 0x146f5c060, StaticClass 0x146f5bfb0, L\"ULiveNUIMenuResultRootWidget\" 0x14c9484e0} at 0x14c943f38..; vtable 0x14c943f60 right after, slot 0 = 0x146f5c090 (stores the vtable), protected ctor 0x15a6eb7c0 stores it too and sets +0x4d0 = 2; [0x14c944418] = 0x147704430. Reflection: OfflineGameModeType offset 0x4d0."
+    },
+    {
+     "claim": "Slot 151 takes the last *(UDM+0x1228) entry (stride 0xc8) or empty default 0x14e33bc20; if entry FString Num<=1 sets ctx+0x71 and runs placeholder builders 0x147724250, 0x147724f30, 0x147725720, 0x1477259e0; then 0x147723be0, 0x147723e20, 0x147703900",
+     "verdict": "confirmed",
+     "evidence": "[V] 0x147704607..0x14770462d, 0x14770480d cmp [rdi+8],1 / setle -> [rbp+0x71]; calls at 0x14770482e..0x147704864, 0x147704880, 0x1477048a7, 0x1477048c1. Also [V] game-mode type ctx+0x70 = 0x14734cac0(InfoMgr, UDM+0xf38) (mission row +0x6c) or widget+0x4d0 (default 2 = CompetitiveCoop) when UDM+0xf38 <= 0 (not in the map)."
+    },
+    {
+     "claim": "ULiveNUIMenuResultContext StaticClass 0x146f5c740; 0x147723700 returns ctx+0x78 if ctx+0x71 else last *(UDM+0x1228) entry else 0x14e33bc20; 0x147725720 rand into +0x3a8..+0x3d0; 0x147724250 has 7 rand calls",
+     "verdict": "confirmed",
+     "evidence": "[V] registry entry 0x14c942d40 -> SC 0x146f5c740 (ctor 0x146f60550, vtable 0x14c9426f0); 0x147723700 disasm; 0x147725720 writes +0x3a8..+0x3d0 and calls IAT 0x14ab063d8 = rand; 7 references to 0x14ab063d8 in 0x147724250."
+    },
+    {
+     "claim": "Record layout: +0x20 FString compared by 0x147723e20 (MVP/top id), +0x30 TArray teams stride 0x28 with users TArray at +0x18 stride 0x170, user +0 FString id",
+     "verdict": "confirmed",
+     "evidence": "[V offsets] 0x147723e63..0x147723e8b compares rec+0x20 FString; 0x147723be0: rsi+0x30/+0x38 array, r15 = [..]+0x18, add r11,0x170 at 0x147723d60, add r15,0x28 at 0x147723d79. Meaning (MVP etc.) remains [I]."
+    },
+    {
+     "claim": "UDM+0x1220 is ResultAPIController; UDM+0x12a0 is PenaltyAPIController (the task's 'LiveWebAPI = UDM+0x12a0' is wrong; LiveWebAPI is GI+0x970)",
+     "verdict": "confirmed",
+     "evidence": "[V] FPropertyParams offsets: GeneralAPIController 0xfb0, UserAPIController 0xfc8, BlockAPIController 0x1010, ResultAPIController 0x1220, SettingsAPIController 0x1238, AcePassAPIController 0x1270, PenaltyAPIController 0x12a0, LogAPIController 0x1330, OnlineMenuBadgeManager 0x1348. GI header order puts LiveWebAPI_ at 0x970."
+    },
+    {
+     "claim": "View vtable 0x14c942dc0 is Top or Players [?]",
+     "verdict": "partly",
+     "evidence": "[V] It is ULiveNUIMenuResultViewTop: StaticClass 0x146f5d180 references ctor 0x146f60760, which stores 0x14c942dc0. ViewPlayers ctor 0x146f60740 -> 0x14772aeb0 stores vtable 0x14c943548; ViewPersonal 0x14c943220, ViewDrop 0x14c942340, ViewBase 0x14c9429f0.",
+     "correction": "0x14c942dc0 = ViewTop (slot 93 0x14772db60 is ViewTop's step machine); ViewPlayers = 0x14c943548."
+    },
+    {
+     "claim": "0x14772db60 sets NUIManager(GI+0x980)+0x478 bit 2 and, with bit 1 from the GM, runs 0x147ec9660 -> 0x1475bf170 -> 0x147a388d0; part builders read *(UDM+0x1228)",
+     "verdict": "confirmed",
+     "evidence": "[V] or dword [rsi+0x478],2 at 0x14772dd57, calls 0x147ec9660/0x1475bf170/0x147a388d0 (protected thunk); 0x1475e23b0 does the same for bit 1; builders 0x147730040/0x147730910/0x147730c00/0x14772ed20/0x14772f4e0 read UDM+0x1228 (scan s_views.txt)."
+    },
+    {
+     "claim": "ALiveResultAvatarGameMode: StaticClass 0x1480dbec0, ctor 0x1480e9030 -> 0x15ccfc4c0 stores vtable 0x14cc6bca0; overrides slots 114, 115, 300, 301 vs base 0x14cc1be90",
+     "verdict": "confirmed",
+     "evidence": "[V] ctor ref in StaticClass at 0x1480dbf27; 0x15ccfc4da lea 0x14cc6bca0; vtable diff gives only slots 0,114,115,300,301 (304+ is data)."
+    },
+    {
+     "claim": "Slot 301 0x1480f3de0: sets ResultState=2 in NM+0x2b0, sends via NM+0x4c0 only if SM+0x1fa; MemberCount 0x1474b39e0 is 0 offline so the wait ends at once, then 0x1475e23b0(NUIManager,1)",
+     "verdict": "confirmed",
+     "evidence": "[V] 0x1480f3f5c/0x1480f3f95 tests SM+0x1fa; 0x1474b39e0 returns 0 when SM+0x1fa==0 (0x1474b39ee -> 0x1474b3b1b xor eax,eax). Count function 0x1474cc700 is a protected thunk (not read)."
+    },
+    {
+     "claim": "Slot 115 -> 0x1480ee060: leave room 0x1474b5650 only if SM+0x1fa or SM+0x30",
+     "verdict": "wrong",
+     "evidence": "[V] 0x1480ee0b7..0x1480ee0dd: if NM+0x4c9==0 and SM+0x1fa==0 it jumps straight to the LeaveRoom call (0x1480ee14e, reason \"AvatarGameModeBase\"); SM+0x30 is only tested when NM+0x4c9!=0 or SM+0x1fa!=0.",
+     "correction": "Offline (NM+0x4c9 == 0) the GM's EndPlay DOES call NM LeaveRoom. Its Strix calls 0x145239880 / 0x1452392f0 each return early on the null Strix global 0x14e4c5818 [V], so nothing leaves the PC, but LeaveRoom also clears SM+0x1f9/0x1fa, sets SM+0x30=-1 and NM+0x4c8=0 (local state RVNG may care about)."
+    },
+    {
+     "claim": "0x1474af750 and 0x1474b1180(NM,1,0x124f86): [?] what it travels to",
+     "verdict": "wrong",
+     "evidence": "[V] 0x1474af750 calls Chronicle matchmaker GI+0x918 0x14748cc20 (session lookup by type 1) and returns non-null; 0x1474b1180 stores 0x124f86 at NM+0x4a4 and, if a session exists, tail-calls 0x14748d220 -> 0x14748bc90 -> plugin 0x145402150 / 0x145401600 (Chronicle SDK, [I]).",
+     "correction": "Not a travel: it is a Chronicle matchmaker cancel, reached only if a matchmaker session of type 1 exists ([I] none under RVNG, which never starts Chronicle matching)."
+    },
+    {
+     "claim": "Base avatar GM slot 301 0x1480ecce0 (messenger/party/anti-cheat-gated code) is not run by the Result GM",
+     "verdict": "confirmed",
+     "evidence": "[V] ptr refs of 0x1480ecce0 = base vtable slot 301 (0x14cc1c7f8) and Guild vtable 0x14cc3fdd0; code ref only the jmp thunk 0x1480f15f0, which is slot 301 of the Lobby GM vtable 0x14cc380e0 (0x14cc38a48). But see missed dependency: the Result screen's own exit travels to the online lobby, whose GM runs it."
+    },
+    {
+     "claim": "0x1480f1e50 belongs to the (Lobby) avatar GM request chain, not the Result GM",
+     "verdict": "confirmed",
+     "evidence": "[V] not in the Result vtable; xrefs only delegate thunks 0x148110031/0x148110054; Lobby vtable 0x14cc380e0 slot 302 = 0x1480f1490 (dtor 0x1480cb8f0 stores the vtable; registry entry ALiveLobbyAvatarGameMode at 0x14cc38b40, SC 0x1480cb810)."
+    },
+    {
+     "claim": "The widget code makes no web calls itself; it only shows the *(UDM+0x1228) record",
+     "verdict": "partly",
+     "evidence": "[V] No gate A/B, GAC request, Strix/EOS/Steam import in a depth-3 scan of the root widget, all four view vtables and the GM (s_root.txt, s_views.txt, s_gm.txt). But the Personal view's Ace Pass gauge 0x147590d30 also reads *(UDM+0x1278) and LiveWebAPI (GI+0x970)+0x1b0 through 0x147927680 -> 0x1479289e0, and the exit handler travels to the online lobby (see missed dependencies).",
+     "correction": "No direct web request, but more web-API data than the record: the AcePass model at UDM+0x1278 and the LiveWebAPI server clock; and the exit leads into the online lobby."
+    },
+    {
+     "claim": "No NetworkManager (GI+0x928) read in the Result widgets; EvaluationList/ScoreUpdate never reach this screen",
+     "verdict": "partly",
+     "evidence": "[V] GI+0x928 is read by RootWidget slot 165 0x147704ba0 and ViewPlayers slot 92 0x14772b950, but only to call LeaveRoom. I found no read of NM score/evaluation tables in the depth-3 scan; that the screen never shows match data is consistent but not proven beyond that depth."
+    },
+    {
+     "claim": "Stub plan / alreadyBlockedBy: 'keep D6's OnlineLobby half' for the exit travel after 0x1480ee060",
+     "verdict": "wrong",
+     "evidence": "[V] rvng_rt.c OnChangeMap redirects only kResultMap; comment at line 1913 and DEATHMATCH_NATIVE.md 9.8 say the OnlineLobby/AbortPath travel 'D6 does not redirect yet'. The exit travel comes from RootWidget slot 165 0x147704ba0 -> 0x147ec9fc0 (writes UDM+0xf3c = 0x1869b) -> 0x147ec9e40 -> RequestChangeMap 0x147901bf0, not from 0x1480ee060.",
+     "correction": "There is no D6 OnlineLobby half today. Lifting D6's Result half without adding one would send players from the Result screen into the online lobby map."
+    },
+    {
+     "claim": "Player header 0x147703900 uses MRMM GI+0x958 via 0x147492a00, 0x147493650, 0x1474939d0, 0x147493910, emblem via InfoMgr 0x14734eb90, UDM+0x1240 model +0x21, placeholder emblem 0x55f3",
+     "verdict": "confirmed",
+     "evidence": "[V] 0x14770397b, 0x147703b4e/0x147703b55, 0x147703b7f, 0x147703d03, 0x147703d11, 0x147703d60, 0x147703de1, 0x147703df5. MRMM helpers scanned 3 deep: no online flags or SDK calls."
+    },
+    {
+     "claim": "WBP_Menu_Result_000, BP_ResultAvatarGameMode and WBP_NUIResultPart have no Blueprint logic; Result.umap holds LiveWorldSettings and sublevel SL_ResultAvatar",
+     "verdict": "partly",
+     "evidence": "[V] Zen name tables of the three have no Ubergraph/K2Node/CallFunc names. Result.umap exports: Result_C, PersistentLevel, LevelStreamingAlwaysLoaded_0 (SL_ResultAvatar), an export named ChronicleWorldSettings (class not resolved by me). BP_ResultAvatarGameMode has a PlugHolder component and GoBack/GoNext names (not analysed)."
+    },
+    {
+     "claim": "No writer of *(UDM+0x1228) found",
+     "verdict": "partly",
+     "evidence": "[V] the model pointer is set at UDM init (0x147918454 from a static, same pattern at 0x147917f59 for +0xfd0); the ResultAPI request 0x1479bdc40 is called only at 0x1474c968c, inside the sweep of the MissionRewardUser handler 0x1474c8f80 (label from deep_pass.json). The response parser that fills the array is still unknown."
+    },
+    {
+     "claim": "Crash guard: detour 0x1477259e0 to return early, low risk",
+     "verdict": "confirmed",
+     "evidence": "[V] one caller (0x147704864, placeholder branch only); it writes only ctx+0x3e0..0x424 before the loop; divs.py finds no other integer divide reachable 3 levels from the root widget and all view vtable slots. Feeding the lookup a season instead only works until the local row's end (2026-12-01 08:00 GMT per the map's DT read, 12 days from today)."
+    }
+   ],
+   "missedDependencies": [
+    {
+     "addr": "0x147704ba0 (ULiveNUIMenuResultRootWidget vtable 0x14c943f60 slot 165) -> 0x147704c04 call 0x147ec9fc0 -> 0x147eca01b call 0x147ec9e40 -> RequestChangeMap 0x147901bf0",
+     "what": "The screen's exit handler travels to the ONLINE LOBBY (level 99995; writes UDM+0xf3c = 0x1869b at 0x147eca011). The online lobby runs ALiveLobbyAvatarGameMode (vtable 0x14cc380e0), whose slot 301 thunk 0x1480f15f0 -> 0x1480ecce0 has the messenger calls 0x1480ed0dd/0x1480ed0fd, the EOS party invite 0x1480ed786 and an anti-cheat call at 0x1480eceff (not analysed), and whose slot 302 0x1480f1490 -> 0x1480f1e50 makes a gate-A web request. RVNG's D6 does not redirect this travel today",
+     "service": "online lobby travel (webapi, eos, strix downstream; anti-cheat call not analysed)",
+     "evidence": "[V] disasm 0x147704ba0 and 0x147ec9fc0..0x147eca15f; Lobby vtable slots 301/302 read from the exe; rvng_rt.c OnChangeMap handles only kResultMap; rvng_rt.c line 1913 and DEATHMATCH_NATIVE.md 9.8: 'D6 does not redirect yet'"
+    },
+    {
+     "addr": "0x147704ca5 (root slot 165, reason \"default\" 0x14b777ab8) and 0x14772ba1e (ULiveNUIMenuResultViewPlayers vtable 0x14c943548 slot 92 0x14772b950, reason \"Result_PlayerView\" 0x14cb95cc8) -> NM LeaveRoom 0x1474b5650",
+     "what": "Two more Strix LeaveRoom calls from the screen itself. Strix calls inside 0x145239880 / 0x1452392f0 return early on the null Strix global 0x14e4c5818. The local side effects still run: SM+0x1f9/0x1fa cleared, SM+0x30 = -1, NM+0x4c8 = 0, NM+0x710/0x718 reset, 0x1474b5950(NM,0) on NM+0x4c0, and *(UDM+0xfd0) is read when SM+0x360 == 1",
+     "service": "strix",
+     "evidence": "[V] disasm 0x14772b950, 0x147704ba0, 0x1474b5650 (0x1474b5668..0x1474b5787), 0x145239884 and 0x1452392f4 test 0x14e4c5818"
+    },
+    {
+     "addr": "0x1480ee14e (GM slot 115 -> 0x1480ee060)",
+     "what": "The GM's EndPlay LeaveRoom (reason \"AvatarGameModeBase\") is taken offline: the guard sends NM+0x4c9==0 and SM+0x1fa==0 straight to the call. The map said it runs only when SM+0x1fa or SM+0x30 is set",
+     "service": "strix",
+     "evidence": "[V] 0x1480ee0b7 cmp NM+0x4c9 / 0x1480ee0cf je 0x1480ee0df (SM+0x1fa==0) -> 0x1480ee14e call 0x1474b5650; string 0x14cc704f8"
+    },
+    {
+     "addr": "0x1480ee158 -> 0x1474af750 -> 0x14748cc20 on GI+0x918; 0x1480ee18a -> 0x1474b1180 -> 0x14748d220 -> 0x14748bc90 -> 0x145402150 / 0x145401600",
+     "what": "Chronicle matchmaker check and cancel at GM EndPlay: it looks up a matchmaker session (type 1) and, if one exists, cancels it through the Chronicle plugin. [I] no session exists under RVNG, so it skips. The map labelled it 'what it travels to [?]'",
+     "service": "chronicle",
+     "evidence": "[V] disasm 0x1474af750 (mov rcx,[GI+0x918]; call 0x14748cc20), 0x1474b1180 (0x1474b11ae / 0x1474b11d5 jmp 0x14748d220), 0x14748d277 -> 0x14748bc90 -> 0x14748bcc8/0x14748bcd3"
+    },
+    {
+     "addr": "0x147727670 (ViewPersonal vtable 0x14c943220 slot 93) -> 0x147590d30 (0x1475914df reads *(UDM+0x1278)) -> 0x1475914f2 call 0x147927680 -> 0x1479289e0 (0x147928a21 GI+0x970, 0x147928a5f +0x1b0) -> InfoMgr 0x147352ae0",
+     "what": "The Personal view's Ace Pass gauge reads the AcePass web-API model (UDM+0x1278, right after AcePassAPIController at UDM+0x1270) and the same LiveWebAPI server clock (+0x1b0) to find the current season. It does this on the real-record path too, so a synthesized record alone does not cover it. It uses no integer divide, so [I] no crash, but the gauge shows a default entry (0x14dd898d0) offline. 0x1479289e0 dereferences GI+0x970 without a null check",
+     "service": "webapi",
+     "evidence": "[V] disasm 0x147590d30, 0x147927680, 0x1479289e0; reflection AcePassAPIController offset 0x1270; divs.py finds only 0x147725a84/0x147725aaf as integer divides in reach"
+    },
+    {
+     "addr": "0x147704634 (UDM+0xf38) -> 0x1477047fc call 0x14734cac0(InfoMgr, MissionID)",
+     "what": "Which layout is shown (ctx+0x70: 3 = Deathmatch) comes from the mission row's +0x6c for UDM+0xf38. If it is <= 0, the widget's OfflineGameModeType (+0x4d0, default 2 = CompetitiveCoop) is used. RVNG must keep the DM mission id in UDM+0xf38 for the DM layout",
+     "service": "local_only",
+     "evidence": "[V] disasm 0x147704430 at 0x1477047f1..0x14770480a and 0x14734cac0 (returns byte row+0x6c); ELiveGameModeType.h; ctor 0x15a6eb7e4 sets +0x4d0 = 2"
+    },
+    {
+     "addr": "0x1480f22da -> 0x1480f3810 registers lambda vtable 0x14cc6ff90 on NRM(GI+0x960)+0x78; callback 0x1480f39f0 (0x1480f3a5d) and 0x1480f3bb0 read *(UDM+0xfd0)",
+     "what": "The GM's ResultEmote-style callback compares the event's user id with the login user id at *(UDM+0xfd0)+0 without a null check. It is local, but it depends on login state the map lists only for the widgets",
+     "service": "login_state",
+     "evidence": "[V] disasm 0x1480f3810 (0x1480f391b lea 0x14cc6ff90, add to [r15+0x78]); vtable 0x14cc6ff90 entries 0x1481111c0/0x1481111a0 -> 0x1480f39f0; UDM+0xfd0 assigned at UDM init 0x147917f59 from a static ([I] non-null)"
+    }
+   ],
+   "verdictAgrees": true,
+   "correctedVerdict": "usable_needs_data",
+   "notes": "Answer to the user's question for this screen: mostly no, it can't run offline just by removing the Bandai calls. The calls themselves are already held back: D5, the never-set online flag SM+0x1fa and the null Strix client mean nothing leaves the PC [V]. What the screen lacks is Bandai's data, and one exit path that RVNG doesn't catch yet.\n\nWhere I agree with the map:\n- The crash, the clock, the record path, the classes and the GM sync all check out [V].\n- The cheapest fix is still to keep D6's Result redirect and draw RVNG's own result panel.\n\nCorrections:\n(1) The exit is not covered today. The screen's own exit handler (root slot 165, 0x147704ba0) travels to the ONLINE LOBBY through 0x147ec9fc0 -> RequestChangeMap. D6 has no OnlineLobby half yet (rvng_rt.c line 1913; DEATHMATCH_NATIVE.md 9.8), and the online lobby GM runs the messenger, EOS party, gate-A web and anti-cheat code (anti-cheat call at 0x1480eceff: not analysed). So the Result screen needs that redirect before D6's Result half can be lifted.\n(2) LeaveRoom runs offline, from three places: GM EndPlay 0x1480ee14e, root slot 165 and the Players view slot 92. Its Strix calls return early on the null client, but it clears SM/NM flags.\n(3) 0x1474b1180 is a Chronicle matchmaker cancel (GI+0x918), not a travel. It is skipped when no matchmaker session exists [I].\n(4) The Personal view's Ace Pass gauge also needs web data on the real path: the AcePass model at UDM+0x1278 and the LiveWebAPI+0x1b0 server clock. A synthesized result record therefore isn't enough; RVNG should hide that view or accept a default gauge.\n(5) View vtable 0x14c942dc0 is ViewTop; ViewPlayers is 0x14c943548.\n(6) UDM+0xf38 (MissionID) picks the layout; DM needs the DM mission id there.\n\nMinimum offline plan if RVNG ever wants the stock screen:\na) Add an OnlineLobby redirect in OnChangeMap (same method as the Result one).\nb) Detour 0x1477259e0 to return (crash guard). It is only needed while the record is empty.\nc) Synthesize a 0xc8 record in *(UDM+0x1228). The offsets +0/+0x20/+0x30, team stride 0x28 and user stride 0x170 are [V]; the score, kills, deaths and reward fields are unknown, and some readers sit behind protected thunks (e.g. 0x147896890).\nd) Keep the MRMM members keyed by the same ids.\ne) Accept that the Personal Ace Pass gauge reads web-API data RVNG can't supply.\n\nTime bomb: any fix that feeds the season lookup a real clock fails after the local DT_AcePass row ends (2026-12-01 08:00 GMT per the map, 12 days from today).\n\nMethod and limits: a depth-3 static scan over pre-dumped objdump text of 0x147100000-0x1482fffff. Calls into protected code (0x15xxxxxxx thunks: 0x1474cc700, 0x147a388d0, 0x147933a40 = a zero-init helper, 0x147896890) were not followed.\n\nFiles, all under <scratchpad>/lobby_ui/result_verify/:\n- notes: notes.txt\n- scan outputs: s_root.txt, s_gm.txt, s_views.txt\n- disassembly dumps: d_1a280.txt, d_04430.txt, d_gm.txt, d_ee060.txt, d_b5650.txt, d_590d30.txt, d_927680.txt, d_db60.txt, d_03900.txt\n- tools: fscan.py, scan.py, v.py, b.py, chain.py, divs.py, props.py, iat.py"
+  }
+ },
+ {
+  "key": "framework",
+  "title": "Online menu system (NUI lobby)",
+  "map": {
+   "screen": "Online menu system (NUI lobby): WBP_NUILobbyMenuManager, WBP_NUILobbyPart, WBP_Menu_Common_Lobby_000/001, BP_GFL_Lobby, Party (WBP_Menu_Party_000), PlayerList (WBP_Menu_PartyList_000), SystemLobbySetting, plus how Matching is opened",
+   "summary": "The game's NUI framework already runs offline: the main menu is an NUI \"part\" with its own NUI menu manager. The online lobby screens belong to a different part, the Lobby part, and the game creates that part only when the loaded map's level ID is 99995 (OnlineLobby). The main menu map gets the CampaignMainMenu part, and the deathmatch maps get no NUI part at all [V 0x1475e28f2]. The lobby's page table (Matching, Party, PlayerList and so on) exists only in WBP_NUILobbyMenuManager. The main menu's manager has no rows for these pages, so asking it for Matching finds no page to open [V CDO dumps, FindMenuParam 0x147680250]. The game opens the Matching page in one place only: after Bandai's matchmaker reports a successful match (MatchMaker result -> listener -> PushTaskMatchingSuccess -> OpenMenu(24)) [V]. Offline that never happens, so RVNG would have to open it itself and supply the room-member data the page reads. The Party, PlayerList and lobby overlay pages are built on the party manager, the web API (Party/Friend/General controllers) and EOS invites; with D5 their web requests return without ever calling back. So reusing the framework to show a single page such as Matching over the main menu looks feasible with stubs plus data, but the Party pages are not worth reusing.",
+   "nativeClasses": [
+    {
+     "name": "ULiveNUIManager",
+     "label": "[V] StaticClass 0x146f3ae90, size 0x848, ctor 0x146f3b000. It lives on the GameInstance at GI+0x980 (NUIManager_). It holds PartUIList +0x480 (from WBP_NUIManager: Startup, Lobby, Mission, Result and CampaignMainMenu parts) and DebugLevelUIPartMap +0x4d0.",
+     "vtable": "0x14c8fdbf0",
+     "keyFunctions": [
+      "0x1475de960 CreatePart(NUIManager, ELiveNUIPartType): loads PartUIList[type], creates a child widget named \"PartUI\" (0x14754d590) and sets +0x520 = type [V]. Its only caller is 0x1475e2975 [V]",
+      "0x1475debb0 finds the child \"PartUI\"; 0x1475ad750(ctx) = GetCurrentPart [V]",
+      "0x14757e510(ctx) = GetLobbyPartManager: GetCurrentPart cast to ULiveNUILobbyPartManager, null otherwise [V]"
+     ]
+    },
+    {
+     "name": "ULiveNUIPartBridgeWorldSubSystem",
+     "label": "[V] World subsystem, StaticClass 0x146f6e660, size 0x68. Slot 0x61 chooses the part from the current level ID. Which world-subsystem event slot 0x61 is (BeginPlay or PostInitialize) is [I].",
+     "vtable": "0x14c96ff88",
+     "keyFunctions": [
+      "0x1475e27e0 (slot 0x61): levelId = 0x14734cb50(InformationManager GI+0x878, this); row = 0x14734d370; LevelID row+0x10 picks the part: 0->Transition(1), 2->CampaignMainMenu(7), 99991->Startup(2), 99992->Title(3), 99994->Result(6), 99995->Lobby(4), 99997->Mission(5), anything else -> no part. It then calls CreatePart 0x1475de960 and part vf+0x568 / vf+0x578 [V]"
+     ]
+    },
+    {
+     "name": "ULiveNUIPartManager",
+     "label": "[V] Base of all parts, StaticClass 0x146f07960, size 0x4a8. PartType +0x468, ResourceBank +0x470 (soft), ResourceLoader +0x498.",
+     "vtable": "0x14c96d930",
+     "keyFunctions": [
+      "slots 0xac/0xad 0x1475e2fc0/0x1475e30b0 load the resource bank through the ResourceLoader 0x1477fa850 [I]"
+     ]
+    },
+    {
+     "name": "ULiveNUILobbyPartManager (WBP_NUILobbyPart)",
+     "label": "[V] StaticClass 0x146f3a700, size 0x718, ctor 0x146f3a930. Members: MenuManager +0x548, OpeningStepProcessor +0x550, TextChat +0x558, Matching +0x560, Blocker +0x568, MatchMaker +0x570, MatchWidgetHelper +0x578, MenuChangingProccessor +0x6b8, MatchMakerClass +0x6c8, lobby state +0x680. It carries a second vtable 0x14c8fead0 at +0x4a8, which is the matchmaker listener interface.",
+     "vtable": "0x14c8fe4d0",
+     "keyFunctions": [
+      "0x1477e9820 slot 0xb2 (start-up, runs once via flag +0x4a0) [V]",
+      "0x1477ea500 slot 0xb1 (tear-down: unbinds the delegates) [V]",
+      "0x1477ee820 creates the lobby MenuManager from the resource bank and stores it at +0x548 [V]",
+      "0x1477eae00 builds the opening steps (Quest and Penalty checks) [V]",
+      "listener slot 2 0x1477f3a20 = on-matching-result -> PushTaskMatchingSuccess 0x1477f2c40 -> step functor vtable 0x14cba1ac0 (0x147820ae0) -> lambda 0x1477f3640 -> OpenMenu(Matching) at 0x1477f37a6 [V; the name comes from the log string 0x14cba4920]"
+     ]
+    },
+    {
+     "name": "ULiveNUICampaignMainMenuPartManager (WBP_NUICampaignMainMenuPart)",
+     "label": "[V] The main menu's part (level 2). StaticClass 0x146f07a20, size 0x4c8. MenuManager at +0x4c0 holds WBP_NUICampaignMainMenuManager.",
+     "vtable": "0x14c887708",
+     "keyFunctions": []
+    },
+    {
+     "name": "ULiveNUIMenuManager (WBP_NUILobbyMenuManager / WBP_NUICampaignMainMenuManager)",
+     "label": "[V] StaticClass 0x146f51530, size 0x5e8, ctor 0x15a6660c0. Members: MenuBlockerWidget +0x468, MenuParamMap +0x480 (TMap<ELiveNUIMenuType, FLiveNUIMenuParam{MenuClass, BG, title, ViewportOrder, fade}>), MenuParamMapByMenuKey +0x4d0, DefaultViewportOrder +0x520, MenuStack +0x528 (count +0x530), ChangeStepProcessor +0x5d0, CloseStepProcessor +0x5d8. It has no blueprint graph; the page table is CDO data only.",
+     "vtable": "0x14c92dac0",
+     "keyFunctions": [
+      "0x14767edb0 OpenMenu(mgr, ELiveNUIMenuType dl, option r8, r9): closes the current top page (0x147680cf0/0x147680c30), pushes the new one through 0x147680c30, broadcasts +0x570/+0x5b8, then 0x14767f480. Every lobby page caller passes the type in dl [V]",
+      "0x14767ef00 close/back (pop) [I]",
+      "0x147680c30 push by type -> 0x147680370 builds the change steps -> 0x1476b5330 adds them to MenuStack [V]",
+      "0x147680250 FindMenuParam(key{u8 type, FString key}): looks in MenuParamMapByMenuKey when the key is set, otherwise in MenuParamMap; returns null when there is no row [V]"
+     ]
+    },
+    {
+     "name": "ULiveNUIMatchMaker (BP_LiveNUIMatchMaker)",
+     "label": "[V] StaticClass 0x146f3a5a0, size 0x58, created by the lobby part from MatchMakerClass. MatchMaker+0x40 is set to the listener (LobbyPart+0x4a8) at 0x1477e9b54. Its only data is ForceAllowSortieGameModeList (OnlineFreeFlight, OnlineTutorials).",
+     "vtable": "0x14c8fd838",
+     "keyFunctions": [
+      "0x1477e80d0 result handler: writes UDM+0xed3 = 0; result 0 sets +0x48; results 1/2 unbind the NetworkManager+0x5f8 delegate; then calls listener slot 2 [V]",
+      "0x1477e81b0 request path (PartyManager, GeneralAPIController) [V reads]",
+      "0x1477e7b60 -> NetworkManager 0x1474b6bc0 [V]",
+      "0x1477e7d90 -> Chronicle 0x1474af750 [V]",
+      "0x1477e7ac0/0x1477e77d0 -> CancelMatch 0x1474af800 [V]"
+     ]
+    },
+    {
+     "name": "ULiveNUIMatchWidgetHelper (BP_LiveNUIMatchWidgetHelper)",
+     "label": "[V] StaticClass 0x146f3a650. Data only: the ELiveRequestMatchingError -> text ID map (AlreadyMatching, InvalidAirsetList, Penalty..., UpdatedMissionSchedule).",
+     "vtable": "0x14c8fb688",
+     "keyFunctions": []
+    },
+    {
+     "name": "ULiveNUIMenuMatchingRootWidget (WBP_Menu_Matching_000, ELiveNUIMenuType::Matching = 24)",
+     "label": "[V] Module LiveLobby, StaticClass 0x1480d8670, size 0x540. The page is a pre-sortie set select (title Online_SetSelect_Title) with a sortie timer and previews of aircraft, ability, parts, ammo, mode, party and role.",
+     "vtable": "0x14cc652a0",
+     "keyFunctions": [
+      "slot 0x97 0x148185530 construct: StrixMessenger 0x1474f0a70, MissionRoomMemberManager bind 0x14753d910, GetLobbyPartManager with a null check at 0x148185b00 [V]",
+      "slot 0xa3 0x1481851f0: tick/state, SM+0x1fa check [V]",
+      "slot 0xac 0x1481863a0: reads [UDM+0xfd0]+0x50 [V]",
+      "slot 0xae 0x148186e70: IsOnline 0x14818a6d0 [V]"
+     ]
+    },
+    {
+     "name": "ULiveNUIMenuPartyWidget (WBP_Menu_Party_000, type Party = 32)",
+     "label": "[V] StaticClass 0x146f525e0, size 0x990, parent ULiveNUIMenuUserCommandInterface (vtable 0x14c95abc0). It has an APIWaitStepProcessor, a top menu, search-option and start-search items, a player list, and mode-all and party previews.",
+     "vtable": "0x14c92a8e0",
+     "keyFunctions": [
+      "slot 0xa4 0x1476a73c0 -> 0x1476aaed0 -> party manager 0x1474e0250/0x1474df0d0 -> PartyAPIController 0x1479b0c10/0x1479b0700 [V]",
+      "opened from the lobby top-menu dispatcher 0x14818ef10 at 0x14818f064 [V]"
+     ]
+    },
+    {
+     "name": "ULiveNUIMenuPlayerListRootWidget (WBP_Menu_PartyList_000, type PlayerList = 11)",
+     "label": "[V] Module LiveLobby, StaticClass 0x1480d9190, size 0x8d0. Shows a player search and lists, a squadron preview, and has a GuildCheckErrorStepProcessor.",
+     "vtable": "0x14cc61360",
+     "keyFunctions": [
+      "slot 0xc2 0x1481902f0 -> 0x148192130 -> 0x1476de010 FriendAPIController [V]",
+      "opened at 0x1476ac6c8, 0x1476e59d0 and 0x1477d120d [V]"
+     ]
+    },
+    {
+     "name": "ULiveNUIMenuLobby000Widget (WBP_Menu_Common_Lobby_000, resource LobbyUI_000)",
+     "label": "[V] StaticClass 0x146f4a5b0, size 0x510. Shows the matching-time text, a matching-complete widget and a mode preview.",
+     "vtable": "0x14c90c450",
+     "keyFunctions": [
+      "slot 0x97 0x1476833f0 -> 0x14752a560 (PartyManager, MissionRoomMemberManager, NetworkManager) [V]",
+      "0x147683f80, called from the Matching-open lambda at 0x1477f36c3 [V]"
+     ]
+    },
+    {
+     "name": "ULiveNUIMenuLobby001Widget (WBP_Menu_Common_Lobby_001, resource LobbyUI_001)",
+     "label": "[V] StaticClass 0x146f4a660, size 0x498: a guide footer only. Its constructor body 0x15a597710 is obfuscated, so the vtable was not recovered.",
+     "vtable": "",
+     "keyFunctions": []
+    },
+    {
+     "name": "ULiveNUIMenuSystemLobbySettingWidget (WBP_Menu_SystemLobbySetting_000, type SystemLobbyOptions = 45)",
+     "label": "[V] StaticClass 0x146f64df0, size 0x5f8. It is in both the lobby and the campaign menu managers, so it already opens over the offline main menu.",
+     "vtable": "0x14c94cc00",
+     "keyFunctions": [
+      "0x147a62c70 / 0x147a63c30 SettingsAPIController (UDM+0x1238) [V reads]"
+     ]
+    },
+    {
+     "name": "ULiveNUIKeyGuideFooterLayout (BP_GFL_Lobby)",
+     "label": "[V] Data-only key-hint layout (CDO 7180 bytes) with no native logic of its own.",
+     "vtable": "0x14c8db640",
+     "keyFunctions": []
+    }
+   ],
+   "howOpened": "[V] There are 5 NUI parts. The resident NUI manager (GI+0x980) has one per level type, and ULiveNUIPartBridgeWorldSubSystem slot 0x61 (0x1475e27e0) picks one from the loaded map's level row: 99995 OnlineLobby -> Lobby part (WBP_NUILobbyPart); 2 MainMenu -> CampaignMainMenu part. Any other level ID, including the deathmatch maps 160010..160060, gets no part (switch at 0x1475e28f2..0x1475e293f), and the only CreatePart call is 0x1475e2975.\n\n[V] When the Lobby part starts (slot 0xb2, 0x1477e9820), 0x1477ee820 creates WBP_NUILobbyMenuManager from AD_Part_Lobby_ResourceBank and stores it at +0x548. Pages are opened by OpenMenu 0x14767edb0(MenuManager, ELiveNUIMenuType, option). The menu type is mapped to a page class by FindMenuParam 0x147680250 (MenuParamMap +0x480), and the page is pushed on MenuStack +0x528 through step processors.\n\n[V] Matching (24) is opened in only one place: 0x1477f37a6, inside the PushTaskMatchingSuccess lambda 0x1477f3640. That runs after the MatchMaker's result handler 0x1477e80d0 calls the lobby part's listener slot 2 (0x1477f3a20). The result itself comes from the matchmaking flow (NetworkManager+0x5f8 delegate, Chronicle and Strix). Party (32) is opened from the lobby top-menu dispatcher 0x14818ef10.\n\nOutside the lobby map:\n- [V] The main menu runs a separate NUI MenuManager (CampaignMainMenu part +0x4c0, WBP_NUICampaignMainMenuManager). Its page table has only Top, the System* option pages and Shop2, with no Matching, Party or PlayerList row. Its SystemLobbyOptions row does point to WBP_Menu_SystemLobbySetting_000, so that page already opens offline.\n- [V] Pages that ask for the lobby part through 0x14757e510 get null outside the lobby. The Matching page's construct checks for null (0x148185b00).\n- [V] The deathmatch map has no part and no MenuManager.\n- [I] An NUI page could therefore be opened over the main menu only by adding a MenuParamMap row (or a MenuParamMapByMenuKey row) to the campaign MenuManager and calling OpenMenu. In the deathmatch map it would first need a part, through CreatePart 0x1475de960(NUIManager, 7 or 4), whose side effects are untested.",
+   "dependencies": [
+    {
+     "addr": "0x1477eb1a7 / 0x1477eb1d6",
+     "what": "The lobby part's opening steps (0x1477eae00) test PenaltyAPIController UDM+0x12a0 with gate A 0x147926ce0. Gate A means 'the controller has cached data (+0x30)' and caches GI+0x970. When it is true, the opening shows the penalty dialog (Online_PenaltyUp_Dialog_StatusCaution/Lv1/Lv2).",
+     "service": "webapi",
+     "label": "[V]",
+     "alreadyBlockedBy": "D5: with gate A false the code jumps to 0x1477eb5e8 and the dialog is skipped",
+     "dataNeeded": "penalty status",
+     "standIn": "none (keep it false)",
+     "risk": "low"
+    },
+    {
+     "addr": "0x1477eae98 / 0x1477eaeac (0x1479936f0, 0x1479b6f60; gate A at 0x1479b6f72)",
+     "what": "The opening steps check QuestAPIController UDM+0x10f0 (quest/mission data) before building the opening tasks.",
+     "service": "webapi",
+     "label": "[V] calls; [I] effect",
+     "alreadyBlockedBy": "D5 for the gate inside 0x1479b6f60. 0x1479936f0 was not analysed.",
+     "dataNeeded": "quest progress",
+     "standIn": "none expected; to be confirmed",
+     "risk": "medium: an opening step might wait for data that never arrives [?]"
+    },
+    {
+     "addr": "0x1477e9d48..0x1477e9de5 (0x1479d4df0 -> 0x1479297c0 reads GI+0x970)",
+     "what": "Lobby start-up registers a callback (0x147783430) on StampAPIController UDM+0x11d8. The registration path reads LiveWebAPI.",
+     "service": "webapi",
+     "label": "[V] reads; [?] whether a request is sent",
+     "alreadyBlockedBy": "unknown (gate A/B were not seen on this path)",
+     "dataNeeded": "stamp list",
+     "standIn": "unknown",
+     "risk": "unknown"
+    },
+    {
+     "addr": "0x1477f43c0 (0x1477f44d5; 0x1477f4630)",
+     "what": "Lobby start-up reads MissionAPIController UDM+0x10d8 (mission schedule) and NetworkManager GI+0x928.",
+     "service": "webapi",
+     "label": "[V] reads",
+     "alreadyBlockedBy": "not determined",
+     "dataNeeded": "online mission schedule/program",
+     "standIn": "unknown",
+     "risk": "unknown"
+    },
+    {
+     "addr": "0x1477f23d0 (0x1477f241f)",
+     "what": "Lobby start-up touches PartyManager GI+0x948 (local party state; invites go over EOS, see the EOS entry).",
+     "service": "unknown",
+     "label": "[V] read",
+     "alreadyBlockedBy": "n/a",
+     "dataNeeded": "party state (solo)",
+     "standIn": "leave empty",
+     "risk": "low [I]"
+    },
+    {
+     "addr": "0x1477e81b0 (0x1477e829a, 0x1477e8341, 0x1477e845f)",
+     "what": "MatchMaker request path: reads PartyManager and GeneralAPIController UDM+0xfb0 (login/season).",
+     "service": "login_state",
+     "label": "[V] reads",
+     "alreadyBlockedBy": "D7 ends the boot login as Failed; the general controller has no data",
+     "dataNeeded": "login, season, party",
+     "standIn": "never call the MatchMaker",
+     "risk": "high if called"
+    },
+    {
+     "addr": "0x1477e7b60 -> 0x1474b6bc0",
+     "what": "MatchMaker -> NetworkManager start (reads StrixManager +0x1fa and LiveWebAPI GI+0x970).",
+     "service": "strix",
+     "label": "[V] scan",
+     "alreadyBlockedBy": "null Strix client 0x14e4c5818 [I]",
+     "dataNeeded": "room",
+     "standIn": "never call it; RVNG's link is the match",
+     "risk": "high if called"
+    },
+    {
+     "addr": "0x1477e7d90 -> 0x1474af750 (reads GI+0x918)",
+     "what": "MatchMaker -> Chronicle matchmaker.",
+     "service": "chronicle",
+     "label": "[V] read",
+     "alreadyBlockedBy": "not verified here",
+     "dataNeeded": "match result",
+     "standIn": "never call it",
+     "risk": "high if called"
+    },
+    {
+     "addr": "0x1477e7afa (from 0x1477e7ac0 / 0x1477e77d0)",
+     "what": "CancelMatch 0x1474af800.",
+     "service": "chronicle",
+     "label": "[V]",
+     "alreadyBlockedBy": "only reached from a matching flow RVNG never starts",
+     "dataNeeded": "-",
+     "standIn": "none",
+     "risk": "low"
+    },
+    {
+     "addr": "0x1477e80d0 -> listener slot 2 0x1477f3a20 -> 0x1477f2c40 -> 0x1477f3640",
+     "what": "The only path that opens the Matching page: the MatchMaker result. It writes UDM+0xed3 = 0, and the lambda sets LobbyPart+0x680 = 7, hides the lobby UI and calls OpenMenu(24).",
+     "service": "chronicle",
+     "label": "[V]",
+     "alreadyBlockedBy": "never fires offline (no match)",
+     "dataNeeded": "result 0 (success)",
+     "standIn": "RVNG opens the page itself: OpenMenu 0x14767edb0(menuManager, 24, 0, 0), or, inside the lobby only, listener slot 2 with result 0",
+     "risk": "medium"
+    },
+    {
+     "addr": "0x1481856ef -> 0x1474f0a70",
+     "what": "The Matching page construct calls StrixMessenger GI+0x920, which returns at once when messenger+0xf8 (client) is null.",
+     "service": "strix",
+     "label": "[V]",
+     "alreadyBlockedBy": "null messenger client offline",
+     "dataNeeded": "-",
+     "standIn": "none",
+     "risk": "low"
+    },
+    {
+     "addr": "0x14818584b / 0x14818587c (0x14753d910), 0x14818a9aa, 0x14752a63a (Lobby000)",
+     "what": "The Matching page and the lobby overlay bind to and read MissionRoomMemberManager GI+0x958, the room members normally filled from the server.",
+     "service": "local_only",
+     "label": "[V] reads",
+     "alreadyBlockedBy": "n/a",
+     "dataNeeded": "the room's member list (2 players: names, aircraft sets, roles)",
+     "standIn": "RVNG fills the room members from its own hello exchange (how to write them is unknown)",
+     "risk": "medium: an empty page or a wait [I]"
+    },
+    {
+     "addr": "0x148185384, 0x14818aabc, 0x1477e7e96",
+     "what": "Checks of StrixManager +0x1fa (in-room flag) in the Matching page and the MatchMaker.",
+     "service": "online_flag",
+     "label": "[V]",
+     "alreadyBlockedBy": "the flag stays 0 offline (RVNG invariant)",
+     "dataNeeded": "-",
+     "standIn": "keep 0; the online branches are skipped",
+     "risk": "low"
+    },
+    {
+     "addr": "0x148186e8c",
+     "what": "The Matching page (slot 0xae) calls IsOnline 0x14818a6d0.",
+     "service": "online_flag",
+     "label": "[V]",
+     "alreadyBlockedBy": "returns 0 offline",
+     "dataNeeded": "-",
+     "standIn": "none",
+     "risk": "low"
+    },
+    {
+     "addr": "0x1481866f7",
+     "what": "Matching slot 0xac reads [UDM+0xfd0]+0x50 with no null check. UDM+0xfd0 is the non-reflected field next to UserAPIController +0xfc8, and the value is compared to a member's player ID. It is reached only when a member entry was found.",
+     "service": "webapi",
+     "label": "[V] read; [?] whether it is null offline",
+     "alreadyBlockedBy": "unknown",
+     "dataNeeded": "the local user's server player ID",
+     "standIn": "possibly an RVNG-made ID object",
+     "risk": "crash if null [?]"
+    },
+    {
+     "addr": "0x148189ffb",
+     "what": "A Matching helper (0x148189fd0) goes on only when UDM+0xed4 != 0 (matching state). The MatchMaker writes UDM+0xed3 at 0x1477e8129.",
+     "service": "local_only",
+     "label": "[V] read",
+     "alreadyBlockedBy": "n/a",
+     "dataNeeded": "matching-state flag",
+     "standIn": "RVNG may need to set it [?]",
+     "risk": "part of the page stays idle"
+    },
+    {
+     "addr": "0x1474df235 -> 0x1479b0700, 0x1474e0399 -> 0x1479b0c10",
+     "what": "Party page -> party manager -> PartyAPIController UDM+0x1160 requests. When gate A is false they return without sending and without calling back (0x1479b0849).",
+     "service": "webapi",
+     "label": "[V]",
+     "alreadyBlockedBy": "D5",
+     "dataNeeded": "party data from the server",
+     "standIn": "none sensible",
+     "risk": "Party's APIWaitStepProcessor may wait forever [I]"
+    },
+    {
+     "addr": "0x1474e5810 -> 0x1474c2520 (from deep_pass, not re-checked here)",
+     "what": "Party invites go over ULiveNetworkP2P (GI+0x930, EOS socket INVITE_PAETY).",
+     "service": "eos",
+     "label": "[I]",
+     "alreadyBlockedBy": "EOS not logged in offline",
+     "dataNeeded": "-",
+     "standIn": "do not use",
+     "risk": "n/a"
+    },
+    {
+     "addr": "0x1476de055 / 0x1476de06b, 0x14793f2a4, 0x148195853",
+     "what": "The PlayerList page reads FriendAPIController UDM+0x1120, GeneralAPIController UDM+0xfb0 and PartyManager.",
+     "service": "webapi",
+     "label": "[V] reads",
+     "alreadyBlockedBy": "probably D5 [I]",
+     "dataNeeded": "friends and players",
+     "standIn": "not useful for RVNG",
+     "risk": "empty page"
+    },
+    {
+     "addr": "0x147a62ea2.., 0x147a63d63.., 0x1479c21fd, 0x147ec9572",
+     "what": "SystemLobbySetting reads SettingsAPIController UDM+0x1238 and GeneralAPIController, and jumps through StrixMessenger GI+0x920. The page already opens over the offline main menu.",
+     "service": "webapi",
+     "label": "[V] reads; [?] whether saving is gated",
+     "alreadyBlockedBy": "unknown",
+     "dataNeeded": "lobby settings (camera, avatar)",
+     "standIn": "none",
+     "risk": "low"
+    }
+   ],
+   "verdict": "usable_needs_data",
+   "stubPlan": [
+    "1. Keep D5 (both gates false), D7, D6 (OnlineLobby and Result redirects) and D8. Never call the MatchMaker (0x1477e81b0, 0x1477e7b60, 0x1477e7d90), the OnlineLobby travel 0x147ec9fc0 or CancelMatch. The real lobby map is not needed and stays blocked [I].",
+    "2. Work over the main menu, which already runs the NUI stack offline. Take the part with GetCurrentPart 0x1475ad750(ctx), check that it is ULiveNUICampaignMainMenuPartManager (StaticClass 0x146f07a20), and read MenuManager = part+0x4c0 [V].",
+    "3. Load /Game/OnlineMode/UI/NUI/Matching/WBP_Menu_Matching_000 (class WBP_Menu_Matching_000_C) and add a row for ELiveNUIMenuType 24 to the campaign MenuManager's MenuParamMap (+0x480, a TMap with a hash; rehash needed). Copy the row's other fields from WBP_NUILobbyMenuManager's CDO row: title Online_SetSelect_Title, BG settings. Alternatively add a key row to MenuParamMapByMenuKey (+0x4d0) [I].",
+    "4. Fill the room members (MissionRoomMemberManager GI+0x958) with the two RVNG players and the data the previews read. How to write them is unknown; RVNG's test-3 SetConfirmed path (NM+0x3d8/+0x410) may be the source [?].",
+    "5. Check that [UDM+0xfd0] is non-null offline before opening; if it is null, supply a stand-in user/ID object, or open the page only after confirming it does not reach 0x1481866f7 [?].",
+    "6. Call OpenMenu 0x14767edb0(MenuManager, 24, option 0, 0). The page's lobby-part lookup (0x14757e510) returns null and its construct skips that work (0x148185b00). The StrixMessenger call returns at the null client, and the SM+0x1fa and IsOnline checks stay false [V].",
+    "7. Decide what ends the page: its sortie timer or a confirm action (not traced). RVNG would hook that or close the page through the stack (0x14767ef00 [I]) and then do its own deathmatch travel.",
+    "8. Do not reuse Party, PlayerList or Lobby000/001. They are party, friends and matching-status screens built on PartyManager, the web API and EOS, and their web requests never call back under D5."
+   ],
+   "openQuestions": [
+    "Is UDM+0xfd0 (next to UserAPIController) null offline? Matching slot 0xac dereferences it at 0x1481866f7 without a check.",
+    "What does the Matching page do when its sortie timer (InitSortieTimerValue) runs out, or when the player confirms? Does it call the lobby part, NetworkManager or a web API? Not traced.",
+    "How do the step processors behind 0x147680370 load the page class, and do they tolerate a missing lobby part beyond the construct? Only the construct's null check was verified.",
+    "Can MissionRoomMemberManager (GI+0x958) be filled offline from RVNG's link, and which fields do the Matching previews read (airset, aircraft, parts, ammo, role)?",
+    "Does 0x1479936f0 / 0x1479b6f60 (Quest step at lobby start) or the StampAPI listener path 0x1479d4df0 -> 0x1479297c0 send a web request, or wait for one, when the gates are false?",
+    "What do the OnlineLobby map's own game mode (LiveLobbyAvatarGameMode, /Script/LiveLobby) and LiveLobbyWorldSubsystem do on BeginPlay? Not analysed, and needed only if the real lobby map were ever loaded.",
+    "Is bridge subsystem slot 0x61 OnWorldBeginPlay or PostInitialize? Does 0x14734cb50 derive the level ID from the map name, as inferred?",
+    "Can CreatePart 0x1475de960 be called a second time (for example on the main menu with type 4)? It does not visibly remove the existing \"PartUI\" child.",
+    "Does the Party page's APIWaitStepProcessor time out, or does it wait forever when PartyAPIController returns without a callback?",
+    "Is the SystemLobbySetting save path (SettingsAPIController UDM+0x1238) behind gate A?",
+    "ULiveNUIMenuLobby001Widget's constructor (0x15a597710) is obfuscated, so its vtable was not recovered.",
+    "No anti-cheat call (GI+0x988 getter 0x147eced00) appeared in any scanned call graph (depth 1-3). Deeper paths were not checked.",
+    "Correction to the brief: by reflection, UDM+0x12a0 is PenaltyAPIController; LiveWebAPI is GI+0x970 (property params 0x14cbbfd60 and 0x14c6ffa90). Gate A 0x147926ce0 is 'controller+0x30 != 0' (has cached data)."
+   ],
+   "displays": [
+    "WBP_NUILobbyMenuManager: nothing visible. Its CDO holds a 49-row page table, ELiveNUIMenuType -> page class and title, including Matching -> WBP_Menu_Matching_000 (Online_SetSelect_Title), Party -> WBP_Menu_Party_000, PlayerList -> WBP_Menu_PartyList_000, SystemLobbyOptions -> WBP_Menu_SystemLobbySetting_000, Top -> /Game/NUI/Main/WBP_Menu_Main_000 and Top2 -> WBP_Menu_Main_001 [V menumgr_cdo.txt]",
+    "WBP_NUIManager (resident, GI+0x980): PartUIList with Startup, Lobby, Mission, Result and CampaignMainMenu parts; DebugLevelUIPartMap {PL_LOB_Lobby01_Season01: Lobby, PL_Satod_TutorialON: Mission}; GameModeNameTextMap [V]",
+    "WBP_NUILobbyPart: nothing visible. Its AD_Part_Lobby_ResourceBank lists MenuManager, DebugMenuManager, LobbyEmergency, TextChatUI, ScreenShotUI, MessageWindowUI, EmoteShortcutUI, EmoteListUI, NoticeUI, LobbyUI_000, LobbyUI_001, ModeSetUI, NoticeIconUI and JukeBoxUI [V]",
+    "WBP_Menu_Common_Lobby_000 (LiveNUIMenuLobby000Widget): matching-time text (Text_MatchingTime_02..04), a matching-complete widget and a mode preview. Data comes from PartyManager, MissionRoomMemberManager and NetworkManager [V header + scan]",
+    "WBP_Menu_Common_Lobby_001 (LiveNUIMenuLobby001Widget): guide footer and animations only [V header]",
+    "BP_GFL_Lobby: key-hint footer layout data, no logic [V]",
+    "WBP_Menu_Party_000 (LiveNUIMenuPartyWidget): top menu, matchmaking search options with a start-search item, party member list, mode and party previews. Data comes from PartyManager (GI+0x948) and PartyAPIController (UDM+0x1160) [V]",
+    "WBP_Menu_PartyList_000 (LiveNUIMenuPlayerListRootWidget): player search and lists, squadron preview. Data comes from FriendAPIController, GeneralAPIController and PartyManager [V]",
+    "WBP_Menu_SystemLobbySetting_000: lobby camera and avatar display options (FLiveLobbySettingData), with SettingsAPIController behind them. It is also in the offline main menu's page table [V]",
+    "Matching (opened by this framework): a pre-sortie set select with sortie timer, previews of aircraft, ability, parts, ammo, mode, party and role, and voice chat settings. Data comes from MissionRoomMemberManager, UDM and the StrixManager flag [V header + scan]"
+   ],
+   "assets": [
+    "/Game/OnlineMode/UI/NUI/System/MenuManager/WBP_NUILobbyMenuManager",
+    "/Game/OnlineMode/UI/NUI/System/Part/WBP_NUILobbyPart",
+    "/Game/OnlineMode/UI/NUI/System/ResourceBank/AD_Part_Lobby_ResourceBank",
+    "/Game/OnlineMode/UI/NUI/System/Part/Component/BP_LiveNUIMatchMaker",
+    "/Game/OnlineMode/UI/NUI/System/Part/Component/BP_LiveNUIMatchWidgetHelper",
+    "/Game/NUI/System/WBP_NUIManager",
+    "/Game/NUI/System/MenuManager/WBP_NUICampaignMainMenuManager",
+    "/Game/NUI/System/Part/WBP_NUICampaignMainMenuPart",
+    "/Game/OnlineMode/UI/NUI/Common/WBP_Menu_Common_Lobby_000",
+    "/Game/NUI/Common/WBP_Menu_Common_Lobby_001",
+    "/Game/NUI/System/GuideFooter/Layout/BP_GFL_Lobby",
+    "/Game/OnlineMode/UI/NUI/Party/WBP_Menu_Party_000",
+    "/Game/OnlineMode/UI/NUI/PartyList/WBP_Menu_PartyList_000",
+    "/Game/OnlineMode/UI/NUI/Matching/WBP_Menu_Matching_000",
+    "/Game/Blueprints/UI/Menu/Main/System/WBP_Menu_SystemLobbySetting_000"
+   ],
+   "evidenceFiles": [
+    "<scratchpad>/lobby_ui/framework/menumgr_cdo.txt",
+    "<scratchpad>/lobby_ui/framework/campmgr_cdo.txt",
+    "<scratchpad>/lobby_ui/framework/vtables.txt",
+    "<scratchpad>/lobby_ui/framework/udm_offsets.txt",
+    "<scratchpad>/lobby_ui/framework/openmenu_callers.txt",
+    "<scratchpad>/lobby_ui/framework/cg_lobbypart_setup_d3.txt",
+    "<scratchpad>/lobby_ui/framework/cg_matching.txt",
+    "<scratchpad>/lobby_ui/framework/cg_matchmaker.txt",
+    "<scratchpad>/lobby_ui/framework/cg_party.txt",
+    "<scratchpad>/lobby_ui/framework/cg_playerlist.txt",
+    "<scratchpad>/lobby_ui/framework/cg_lobby000.txt",
+    "<scratchpad>/lobby_ui/framework/cg_syslobby.txt",
+    "<scratchpad>/lobby_ui/framework/dis/nuimgr_region.txt",
+    "<scratchpad>/lobby_ui/framework/dis/lp_region.txt",
+    "<scratchpad>/lobby_ui/framework/dis/lp_b2_full.txt",
+    "<scratchpad>/lobby_ui/framework/dis/mm_region.txt",
+    "<scratchpad>/lobby_ui/framework/dis/match_region.txt",
+    "<scratchpad>/lobby_ui/framework/scripts/cg.py",
+    "<scratchpad>/lobby_ui/framework/scripts/x.py",
+    "<scratchpad>/lobby_ui/framework/scripts/cdo.py",
+    "<scratchpad>/lobby_ui/NUI/System/WBP_NUIManager",
+    "<scratchpad>/lobby_ui/NUI/System/MenuManager/WBP_NUICampaignMainMenuManager",
+    "<scratchpad>/lobby_ui/OnlineMode/UI/NUI/System/ResourceBank/AD_Part_Lobby_ResourceBank",
+    "E:/ACE8 Survival Mode/build/liveproject/Source/Live/Public/LiveNUIManager.h",
+    "E:/ACE8 Survival Mode/build/liveproject/Source/Live/Public/LiveNUILobbyPartManager.h",
+    "E:/ACE8 Survival Mode/build/liveproject/Source/Live/Public/LiveNUIMenuManager.h",
+    "E:/ACE8 Survival Mode/build/liveproject/Source/Live/Public/LiveGameInstance.h",
+    "E:/ACE8 Survival Mode/build/liveproject/Source/LiveLobby/Public/LiveNUIMenuMatchingRootWidget.h"
+   ]
+  },
+  "verify": {
+   "screen": "Online menu system (NUI lobby): WBP_NUILobbyMenuManager, WBP_NUILobbyPart, WBP_Menu_Common_Lobby_000/001, BP_GFL_Lobby, Party, PartyList, SystemLobbySetting, plus how Matching is opened (key \"framework\")",
+   "claimsChecked": [
+    {
+     "claim": "The bridge subsystem slot 0x61 (0x1475e27e0) picks the NUI part from the level row: 99995 -> Lobby, 2 -> CampaignMainMenu, any other ID -> no part; the only CreatePart call is 0x1475e2975",
+     "verdict": "confirmed",
+     "evidence": "[V] Slot 0x61 of vtable 0x14c96ff88 is 0x1475e27e0. Switch at 0x1475e28f2..0x1475e293f: 0x18697 -> 2, 0x18698 -> 3, 2 -> 7, 0x1869a -> 6, 0x1869b -> 4, 0x1869d -> 5, otherwise exit. The xrefs to 0x1475de960 show only 0x1475e2975.",
+     "correction": "Small one: level ID 0 exits early at 0x1475e2883 (cmp [row+0x10],0 / je), so the '0 -> Transition' case is dead code."
+    },
+    {
+     "claim": "The main menu's part (CampaignMainMenu) keeps its MenuManager at part+0x4c0; the Lobby part keeps it at +0x548",
+     "verdict": "confirmed",
+     "evidence": "[V] 0x1477a10bb loads part+0x4c0 after a class check against 0x146f07a20, and 0x1477a10ec loads +0x548 after a check against 0x146f3a700. Campaign part slot 0xb0 (0x1477e9480) builds the manager when +0x4c0 is null. These are the System option widgets' OptionIdToTransitionMenuMap openers: the game already picks the manager by part class and calls OpenMenu."
+    },
+    {
+     "claim": "The campaign MenuManager's page table has only Top, the System* pages and Shop2 (no Matching, Party or PlayerList), and its SystemLobbyOptions row points to WBP_Menu_SystemLobbySetting_000",
+     "verdict": "confirmed",
+     "evidence": "[V] My own Zen dump of the name table of NUI/System/MenuManager/WBP_NUICampaignMainMenuManager. The package holds only the CDO, the class and a WidgetTree, so there is no Blueprint graph. The lobby manager lists 54 menu-type names (the map says 49 rows)."
+    },
+    {
+     "claim": "FindMenuParam 0x147680250 searches MenuParamMapByMenuKey +0x4d0 when the key is set, otherwise MenuParamMap +0x480, and returns null when there is no row, so asking the campaign manager for Matching opens nothing",
+     "verdict": "confirmed",
+     "evidence": "[V] It tests key string length > 1 (0x147680256). The type lookup uses the hash at +0x4b8/+0x4c0 with mask +0x4c8; elements are 0x80 bytes with the next index at +0x78 (0x147680330). It returns null on a miss. Both step lambdas null-check the result (0x14768075a, 0x14768082b), so a missing row does nothing rather than crash."
+    },
+    {
+     "claim": "0x14767ef00 is close/back (pop) [I], and the stub plan step 7 closes the page through it",
+     "verdict": "wrong",
+     "evidence": "[V] 0x14767ef00 takes an FString key, builds steps with 0x147680370 and pushes them with 0x1476b5330. When the stack is empty it goes to 0x147680cf0, the key version of 0x147680c30. Its caller 0x14757bb96 picks it when the key string is set and calls OpenMenu(type) otherwise.",
+     "correction": "0x14767ef00 opens a page by its key. The function that closes or pops a page was not found."
+    },
+    {
+     "claim": "Matching (24) is opened in one place only: 0x1477f37a6 inside the PushTaskMatchingSuccess lambda 0x1477f3640",
+     "verdict": "partly",
+     "evidence": "[V] Of the 44 OpenMenu xrefs, only 0x1477f37a6 passes the literal 0x18 (see openmenu_callers_v.txt). The log string at 0x14cba4920 reads 'ULiveNUILobbyPartManager::PushTaskMatchingSuccess::<lambda_7>'. Chain: listener slot 2 0x1477f3a20 -> 0x1477f2c40 at 0x1477f3dfe; MatchMaker+0x40 = LobbyPart+0x4a8 (0x1477e9b54); result handler 0x1477e80d0 calls listener vf+0x10 at 0x1477e8196.",
+     "correction": "Five more OpenMenu callers pass a menu type read from data: 0x14757bba7, 0x14769115d, 0x1476993a8, 0x1477a1111 and 0x1477a740b. So 0x1477f37a6 is the only fixed-value site, not the only possible one."
+    },
+    {
+     "claim": "The Matching page's construct checks for a null lobby part (0x148185b00), so it can run outside the lobby",
+     "verdict": "confirmed",
+     "evidence": "[V] All four GetLobbyPartManager (0x14757e510) calls in the page are followed by a null check: 0x148185afb, 0x148185b21 (construct), 0x148185eef and 0x148185f10 (slot 0x98). 0x14757e510 returns null unless the current part is class 0x146f3a700."
+    },
+    {
+     "claim": "UDM+0xfd0 might be null offline, and Matching slot 0xac dereferences it at 0x1481866f7 (crash if null [?])",
+     "verdict": "wrong",
+     "evidence": "[V] The UDM init 0x147994c00 (called from 0x14799118d) creates the data objects locally and stores their shared pointers: +0xfd0 at 0x14799508e, +0x1050 at 0x147995c48 and +0x10e0 at 0x14799661f..0x14799664f. The project doc DEATHMATCH_NATIVE.md 9.3 records in game that the offline user id is an empty string, which means the pointer is set. About 320 game sites dereference +0xfd0 without a check.",
+     "correction": "The pointer at UDM+0xfd0 is set offline and points at an empty local user record, so 0x1481866f7 does not crash. The same holds for the construct's other unchecked reads, UDM+0x1050 (0x148185881) and UDM+0x10e0 (0x1481858b1): they read empty local data."
+    },
+    {
+     "claim": "The StrixMessenger call in the Matching construct returns at once when messenger+0xf8 (the client) is null; IsOnline 0x14818a6d0 returns SM+0x1fa",
+     "verdict": "confirmed",
+     "evidence": "[V] 0x1474f0a7a: cmp [rcx+0xf8],0 / je 0x1474f0b4d. 0x14818a710..0x14818a71c: NM (GI+0x928) -> 0x1474ae240 (StrixManager) -> movzx [rax+0x1fa]. That the client is null offline is [I], from the RVNG invariant that Strix is never initialised."
+    },
+    {
+     "claim": "Lobby part opening steps (0x1477eae00) check PenaltyAPIController UDM+0x12a0 through gate A at 0x1477eb1a7 / 0x1477eb1d6; the Quest step 0x1479b6f60 checks gate A at 0x1479b6f72",
+     "verdict": "confirmed",
+     "evidence": "[V] My scan shows 0x1477eb19d mov rbx,[r13+0x12a0] -> call 0x147926ce0 at 0x1477eb1a7 (again at 0x1477eb1bb/0x1477eb1d6), and 0x1479b6f72 call 0x147926ce0. I took the name PenaltyAPIController for UDM+0x12a0 from the other agent's property table and did not re-derive it."
+    },
+    {
+     "claim": "Gate A 0x147926ce0 means 'the controller has cached data (+0x30)' and caches GI+0x970",
+     "verdict": "partly",
+     "evidence": "[V] It caches GI+0x970 at ctrl+0x40 (0x147926d31, 0x147926d52/69) and returns ctrl+0x30 != 0 (0x147926d56). Gate B 0x147959480 caches GI+0x970 at +0x108 and UDM at +0x110, and returns GAC+0xf8 != 0 (0x147959581).",
+     "correction": "The mechanics are right. Calling +0x30 'cached data' is an interpretation [?]; it may just as well be a client or session pointer."
+    },
+    {
+     "claim": "The Party page reaches PartyAPIController (0x1479b0c10 / 0x1479b0700), which returns without sending or calling back when gate A is false (0x1479b0849); the chain is 0x1476a73c0 -> 0x1476aaed0 -> party manager",
+     "verdict": "partly",
+     "evidence": "[V] 0x1479b0718 calls gate A, and je 0x1479b0849 returns. 0x1474df0d0 -> 0x1479b0700 at 0x1474df235 and 0x1474e0250 -> 0x1479b0c10 at 0x1474e0399 are right.",
+     "correction": "0x1476a73c0 only references 0x1476aaed0 (at 0x1476a7454, probably a delegate bind) and does not call it. The Party page reaches the party manager and PartyAPIController from 0x1476a8bad, 0x1476ab612, 0x1476ab6bd and 0x1476b2836 (the last calls 0x1479b0700 directly)."
+    },
+    {
+     "claim": "SystemLobbySetting: whether its save path (SettingsAPIController UDM+0x1238) is gated is unknown [?]",
+     "verdict": "partly",
+     "evidence": "[V] 0x147a63c30 -> 0x1479c2680 (at 0x147a63dfe) first checks gate 0x1479c55b0 (+0x58, not hooked by D5), then calls GAC 0x147959070 at 0x1479c27e6, which checks gate B at 0x147959081 and returns at 0x1479592b3 when it is false.",
+     "correction": "The save is gated, and D5's gate B is what stops it. The first gate on the path, 0x1479c55b0, is not hooked."
+    },
+    {
+     "claim": "Lobby part start-up is slot 0xb2 0x1477e9820 and runs once via flag +0x4a0; the tear-down is slot 0xb1 0x1477ea500",
+     "verdict": "confirmed",
+     "evidence": "[V] vtable 0x14c8fe4d0 slot 0xb2 = 0x1477e9820 and slot 0xb1 = 0x1477ea500; 0x1477e9844 cmp [rcx+0x4a0],0 and 0x1477e986b mov [rcx+0x4a0],1. The base part's slot 0xb2 (0x146f07a10) only sets +0x4a0.",
+     "correction": "The map leaves out the lobby part's tick (slot 0xa3, 0x1477ea760), which runs every frame on its own and holds most of the online-facing code (see the missed items)."
+    },
+    {
+     "claim": "The deathmatch maps get no NUI part and no MenuManager",
+     "verdict": "partly",
+     "evidence": "[V] Any level ID outside the switch gets no part (0x1475e290c/0x1475e2931 -> 0x1475e29d8). [I] That a DM map's row+0x10 is its MissionID (160010..160060) comes from the doc's MissionIDs and from the same row function 0x14734d370 being used for DM travel. Not checked in game.",
+     "correction": "The DM maps falling into the default case is inferred, not verified."
+    },
+    {
+     "claim": "Framework start-up and OpenMenu need no login, online flag or web data",
+     "verdict": "confirmed",
+     "evidence": "[V] My scanner (scripts/scan.py) covered OpenMenu 0x14767edb0, 0x14767ef00, the step builder 0x147680370, 0x14767f480, 0x1475ba6f0, MenuManager slots 0x97/0x98/0xa4/0xa5, the bridge, CreatePart, 0x1475e1700, campaign part slot 0xb0 0x1477e9480 and part slot 0xad: 72 functions at depth 2, with no getter, gate, Strix, Chronicle, EOS or login signal. Indirect vtable calls were not followed."
+    },
+    {
+     "claim": "ULiveNUIManager StaticClass 0x146f3ae90 / size 0x848 / ctor 0x146f3b000; MenuManager ctor 0x15a6660c0; Lobby001 ctor obfuscated",
+     "verdict": "unverifiable",
+     "evidence": "Not re-checked; it does not affect the verdict. Vtable addresses I did use (0x14c8fe4d0, 0x14c887708, 0x14c92dac0, 0x14cc652a0, 0x14c96ff88, 0x14c8fead0) match the slot values the map gives."
+    }
+   ],
+   "missedDependencies": [
+    {
+     "addr": "0x1479297c0, 0x147945bc0, 0x14794c290, 0x147951270, 0x147972270, 0x14797c390, 0x1479a16e0, 0x1479c55b0, 0x15c413210",
+     "what": "At least nine more web gates, the same shape as gate A: each caches LiveWebAPI GI+0x970 and returns a controller field != 0 (+0x28, +0x28, +0x28, +0x38, +0x30, +0x28, +0x30, +0x58, +0x48). They have 42, 12, 17, 12, 36, 8, 13, 24 and 1 callers. D5 hooks only 0x147926ce0 and 0x147959480. Gate B answered true at boot offline (doc 9.1), so these may also answer true offline [?]. Any reuse of lobby code must add them to D5.",
+     "service": "webapi",
+     "evidence": "[V] framework_verify/web_gates.txt (byte search for 'mov rbx/rsi,[rbx/rsi+0x970]' in short functions ending in setne). Example: the body of 0x1479297c0 (caches at +0x38 at 0x147929832, returns +0x28 != 0 at 0x147929836)."
+    },
+    {
+     "addr": "0x1477e9de5 -> 0x1479d4df0 (gate 0x1479297c0 at 0x1479d4e14) -> 0x147f94730",
+     "what": "Lobby part start-up sends a StampAPIController (UDM+0x11d8, read at 0x1477e9d48) web request. Its only gate is the unhooked 0x1479297c0. After it, 0x147f94730, a generated request builder (request vtable 0x14cc09a28), sends through LiveWebAPI. No gate A or B was found three levels below it. The map listed this read as 'request unknown'.",
+     "service": "webapi",
+     "evidence": "[V] dis of 0x1479d4df0 (0x1479d4e14 call 0x1479297c0 / je 0x1479d5051; 0x1479d4efb call 0x147f94730 on [rbx+0x38] = the cached LiveWebAPI); scan_lobbypart_d3.txt"
+    },
+    {
+     "addr": "0x1477ea9ad -> 0x1477f4e60 (0x1477f4f05, 0x1477f4f18)",
+     "what": "The lobby part's tick (slot 0xa3, every frame) reads LiveWebAPI+0x1b0 (server time) with no null check and turns it into Unix time (subtracts 0x089F7FF5F7B58000) for time-based lobby UI. Offline the clock holds whatever value it starts with [I].",
+     "service": "webapi",
+     "evidence": "[V] dis_lp_tick.txt and the 0x1477f4ec0..0x1477f4f53 disassembly"
+    },
+    {
+     "addr": "0x1477ea9e7 -> 0x1477e74d0 (0x1477e7570, 0x1477e75f4, 0x1477e766b, 0x1477e7533)",
+     "what": "The lobby part's tick also runs the MatchMaker tick, a state machine on MatchMaker+0x38. At -1 (idle) it does nothing. States 233..236 call 0x1477e7d90 (Chronicle), 0x1474b1180 -> 0x1474af750 (Chronicle request), StrixMessenger GI+0x920 (0x1474f2880/0x1474f25f0), CancelMatch via 0x1477e77d0, and the result handler. Safe only while no match request sets state 0.",
+     "service": "chronicle",
+     "evidence": "[V] dis_e74d0.txt; jump table 0x1477e76b8/0x1477e76d4 decoded: -1 -> 0x1477e76a3 (exit)"
+    },
+    {
+     "addr": "0x1477ea9d6 -> 0x1477e8a40 (0x1477e8af1)",
+     "what": "The lobby part's tick runs the MatchWidgetHelper update, which reads GeneralAPIController UDM+0xfb0 (login and season state).",
+     "service": "login_state",
+     "evidence": "[V] scan_matchmaker.txt; dis_lp_tick.txt (0x1477ea9c2 mov rcx,[rbx+0x578])"
+    },
+    {
+     "addr": "0x1477f3725 / 0x1477f3778 -> 0x1474b5650",
+     "what": "The Matching-open lambda (the map's alternative 'fire listener slot 2 with result 0') also calls NetworkManager 0x1474b5650 when the mission type 0x147ec9d20(UDM+0xf38) == 10. That resets StrixManager (+0x30 = -1, +0x1f9/+0x1fa = 0, +0x1f8 = 0), calls the Strix SDK 0x145239880 and 0x1452392f0 when SM+0x28 != 0, and copies UDM+0xfd0 when SM+0x360 == 1. Per deep_pass a DM MissionID gives type 3, so this would not run after RVNG's travel write [I]. Calling OpenMenu directly avoids it.",
+     "service": "strix",
+     "evidence": "[V] dis_matchopen.txt (0x1474b5691..0x1474b5774)"
+    },
+    {
+     "addr": "0x148185881, 0x1481858b1, 0x14818591a (Matching construct 0x148185530; r15 = UDM from 0x1481855d2)",
+     "what": "The Matching construct reads the Airset data (UDM+0x1050), the Mission data (UDM+0x10e0) and the user record (UDM+0xfd0) with no null checks. All three are created locally by the UDM init, so offline they hold empty local data. The mission lookup falls back to the static default 0x14dd89eb0, so the page shows default mission and airset previews unless RVNG fills them [I].",
+     "service": "local_only",
+     "evidence": "[V] dis_match_construct.txt; writers 0x14799508e / 0x147995c48 / 0x14799661f in 0x147994c00"
+    },
+    {
+     "addr": "0x148185e66 / 0x148185ee7, 0x148185f7b",
+     "what": "The Matching page's slot 0x98 (close/teardown) uses MissionRoomMemberManager GI+0x958 (0x147491760) and SoundManager GI+0x908 -> +0x170 with no checks. Both are local, but they must exist over the main menu [I].",
+     "service": "local_only",
+     "evidence": "[V] 0x148185e00 disassembly; GI+0x908 = SoundManager from the member order in LiveGameInstance.h [I]"
+    },
+    {
+     "addr": "0x1477ea53a, 0x1477ea609",
+     "what": "The lobby part's tear-down (slot 0xb1) uses NetworkManager and MissionAPIController UDM+0x10d8; the map gave no dependencies for it.",
+     "service": "webapi",
+     "evidence": "[V] scan_lobbypart.txt"
+    }
+   ],
+   "verdictAgrees": true,
+   "correctedVerdict": "usable_needs_data",
+   "notes": "Verdict: I agree with usable_needs_data, for the narrow plan of opening one page (Matching) over the offline main menu. I do not agree for anything that creates the real Lobby part.\n\nWhy the narrow plan holds [V]:\n- The framework itself (NUI manager, bridge, CreatePart, MenuManager OpenMenu and its step builder, the campaign part's set-up) touches no online service at depth 2.\n- The Matching page's own code reaches no web gate even at depth 3. It only reads the Strix flags and the null messenger.\n- The page null-checks the lobby part at all four sites.\n- The UDM data it reads without checks is created locally at boot.\n- The game already has code that picks the MenuManager by part class and calls OpenMenu (0x1477a1029 and 0x1477a7328, in the System option widgets).\n\nSmallest stub set over the main menu, revised:\n- Keep D5, D6, D7 and D8.\n- Get the current part with 0x1475ad750, check it is class 0x146f07a20, and take the MenuManager at part+0x4c0.\n- Load the WBP_Menu_Matching_000_C class.\n- Give the campaign manager a row for type 24: insert into MenuParamMap +0x480 (0x80-byte elements, needs a rehash), or, more simply [I], overwrite the MenuClass of an existing unused row and open that row's type.\n- Call OpenMenu 0x14767edb0(mgr, type, 0, 0).\n- RVNG still has to supply the data: room members (GI+0x958) and the airset/mission previews (default and empty otherwise).\n\nCorrections to the map:\n- 0x14767ef00 opens a page by its key. It does not close one, so stub plan step 7 has no close function yet.\n- 0x1477f37a6 is the only fixed-value Matching open, not the only possible one.\n- The UDM+0xfd0 crash risk is resolved: the pointer is set offline.\n\nBiggest miss: D5 covers only 2 of at least 11 LiveWebAPI gates. If RVNG ever creates the Lobby part (CreatePart type 4 or the real lobby map), its start-up sends a Stamp web request through the unhooked gate 0x1479297c0. Its every-frame tick also reads the web server clock, reads GAC, and runs the MatchMaker, which can reach Chronicle and Strix. Party, PlayerList and Lobby000/001 should not be reused, as the map says.\n\nLimits:\n- Only direct calls were followed; vtable and delegate calls were not. The lobby part's sub-UIs (TextChat, Notice, JukeBox and so on) were not analysed.\n- The anti-cheat getter 0x147eced00 appeared in no scan.\n\nNotes, scripts and dumps are in <scratchpad>/lobby_ui/framework_verify/ (NOTES.txt, web_gates.txt, scan_*.txt, dis_*.txt)."
+  }
+ },
+ {
+  "key": "debug",
+  "title": "Developer debug lobby menus",
+  "map": {
+   "screen": "Developer debug lobby menus (key \"debug\"): WBP_NUIDebugLobbyMenuManager, WBP_NUIDebugMenuLobbyTop, WBP_NUIDebugMenuMatchingOption, WBP_NUIDebugMenuStartupTop (plus the related WBP_NUIDebugStartupMenuManager and WBP_DebugBootMenu that sit next to them in the same resource banks)",
+   "summary": "The four DebugMenu packages are thin Blueprint shells. Each has a background image and an empty scroll box. Native C++ classes fill the scroll box, and those classes are still in the shipping exe. The lobby top page has four hard-coded rows: \"Matching Option >>\", \"Localize Text >>\", \"Tutorial Dialog >>\" and \"OpenOldDebugMenu\". In this build the \"Matching Option\" page is empty: its class overrides nothing, so it shows no rows. None of the four pages makes any call to Bandai's services. No shipping code ever opens them either: the resource-bank keys that would load them (\"DebugMenuManager\", \"DebugBootMenu\") are never asked for by any of the 21 native bank lookups, and no console command or flag opens them. The only debug screen that really sets up a match is the separate Debug Boot menu (ULiveNUIDebugBootMenuWidget). Its whole PlayGame path is made of Bandai calls: web login and sign-up checks, network-manager matchmaking into the Chronicle matchmaker, waiting for a matching-server room, then travel. Removing those calls would leave only the final travel step, which RVNG already does directly. So this group gives RVNG no offline way into online match setup.",
+   "nativeClasses": [
+    {
+     "name": "ULiveNUIMenuManager",
+     "label": "[V] native parent of both WBP_NUIDebugLobbyMenuManager_C and WBP_NUIDebugStartupMenuManager_C (zen import 'LiveNUIMenuManager'). StaticClass 0x146f51530, size 0x5e8, no native UFunctions (RegisterNatives = 0x1416b1b70, a bare ret). Holds MenuParamMapByMenuKey (FString key -> LiveNUIMenuParam with MenuClass).",
+     "keyFunctions": [
+      "0x14767ef00 push/open menu by FString key (menu stack at +0x528, widget made by 0x147680370) [V]",
+      "0x146f51530 StaticClass [V]"
+     ]
+    },
+    {
+     "name": "ULiveNUIDebugMenuBaseWidget",
+     "label": "[V] native base of the three Top/Option pages; parent ULiveNUIRootUserWidget (StaticClass 0x146f03dc0, ctor 0x14754b4f0, vtable 0x14c97b110). Size 0x5b8, no native UFunctions; GetScrollBox is a Blueprint-implemented event (BP body only returns ItemScrollBox).",
+     "vtable": "0x14c8cf760",
+     "keyFunctions": [
+      "0x146f25390 C++ ctor (sets vtable 0x14c8cf760) [V]",
+      "0x1475754a0 vslot +0x4b8 init (base part, registers a delegate at +0x568, adds no rows) [V]",
+      "0x147575920 AddRow(index, FString label, ...) helper; callers only 0x147576ce0, 0x1475771f0, 0x147573f70 (LocalizeText), 0x147577480 (TutorialDialog) [V]",
+      "0x147575860 OpenSubMenu(FString key): owner weak ptr +0x3f0, IsA ULiveNUIMenuManager, then 0x14767ef00 [V]",
+      "0x147576c00 vslot +0x4f0 input: up/down index at +0x558; input 5 calls vslot +0x528 [V]",
+      "0x147573d80 vslot +0x528 back/close: 0x14754bf90 then +0x410=0, then 0x14754cce0(this,1,1) [V code, I meaning]"
+     ]
+    },
+    {
+     "name": "ULiveNUIDebugMenuLobbyTopWidget",
+     "label": "[V] native class of WBP_NUIDebugMenuLobbyTop_C. StaticClass 0x146f25670; its only StaticClass caller is registration 0x1411b7840. Overrides vslots +0x4b8 and +0x578 only.",
+     "vtable": "0x14c8cea80",
+     "keyFunctions": [
+      "0x147576ce0 build rows: 0 'Matching Option >>', 1 'Localize Text >>', 2 'Tutorial Dialog >>', 3 'OpenOldDebugMenu' [V]",
+      "0x147577040 row pressed: 0 -> OpenSubMenu('MatchingOption'), 1 -> 'LocalizeText', 2 -> 'TutorialDialog', 3 -> vslot +0x528 (0x147573d80, closes) [V]"
+     ]
+    },
+    {
+     "name": "ULiveNUIDebugMenuMatchingOptionWidget",
+     "label": "[V] native class of WBP_NUIDebugMenuMatchingOption_C. StaticClass 0x146f257e0. All 177 primary vtable slots after the destructor equal the base class's, so in shipping it adds no rows and handles nothing: an empty page.",
+     "vtable": "0x14c8cf180",
+     "keyFunctions": [
+      "(none; inherits base 0x1475754a0 / 0x147576c00 / 0x147573d80) [V]"
+     ]
+    },
+    {
+     "name": "ULiveNUIDebugMenuStartupTopWidget",
+     "label": "[V] native class of WBP_NUIDebugMenuStartupTop_C. StaticClass 0x146f25950 (only registration 0x1411b78c0 calls it).",
+     "vtable": "0x14c8cc020",
+     "keyFunctions": [
+      "0x1475771f0 build rows: 'Localize Text >>', 'OpenOldDebugMenu' [V]",
+      "0x1475773b0 row pressed: 0 -> OpenSubMenu('LocalizeText'), 1 -> vslot +0x528 (close) [V]"
+     ]
+    },
+    {
+     "name": "ULiveNUIResourceBank",
+     "label": "[V] data asset class of AD_Part_Lobby_ResourceBank / AD_Part_Startup_ResourceBank (WidgetList: FName -> widget class). No native UFunctions (RegisterNatives 0x1416b1b70).",
+     "keyFunctions": [
+      "0x1477fb7f0 find widget class by key: 21 callers, all with literal keys (MenuManager, LobbyUI_000/001, NoticeUI, NoticeIconUI, ModeSetUI, MessageWindowUI, TextChatUI, JukeBoxUI, EmoteListUI, EmoteShortcutUI, ScreenShotUI, LobbyEmergency, Pause, Result, AvatarSettingMenu, AccountNameInput, DialogManager, CommonHeader); never 'DebugMenuManager' or 'DebugBootMenu' [V]",
+      "0x1477e9480 lobby view: bank('MenuManager') -> 0x147819920 create -> view+0x4c0 [V]"
+     ]
+    },
+    {
+     "name": "ULiveNUIDebugBootMenuWidget (related, startup bank key 'DebugBootMenu')",
+     "label": "[V] class and code present in .text (ctor moved to protected .sbss at 0x15a396620). StaticClass 0x146f22fe0 (only registration calls it). Developer 'boot into any mode' menu with tabs Config/Server/PlayMode/PlaneSetting/SaveData and PlayGame/Replay buttons.",
+     "vtable": "0x14c8d4388",
+     "keyFunctions": [
+      "0x147555fd0 vslot +0x4b8 rows (PlayGame, Replay) [V]",
+      "0x147559880 Config tab rows: Connection Server, Login Type, UseMessenger, ScoreCalcOnClient, Login, Force ErrorDisplay [V]",
+      "0x14756b160 / 0x14756b930 / 0x14756c56e / 0x14756df40 / 0x14756e9e0 login and sign-up steps (GAC UDM+0xfb0 calls) [V]",
+      "0x14756ef06 messenger step (GI+0x920) [V]",
+      "0x14756f8f0 'Matchmaking...' step: NM StartMatching 0x1474af800 with UDM+0xf38 MissionID [V]",
+      "0x147570ab0 'Connect Matching Server' / 'Room Member Count (%d/%d) Rev.%s' wait (NM) [V]",
+      "0x147570440 'Aircraft Select Start' (GI+0x958 MRMM) [V]",
+      "0x147570da0 travel lambda: UDM+0xf38/+0xf3c, RequestChangeMap 0x147901bf0 at 0x147570f85/0x147571068, then jmp NM 0x1474ae080 [V]",
+      "0x14756ad10 binds NM's OnNetworkMissionError [V]"
+     ]
+    },
+    {
+     "name": "ULiveNetworkManager (GI+0x928)",
+     "label": "[V] matchmaking entry used by the debug boot menu. Correction to earlier notes: 0x1474af800 is the START of matchmaking. It only reports the text 'CancelMatch' (code 0x10c8e1) when the Chronicle matchmaker says a match is already running.",
+     "keyFunctions": [
+      "0x1474af800 StartMatching(NM, modeId, callback) [V code, I name]",
+      "0x1474af750 -> Chronicle (GI+0x918) 0x14748cc20 'already matching?' [V]",
+      "0x1474b0980 -> 0x1474b00d0 build request ('476778' rev string), 0x1474ae300 returns GI+0x918, 0x14748cb00, 0x1454004d0 [V]"
+     ]
+    },
+    {
+     "name": "UChronicleMatchmaker (GI+0x918)",
+     "label": "[V] native table 0x14bfde190: ApplyMatch 0x1453fb7c0, ApplyMatchDebug 0x1453fbbe0, CancelMatch 0x1453fbf70, ConfirmMatch 0x1453fc010, JoinLobby 0x1453fc6b0, JoinLobbyDebug 0x1453fca60, StopWaiting 0x1453fcef0. The Debug variants are real code, not stubs.",
+     "keyFunctions": [
+      "0x1453fbbe0 ApplyMatchDebug: copies ChronicleMatchmakerApplyMatchDebugArgs to +0x228, state +0x3c0=1, calls 0x145401040 [V]",
+      "0x1453fca60 JoinLobbyDebug: copies args to +0x340, state +0x3c0=3, calls 0x145401040 [V]"
+     ]
+    }
+   ],
+   "howOpened": "[V] No shipping code opens these menus. Package-store import lists show only two importers: WBP_NUIDebugLobbyMenuManager is imported only by /Game/OnlineMode/UI/NUI/System/ResourceBank/AD_Part_Lobby_ResourceBank (key 'DebugMenuManager'), and WBP_NUIDebugStartupMenuManager plus WBP_DebugBootMenu only by AD_Part_Startup_ResourceBank (keys 'DebugMenuManager' and 'DebugBootMenu'). The three Top/Option pages are imported only by those two managers, which map Top -> LobbyTop/StartupTop, MatchingOption, AvatarSettings (the real WBP_Menu_Avatar_000), LocalizeText and TutorialDialog. The exe has no UTF-16 or ANSI string 'DebugMenuManager' or 'DebugBootMenu'. All 21 native bank lookups (0x1477fb7f0) use other literal keys. There is no '/Game/.../Debug' asset path in the exe, and no console command containing 'DebugMenu'. The debug classes' StaticClass functions are called only by compiled-in registration. ULiveNUIResourceBank has no native UFunctions a Blueprint could use to look a key up. [I] The developer hook that pushed 'DebugMenuManager'/'DebugBootMenu' was compiled out of the shipping build. [I] RVNG could still create WBP_NUIDebugLobbyMenuManager_C itself by class path and push 'Top', outside the online lobby map: nothing in the classes depends on that map. But it would only show the four rows above. 'OpenOldDebugMenu' just runs the close/back slot (0x147573d80), and the old ULiveDebugMenuManager is never constructed by native code (StaticClass callers 0x141105e50 registration only).",
+   "dependencies": [
+    {
+     "addr": "0x147573040..0x147577bc0",
+     "what": "Whole native code block of the debug menu base, LobbyTop, StartupTop, LocalizeText and TutorialDialog widgets: no reads of GI network members (only GI+0x980 at 0x14757312c/0x147573b18 in LocalizeText), no calls into the NM/Strix/Chronicle/web ranges, no web gates",
+     "service": "local_only",
+     "label": "[V] callee and member-offset scan of the block; BP name tables of the four packages contain no function names besides GetScrollBox",
+     "alreadyBlockedBy": "nothing needed",
+     "dataNeeded": "none (labels are hard-coded literals)",
+     "standIn": "none",
+     "risk": "none for Bandai; only shows local UI"
+    },
+    {
+     "addr": "0x1477fb7f0",
+     "what": "Resource-bank lookup that would load 'DebugMenuManager' / 'DebugBootMenu'; no caller passes those keys",
+     "service": "local_only",
+     "label": "[V] 21 callers listed with their literal keys",
+     "alreadyBlockedBy": "never asked for in shipping (compiled out) [I]",
+     "dataNeeded": "widget class from AD_Part_Lobby/Startup_ResourceBank",
+     "standIn": "RVNG would have to create the widget itself by class path; not recommended",
+     "risk": "none"
+    },
+    {
+     "addr": "0x14756b160 -> 0x147956ec0; 0x14756b930 -> 0x147956d00; 0x14756c56e -> 0x147956150; 0x14756e9e0 -> 0x1479564e0",
+     "what": "Debug boot login / 'Just Login' / account steps: GeneralAPIController (UDM+0xfb0) web requests",
+     "service": "webapi",
+     "label": "[V] each callee calls gate B 0x147959480 at its start (0x147956ed2, 0x147956d11, 0x147956169, 0x1479564f8)",
+     "alreadyBlockedBy": "D5 (gate B answers false) [I that false skips the request]",
+     "dataNeeded": "login status / account and sign-up data (ELiveLoginStatus)",
+     "standIn": "none: the debug boot would show 'Failed... Just Login'; RVNG should not drive this screen",
+     "risk": "blocked; offline the flow stalls or fails at login"
+    },
+    {
+     "addr": "0x14756df40 (gate B at 0x14756e040, 0x14756e0ea; then 0x147955b30)",
+     "what": "Debug boot 'SignUp Check' step",
+     "service": "webapi",
+     "label": "[V]",
+     "alreadyBlockedBy": "D5",
+     "dataNeeded": "sign-up result",
+     "standIn": "none",
+     "risk": "blocked"
+    },
+    {
+     "addr": "0x14756ef06",
+     "what": "Debug boot messenger step ('UseMessenger' option) reading GI+0x920 Strix Messenger",
+     "service": "strix",
+     "label": "[V] reads [GI+0x920]; [I] connects the Strix messenger",
+     "alreadyBlockedBy": "null Strix client offline [I]",
+     "dataNeeded": "messenger connection",
+     "standIn": "none",
+     "risk": "would try a Strix service if a client existed"
+    },
+    {
+     "addr": "0x14756faa7 -> 0x1474af800",
+     "what": "Debug boot 'Matchmaking...' step calls NM StartMatching(GI+0x928, modeId from 0x1479aeca0(UDM+0xf38), callback)",
+     "service": "chronicle",
+     "label": "[V] call and arguments; [I] it starts real matchmaking",
+     "alreadyBlockedBy": "nothing at the call; only unreachable because the debug boot menu is never opened [I]. Not covered by D5/D7.",
+     "dataNeeded": "Chronicle match ticket -> confirmed match / room (FChronicleMatchmakerConfirmedResult)",
+     "standIn": "RVNG's own P2P lobby plus SetConfirmed 0x1474b2310 (DEATHMATCH_NATIVE 6.3). Never call 0x1474af800.",
+     "risk": "HIGH: would contact Bandai's Chronicle matchmaking service"
+    },
+    {
+     "addr": "0x1474af87f / 0x1474af889 (GI+0x938 +0x78/+0x79), error path 0x1474afb4b (code 0x30d402)",
+     "what": "Restriction check inside StartMatching ('client error : Restrictions by easy anti cheat')",
+     "service": "anticheat_not_analysed",
+     "label": "[V] location only",
+     "alreadyBlockedBy": "n/a",
+     "dataNeeded": "n/a",
+     "standIn": "n/a",
+     "risk": "anti-cheat call at 0x1474af87f: not analysed"
+    },
+    {
+     "addr": "0x1474af898 -> 0x1474af750 -> 0x14748cc20",
+     "what": "StartMatching asks the Chronicle matchmaker (GI+0x918) whether a match is already running; if so, callback with code 0x10c8e1 'CancelMatch'",
+     "service": "chronicle",
+     "label": "[V] code; [I] local state query",
+     "alreadyBlockedBy": "not blocked",
+     "dataNeeded": "matchmaker state",
+     "standIn": "n/a (do not call)",
+     "risk": "local read [I]"
+    },
+    {
+     "addr": "0x1474afa5e..0x1474afa93 (GI+0x948: 0x1474dd080, 0x1474e33c0)",
+     "what": "StartMatching party branch when PartyManager has >1 member",
+     "service": "unknown",
+     "label": "[V] calls; [?] which transport the party manager uses",
+     "alreadyBlockedBy": "party never forms offline [I]",
+     "dataNeeded": "party state",
+     "standIn": "n/a",
+     "risk": "unknown"
+    },
+    {
+     "addr": "0x1474b0980 -> 0x1474b00d0 (0x1474ae300 = GI+0x918 at 0x1474ae33b; 0x14748cb00 at 0x1474b05b6; 0x1454004d0 at 0x1474b081d)",
+     "what": "Builds and sends the Chronicle matchmaking request (rev string '476778')",
+     "service": "chronicle",
+     "label": "[V] addresses; [I] 0x1454004d0 starts the network request",
+     "alreadyBlockedBy": "not blocked by D5/D7",
+     "dataNeeded": "match result / region RTTs / room",
+     "standIn": "RVNG lobby (never call)",
+     "risk": "HIGH: Chronicle service contact"
+    },
+    {
+     "addr": "0x147570ab0",
+     "what": "Debug boot wait 'Connect Matching Server' / 'Room Member Count (%d/%d) Rev.%s' (reads NM GI+0x928)",
+     "service": "strix",
+     "label": "[V] strings and NM read; [I] waits on the Strix room",
+     "alreadyBlockedBy": "null Strix client: never completes offline [I]",
+     "dataNeeded": "room member count",
+     "standIn": "would need RVNG's room tables (NM+0x3d8 = 2, NM+0x410)",
+     "risk": "stalls offline"
+    },
+    {
+     "addr": "0x147570440",
+     "what": "Debug boot 'Aircraft Select Start' (GI+0x958 MRMM)",
+     "service": "local_only",
+     "label": "[V] read; [I] meaning",
+     "alreadyBlockedBy": "n/a",
+     "dataNeeded": "MRMM member selectors",
+     "standIn": "RVNG fills the selectors itself (DEATHMATCH_NATIVE 6.3)",
+     "risk": "low"
+    },
+    {
+     "addr": "0x147570da0 (RequestChangeMap 0x147901bf0 at 0x147570f85 / 0x147571068; jmp NM 0x1474ae080 at 0x1475710d8)",
+     "what": "Debug boot travel lambda (the 'game transition' named in DEATHMATCH_NATIVE 6.3): MissionID UDM+0xf38 -> 0x14734d370 row -> RequestChangeMap. If UDM+0xf3c is in 19..49 it takes the campaign branch, which calls GAC 0x147956d00 at 0x147570fe5.",
+     "service": "local_only",
+     "label": "[V]; [I] it is debug-boot code, reached only through delegate thunk 0x1475815bb/0x1475815d4",
+     "alreadyBlockedBy": "campaign-branch web call blocked by D5 (gate B at 0x147956d11)",
+     "dataNeeded": "UDM+0xf38 MissionID, a UObject capture at *rcx",
+     "standIn": "none needed: RVNG already calls RequestChangeMap directly",
+     "risk": "low (local travel)"
+    },
+    {
+     "addr": "0x14756ad10",
+     "what": "Debug boot binds NM's OnNetworkMissionError",
+     "service": "online_flag",
+     "label": "[V] reads GI+0x928 and uses the bind name string",
+     "alreadyBlockedBy": "n/a",
+     "dataNeeded": "none",
+     "standIn": "none",
+     "risk": "none"
+    },
+    {
+     "addr": "0x1453fbbe0 / 0x1453fca60",
+     "what": "UChronicleMatchmaker::ApplyMatchDebug / JoinLobbyDebug (BlueprintCallable, live code: state +0x3c0 then 0x145401040)",
+     "service": "chronicle",
+     "label": "[V] live thunks; [V] not called by any package in this group; [?] whether another cooked Blueprint calls them",
+     "alreadyBlockedBy": "not blocked",
+     "dataNeeded": "debug region/team-matching args (EChronicleMatchmakerDebugRegion Oregon/Tokyo/Europe, EChronicleMatchmakerDebugTeamMatching)",
+     "standIn": "never call",
+     "risk": "HIGH if called: Chronicle service contact"
+    }
+   ],
+   "verdict": "unsafe",
+   "stubPlan": [
+    "1. Do not reuse this group for match setup. The four DebugMenu pages need no stubs (they make no Bandai calls), but they also hold no match setup: 'Matching Option' is an empty page in this build (vtable 0x14c8cf180 is identical to the base).",
+    "2. If a developer menu is ever wanted, RVNG could create /Game/OnlineMode/UI/NUI/Debug/DebugMenu/WBP_NUIDebugLobbyMenuManager.WBP_NUIDebugLobbyMenuManager_C itself and push key 'Top' via 0x14767ef00. It would only reach the LocalizeText and TutorialDialog test pages. Not worth doing.",
+    "3. Never open WBP_DebugBootMenu and never call NM StartMatching 0x1474af800, 0x1474b0980/0x1474b00d0, or UChronicleMatchmaker ApplyMatchDebug 0x1453fbbe0 / JoinLobbyDebug 0x1453fca60. Each one starts Chronicle matchmaking, and D5/D7 do not block that.",
+    "4. Keep RVNG's current path. Its own P2P lobby replaces login + matchmaking + room wait. Write UDM+0xf38 (MissionID), then call RequestChangeMap 0x147901bf0 directly (the same thing the debug-boot lambda 0x147570da0 does) and 0x1474ae080. Fill the room tables with SetConfirmed 0x1474b2310 and the MRMM selectors (DEATHMATCH_NATIVE 6.3).",
+    "5. (For completeness only) Running the Debug Boot flow offline would need all of these: stub its five GAC login/sign-up steps to 'success' (D5 currently makes them fail), replace 0x1474af800 with RVNG's lobby, fake the Strix room member count for 0x147570ab0, and supply the MRMM aircraft-select data. That is RVNG's whole networking layer again, and it would also pass the anti-cheat restriction check at 0x1474af87f (not analysed). Not recommended."
+   ],
+   "openQuestions": [
+    "Does any cooked Blueprint outside this group call UChronicleMatchmaker ApplyMatchDebug / JoinLobbyDebug, or read a resource bank's WidgetList map directly? This needs a name-table scan of all packages. [?]",
+    "Who binds the debug boot step delegates (delegate vtables near 0x14cb6eec8, 0x14cb6f1a0, 0x14cb6f020, 0x14cb6f568, 0x14cb6f910)? No static code reference was found; the binder may be in the protected .sbss code. [?]",
+    "ELiveUIKey::Debug_SkipAuthenticateTrigger, Debug_TravelOnlineStartupTrigger, Debug_TravelStartupTrigger and Debug_TravelTitleTrigger exist as reflected enum values. Does any shipping code fire them? Not checked.",
+    "What does the debug boot 'ScoreCalcOnClient' option set, and does shipping match code read that flag? This could matter for RVNG's host-as-server design; not traced.",
+    "ELiveLoginSequenceType::DebugLogin and ELiveNetworkType::Debug exist; [I] they are debug-boot 'Login Type' / 'Connection Server' choices that still log in to Bandai's servers. Not verified.",
+    "Whether Live/Config/DefaultGame.ini enables any debug-menu path could not be checked (reading it is not allowed).",
+    "The meaning of root-widget vslot +0x528 (0x14754bf90) and 0x14754cce0 is inferred as back/close from how they are used; not proven.",
+    "The startup lookup at 0x1477ee8ab asks for key 'MenuManager', but AD_Part_Startup_ResourceBank has no such key. Which bank does the startup view use? Not checked.",
+    "Correction for KNOWN FACTS: 0x1474af800 is NM's matchmaking START, not CancelMatch. 'CancelMatch' is only the error text it reports when a match is already running. 0x14756f8f0 is the Debug Boot menu's 'Matchmaking...' step. The other caller 0x1477e77d0 was not examined here.",
+    "GI+0x980 (read by the LocalizeText widget at 0x14757312c through 0x14712fd70) is not identified; [I] it is a text/localisation object, not a network one."
+   ],
+   "displays": [
+    "WBP_NUIDebugMenuLobbyTop: background Image_BG and ItemScrollBox with 4 button rows made by native 0x147576ce0. The labels are hard-coded literals: 'Matching Option >>', 'Localize Text >>', 'Tutorial Dialog >>', 'OpenOldDebugMenu'. No data source. [V]",
+    "WBP_NUIDebugMenuStartupTop: same layout, 2 rows from 0x1475771f0: 'Localize Text >>', 'OpenOldDebugMenu'. [V]",
+    "WBP_NUIDebugMenuMatchingOption: same layout, no rows in shipping (no native overrides). [V]",
+    "WBP_NUIDebugLobbyMenuManager / WBP_NUIDebugStartupMenuManager: no visuals. Menu-key tables (DesignType 2): lobby has Top, MatchingOption, AvatarSettings (real WBP_Menu_Avatar_000), LocalizeText, TutorialDialog; startup has Top, LocalizeText. [V]",
+    "Sub-pages reachable from them: LocalizeText (rows ManualInput, TextIDInput, Exit; 0x147573f70) and TutorialDialog (TutorialID, FirstOpenMode, OpenTutorialDialog, Exit; 0x147577480). Both are local UI test pages. [V strings, I purpose]",
+    "Related WBP_DebugBootMenu (not opened in shipping): 6 tabs, PlayGame/Replay buttons, and info panels. The panels show <Server Infomation> (CurrentServer, ClientApiVersion, ServerApiVersion), <PlayMode Infomation> (CurrentPlayMode, CurrentMission) and <Plane Inmfomation> (plane, SpWeapon1/2, Skin, Level, AbilitySlot1-4, Parts1-9). Play modes listed: CompetitiveCoop, PvPvE, Deathmatch, TeamDeathmatch, FreeFlight, EmergencyCall, BaseDefenseline, AceBattle, Single, Tutorial, Lobby, CampaignTitle, CampaignStartup. Status lines: 'Waiting... Login', 'SignUp Check', 'Matchmaking...', 'Connect Matching Server', 'Room Member Count', 'Aircraft Select Start'. [V strings in 0x147555000..0x147573000]"
+   ],
+   "evidenceFiles": [
+    "<scratchpad>/lobby_ui/OnlineMode/UI/NUI/Debug/DebugMenu/WBP_NUIDebugLobbyMenuManager",
+    "<scratchpad>/lobby_ui/OnlineMode/UI/NUI/Debug/DebugMenu/WBP_NUIDebugMenuLobbyTop",
+    "<scratchpad>/lobby_ui/OnlineMode/UI/NUI/Debug/DebugMenu/WBP_NUIDebugMenuMatchingOption",
+    "<scratchpad>/lobby_ui/OnlineMode/UI/NUI/Debug/DebugMenu/WBP_NUIDebugMenuStartupTop",
+    "<scratchpad>/lobby_ui/OnlineMode/UI/NUI/Debug/DebugMenu/WBP_NUIDebugStartupMenuManager",
+    "<scratchpad>/lobby_ui/OnlineMode/UI/NUI/Debug/DebugBoot/Widget/WBP_DebugBootMenu",
+    "<scratchpad>/lobby_ui/OnlineMode/UI/NUI/System/ResourceBank/AD_Part_Lobby_ResourceBank",
+    "<scratchpad>/lobby_ui/OnlineMode/UI/NUI/System/ResourceBank/AD_Part_Startup_ResourceBank",
+    "<scratchpad>/lobby_ui/debug/h.py",
+    "<scratchpad>/lobby_ui/debug/refs.py",
+    "<scratchpad>/lobby_ui/debug/lobby_startup_sel.txt",
+    "<scratchpad>/lobby_ui/debug/dbg_matchmaking.txt",
+    "<scratchpad>/lobby_ui/debug/nm_af800.txt",
+    "<scratchpad>/lobby_ui/debug/nm_b00d0.txt",
+    "<scratchpad>/lobby_ui/debug/dbgboot_map.txt",
+    "<scratchpad>/lobby_ui/debug/dbgboot_strings.txt",
+    "<scratchpad>/lobby_ui/debug/dbgboot_config.txt",
+    "<scratchpad>/lobby_ui/debug/dbgboot_transition.txt",
+    "<scratchpad>/lobby_ui/debug/hdr",
+    "E:/ACE8 PVP/docs/re/DEATHMATCH_NATIVE.md"
+   ],
+   "assets": [
+    "/Game/OnlineMode/UI/NUI/Debug/DebugMenu/WBP_NUIDebugLobbyMenuManager",
+    "/Game/OnlineMode/UI/NUI/Debug/DebugMenu/WBP_NUIDebugStartupMenuManager",
+    "/Game/OnlineMode/UI/NUI/Debug/DebugMenu/WBP_NUIDebugMenuLobbyTop",
+    "/Game/OnlineMode/UI/NUI/Debug/DebugMenu/WBP_NUIDebugMenuMatchingOption",
+    "/Game/OnlineMode/UI/NUI/Debug/DebugMenu/WBP_NUIDebugMenuStartupTop",
+    "/Game/OnlineMode/UI/NUI/Debug/DebugLocalizeText/Widget/WBP_NUIDebugMenu_LocalizeText",
+    "/Game/OnlineMode/UI/NUI/Debug/DebugTutorialDialog/Widget/WBP_NUIDebugMenu_TutorialDialog",
+    "/Game/OnlineMode/UI/NUI/Debug/DebugBoot/Widget/WBP_DebugBootMenu",
+    "/Game/OnlineMode/UI/NUI/Debug/DebugBoot/Widget/Parts/WBP_DebugBootMenu_Tab",
+    "/Game/OnlineMode/UI/NUI/Debug/DebugBoot/GuidFooterLayout/BP_GFL_DebugBoot",
+    "/Game/OnlineMode/UI/NUI/System/ResourceBank/AD_Part_Lobby_ResourceBank",
+    "/Game/OnlineMode/UI/NUI/System/ResourceBank/AD_Part_Startup_ResourceBank"
+   ]
+  },
+  "verify": {
+   "screen": "Developer debug lobby menus (key \"debug\"): WBP_NUIDebugLobbyMenuManager, WBP_NUIDebugMenuLobbyTop, WBP_NUIDebugMenuMatchingOption, WBP_NUIDebugMenuStartupTop (plus related WBP_NUIDebugStartupMenuManager, WBP_DebugBootMenu)",
+   "claimsChecked": [
+    {
+     "claim": "The four DebugMenu packages are thin Blueprint shells (background image + empty scroll box). Their Blueprints call no native functions except the Blueprint-implemented GetScrollBox. Native parents are LiveNUIMenuManager and LiveNUIDebugMenu{LobbyTop,MatchingOption,StartupTop}Widget.",
+     "verdict": "confirmed",
+     "evidence": "[V] zen name tables of all 5 DebugMenu packages: the only function name is GetScrollBox. Imports resolved through scriptobjs.pkl: LiveNUIMenuManager / LiveNUIDebugMenuBaseWidget + LiveNUIDebugMenuLobbyTopWidget / ...MatchingOptionWidget / ...StartupTopWidget."
+    },
+    {
+     "claim": "LobbyTop rows are built by 0x147576ce0 ('Matching Option >>', 'Localize Text >>', 'Tutorial Dialog >>', 'OpenOldDebugMenu'). Row press 0x147577040 maps 0->OpenSubMenu('MatchingOption'), 1->'LocalizeText', 2->'TutorialDialog', 3->vslot +0x528.",
+     "verdict": "confirmed",
+     "evidence": "[V] Disassembly: the labels are SSE loads from 0x14cb71790/0x14cb71740/0x14cb71768/0x14cb717f8, each passed to 0x147575920. Handler dl==0 loads 0x14cb71820 'MatchingOption', 1 loads 0x14cb717b8, 2 loads 0x14cb717d8, and all three call 0x147575860. dl==3 does jmp [vt+0x528]. Vtable 0x14c8cea80 slots +0x4b8 = 0x147576ce0 and +0x578 = 0x147577040."
+    },
+    {
+     "claim": "StartupTop rows come from 0x1475771f0 ('Localize Text >>', 'OpenOldDebugMenu'). Its press handler 0x1475773b0 does OpenSubMenu('LocalizeText') or close.",
+     "verdict": "confirmed",
+     "evidence": "[V] Disassembly. Vtable 0x14c8cc020 slots +0x4b8 / +0x578."
+    },
+    {
+     "claim": "MatchingOption page is empty in shipping: all 177 primary slots after the destructor equal the base class's.",
+     "verdict": "confirmed",
+     "evidence": "[V] 0x14c8cf180 vs 0x14c8cf760: slots 0x8..0x588 are identical. The secondary vtables (+0x28 0x14c8cf0a0, +0x178 0x14c8cf0e0, set in dtor 0x146f258c0) differ from the base's only in destructor thunks and the StaticClass pointers. The BP name table has no row logic either."
+    },
+    {
+     "claim": "ULiveNUIMenuManager StaticClass 0x146f51530, size 0x5e8, has no native UFunctions (RegisterNatives 0x1416b1b70 is a bare ret). The debug page classes and the DebugBoot class also have none.",
+     "verdict": "confirmed",
+     "evidence": "[V] r9 = 0x1416b1b70 ('ret 0') in the GetPrivateStaticClassBody calls of 0x146f51530 (size 0x5e8), 0x146f25670/0x146f257e0/0x146f25950 (0x5b8) and 0x146f22fe0 (0x698). The base class was not checked for this."
+    },
+    {
+     "claim": "OpenSubMenu 0x147575860 reads the weak owner at +0x3f0, checks IsA ULiveNUIMenuManager, then calls 0x14767ef00.",
+     "verdict": "confirmed",
+     "evidence": "[V] Full disassembly 0x147575860..0x147575911: weak-object lookup of +0x3f0, call 0x146f51530 class compare, call 0x14767ef00 at 0x147575901."
+    },
+    {
+     "claim": "The 21 callers of the resource-bank lookup 0x1477fb7f0 all pass literal keys, and none is 'DebugMenuManager' or 'DebugBootMenu'.",
+     "verdict": "confirmed",
+     "evidence": "[V] xrefs over .text/.sbss/.edata gave exactly 21 call sites, each with a string literal just before it: DialogManager, CommonHeader, EmoteShortcutUI x2, MenuManager x2, LobbyUI_000/001, NoticeUI, NoticeIconUI, ModeSetUI, MessageWindowUI, TextChatUI, JukeBoxUI, EmoteListUI, ScreenShotUI, LobbyEmergency, Pause, Result, AvatarSettingMenu, AccountNameInput. [I] Other bank functions (0x1477fb430 reads +0x170 for cleanup, 0x1477fbb80) were not fully traced, so a whole-map iteration that creates widgets is not ruled out."
+    },
+    {
+     "claim": "The exe has no UTF-16 or ANSI string 'DebugMenuManager' or 'DebugBootMenu'.",
+     "verdict": "partly",
+     "evidence": "[V] No such whole literal is referenced by code: my brute-force disp32 scan of .text/.edata catches the movups/movsd string loads the xref helper misses. However, a null-terminated UTF-16 'DebugMenuManager' does exist as the tail of 'ULiveDebugMenuManager' (0x14c6a740a), with no code reference. The only reference is 0x14c6a7402 'LiveDebugMenuManager', at class registration 0x146dfaeef. ANSI 'DebugMenuManager_' (0x14c6a7320) is the reflected property ULiveDebugManager::DebugMenuManager_ (+0x68). ANSI 'DebugBootMenuWidget' is a reflected property name. The protected .sbss was not scanned.",
+     "correction": "No code uses the literal keys (in .text/.edata). Look-alike strings exist only as reflected property names and as a class-name tail."
+    },
+    {
+     "claim": "No console command containing 'DebugMenu' opens these menus.",
+     "verdict": "partly",
+     "evidence": "[V] ULiveCheatManager (StaticClass 0x14718f5f0) has a reflected exec UFunction 'OpenDebugMenu': function-info table 0x14cb31568 -> Z_Construct 0x147193550; native table entry 0x14cb32110 -> thunk 0x143cbef30. That thunk is jmp 0x152836630 = 'Stack.Code += !!Stack.Code; ret', an empty P_FINISH shared by 113 native-table entries.",
+     "correction": "The console/cheat command OpenDebugMenu exists by name, but its native body is empty in shipping, so it opens nothing. This is direct evidence that the debug openers were compiled out."
+    },
+    {
+     "claim": "WBP_NUIDebugLobbyMenuManager is imported only by AD_Part_Lobby_ResourceBank. WBP_NUIDebugStartupMenuManager and WBP_DebugBootMenu are imported only by AD_Part_Startup_ResourceBank. The pages are imported only by their managers.",
+     "verdict": "confirmed",
+     "evidence": "[V] Container-header import scan (debug/refs.py run with MSYS_NO_PATHCONV=1; output in debug_verify/importers.txt). The two banks themselves are imported by nothing (soft-loaded)."
+    },
+    {
+     "claim": "The lobby debug manager's key table is Top, MatchingOption, AvatarSettings (the real WBP_Menu_Avatar_000), LocalizeText, TutorialDialog. The startup one is Top, LocalizeText.",
+     "verdict": "confirmed",
+     "evidence": "[V] uprop dump of Default__WBP_NUIDebugLobbyMenuManager_C MenuParamMapByMenuKey. Import indices were resolved through the store import list: pkg0 = /Game/OnlineMode/UI/NUI/Avatar/WBP_Menu_Avatar_000 (AvatarSettings, obj -19 -> t2:5). [V] No debug row pushes 'AvatarSettings' (0x147577040 pushes only MatchingOption/LocalizeText/TutorialDialog)."
+    },
+    {
+     "claim": "Bank WidgetList contents: Lobby has MenuManager + DebugMenuManager; Startup has DebugBootMenu, AvatarSettingMenu, DebugMenuManager, AccountNameInput.",
+     "verdict": "confirmed",
+     "evidence": "[V] uprop dump of AD_Part_Lobby_ResourceBank / AD_Part_Startup_ResourceBank WidgetList. The entries are hard object refs, so [I] loading the bank also loads the debug classes into memory without creating them."
+    },
+    {
+     "claim": "The sub-pages LocalizeText and TutorialDialog are local UI only. The whole debug-menu code block makes no network reads, besides GI+0x980.",
+     "verdict": "confirmed",
+     "evidence": "[V] LocalizeText vtable 0x14c8ce430 (overrides 0x147573f70, 0x147575470 -> 0x1475742e0 / 0x147574780). TutorialDialog vtable 0x14c8cb808 (0x147577480, 0x147577ab0, 0x147577b40, 0x147577bb0). The base functions are 0x1475754a0/0x147575920/0x147576c00/0x147573d80. A 2-level callee walk found no GI+0x910/918/920/928/930/938/988, UDM+0xfb0/0x12a0, gates A/B, Strix global, or NM/Chronicle/GAC calls. Only OpenTutorialDialog 0x1475aeca0 reads GI+0x980 (0x1475aecfa)."
+    },
+    {
+     "claim": "GI+0x980 is unidentified; [I] a text/localisation object, not a network one.",
+     "verdict": "partly",
+     "evidence": "[V] The reflected GameInstance property at offset 0x980 is 'NUIManager_' (property params 0x14c6ffb10). The same scan names GI+0x918 MatchmakerManager_, +0x920 StrixMessenger_, +0x928 NetworkManager_, +0x930 NetworkP2P_, +0x948 PartyManager_, +0x958 MissionRoomMemberManager_ and +0x910 StrixManager_.",
+     "correction": "GI+0x980 is the NUI manager (UI), not a text object. It is still not network."
+    },
+    {
+     "claim": "'OpenOldDebugMenu' only runs the close slot, and the old ULiveDebugMenuManager is never constructed by native code.",
+     "verdict": "partly",
+     "evidence": "[V] Row 3 does jmp [vt+0x528] = 0x147573d80 (0x14754bf90, +0x410=0, jmp 0x14754cce0). [V] Only registration 0x141105e50 and the property ClassFunc thunk 0x146dfaf60 (ULiveDebugManager::DebugMenuManager_) reference ULiveDebugMenuManager's StaticClass 0x146dfaeb0. Only registration 0x1410ffd90 references ULiveDebugManager's StaticClass 0x146df9970.",
+     "correction": "'Never constructed' is [I] only: data-driven creation through a class property or config can't be ruled out statically."
+    },
+    {
+     "claim": "0x1474af800 is NM's matchmaking START. 'CancelMatch' (code 0x10c8e1) is only the error text it reports when the Chronicle matchmaker says a match is already running.",
+     "verdict": "confirmed",
+     "evidence": "[V] 0x1474af898 calls 0x1474af750 ([GI+0x918] -> 0x14748cc20, returns non-null), and the true path builds 'CancelMatch' plus 0x10c8e1 -> 0x1474b1410. It then goes on to the PartyManager branch and 0x1474b0980 -> 0x1474b00d0 at 0x1474b09ac. An anti-cheat restriction check reads GI+0x938 at 0x1474af870 (not analysed). Callers are 0x14756faa7 (debug boot) and 0x1477e7afa (function 0x1477e7ac0), not 0x1477e77d0. [I] the name 'StartMatching'."
+    },
+    {
+     "claim": "The debug boot 'Matchmaking...' step 0x14756f8f0 calls NM 0x1474af800 with GI+0x928 and a mode id from 0x1479aeca0(UDM+0xf38).",
+     "verdict": "confirmed",
+     "evidence": "[V] 0x14756f963 mov r15,[rdi+0x928]; 0x14756fa6d movsxd r14,[r14+0xf38]; 0x14756fa83 call 0x1479aeca0; 0x14756faa7 call 0x1474af800; string 'Matchmaking...' at 0x14cb71388."
+    },
+    {
+     "claim": "UChronicleMatchmaker native table 0x14bfde190: ApplyMatchDebug 0x1453fbbe0 and JoinLobbyDebug 0x1453fca60 are live code (state +0x3c0 = 1/3, then 0x145401040).",
+     "verdict": "confirmed",
+     "evidence": "[V] The table entries (ApplyMatch 0x1453fb7c0, ApplyMatchDebug 0x1453fbbe0, CancelMatch 0x1453fbf70, ...) are present. 0x1453fbd38 writes [rdi+0x3c0]=1 and calls 0x145401040. 0x1453fcbb2 writes [r14+0x3c0]=3 and calls 0x145401040. Neither thunk has a code xref, only the native table. Whether any cooked Blueprint calls them is unverifiable here."
+    },
+    {
+     "claim": "The debug boot login/sign-up steps call GAC functions that call gate B first (0x147956ed2, 0x147956d11, 0x147956169, 0x1479564f8). The SignUp step calls gate B at 0x14756e040 / 0x14756e0ea, then 0x147955b30.",
+     "verdict": "confirmed",
+     "evidence": "[V] Walk output (walk_boot.txt): 0x14756b2a7 -> 0x147956ec0 (gate B 0x147956ed2), 0x14756b958 -> 0x147956d00 (0x147956d11), 0x14756c5ab -> 0x147956150 (0x147956169), 0x14756eae1 -> 0x1479564e0 (0x1479564f8), 0x14756e101 -> 0x147955b30 (gate B 0x147955b48). [I] that a false gate skips the request."
+    },
+    {
+     "claim": "0x14756ad10 binds NM's OnNetworkMissionError; risk none.",
+     "verdict": "wrong",
+     "evidence": "[V] 0x14756ad10 is the debug boot's OnNetworkMissionError handler (its only caller is 0x14756ab91). It shows an error through 0x1475aed40 (GI+0x980 NUIManager_), then calls NM 0x1474b5650([GI+0x928], 'ULiveNUIDebugBootMenuWidget::OnNetworkMissionError') at 0x14756ae44. 0x1474b5650 is a network reset. It calls Strix SDK 0x145239880 and 0x1452392f0, which both read the Strix client global 0x14e4c5818 at 0x145239884 / 0x1452392f4. It also clears SM+0x1f9/+0x1fa (word write at 0x1474b5721) and SM+0x1f8 (0x1474b5774), and sets NM+0x528 = '0.0.0.0'.",
+     "correction": "It is a handler that runs NM's network reset/leave, which reaches the Strix SDK (a no-op while the Strix client is null)."
+    },
+    {
+     "claim": "0x147570440 'Aircraft Select Start' is local_only, low risk (GI+0x958 MRMM).",
+     "verdict": "partly",
+     "evidence": "[V] 0x1475704cb calls 0x1474909d0. That function reads NM (GI+0x928), tests SM+0x1fa (0x147490a26, 0x147490a56) and, when online, calls 0x1474efb30 (reads Strix client 0x14e4c5818 at 0x1474efb3a, then calls 0x1452947b0) and 0x1474ce870 (send via NM+0x4c0, at 0x147490a6d). Offline only 0x1474ae800(NM,0) runs.",
+     "correction": "It is online-gated Strix code, harmless while SM+0x1fa stays 0, not purely local."
+    },
+    {
+     "claim": "0x14756ef06 is the 'UseMessenger' messenger step reading GI+0x920; [I] it connects the Strix messenger.",
+     "verdict": "partly",
+     "evidence": "[V] 0x14756ef06 is the body of 0x14756ef00. The debug-boot init vslot +0x4b8 (0x147555fd0) calls it at 0x147556cbc. It adds a delegate to [GI+0x920]+0x40 (StrixMessenger_ event list) and stores the handle at widget+0x480. 0x14756f0f0 removes it through 0x147ece970. No connect call is in it.",
+     "correction": "It is an event bind done when the debug boot opens, not a connect step. It touches the Strix Messenger object but makes no network call itself."
+    },
+    {
+     "claim": "StartMatching's party branch (GI+0x948) uses an unknown transport [?].",
+     "verdict": "partly",
+     "evidence": "[V] GI+0x948 is 'PartyManager_'. 0x1474afa93 calls 0x1474e33c0, which reads [GI+0x920]+0xf8 (StrixMessenger_) at 0x1474e36e5 and calls 0x145421230 at 0x1474e3712.",
+     "correction": "The party branch goes through the Strix Messenger ([I] a party notify/send)."
+    },
+    {
+     "claim": "No static code reference binds the debug boot step delegates (vtables near 0x14cb6eec8 ...).",
+     "verdict": "wrong",
+     "evidence": "[V] Each delegate vtable is referenced from debug-boot code: 0x14cb6ee88 (travel lambda 0x147570da0) in 0x147570c50; 0x14cb6f160 (matchmaking 0x14756f8f0) and 0x14cb6efc0 (aircraft select 0x147570440) in 0x14756f150; 0x14cb6fcc0 (login 0x14756b160) in 0x14756ae50. Callers: 0x147570c50 <- 0x14756cb00, 0x14756d5c5; 0x14756f150 <- 0x14756d5bd; 0x14756ae50 <- 0x147571170.",
+     "correction": "The binders are ULiveNUIDebugBootMenuWidget's own functions, all in .text."
+    },
+    {
+     "claim": "The debug boot class and code are present (StaticClass 0x146f22fe0, only registration calls it; vtable 0x14c8d4388; ctor in .sbss 0x15a396620).",
+     "verdict": "confirmed",
+     "evidence": "[V] 0x146f22fe0 is called only by thunk 0x146f234f0, which is referenced only as a property ClassFunc. The vtable 0x14c8d4388 is referenced at 0x146f237e4 and 0x15a39662e. Overrides: 0x4b8 0x147555fd0, 0x4c0 0x147556f30, 0x4f0 0x147572810, 0x520 0x1475570b0, 0x528 0x1475579f0."
+    },
+    {
+     "claim": "ELiveLoginSequenceType::DebugLogin and ELiveNetworkType::Debug are [I] debug-boot 'Login Type' / 'Connection Server' choices.",
+     "verdict": "partly",
+     "evidence": "[V] ELiveNetworkType's values are Centurion, Debug, Lobby, Guild, Player, Npc, Invalid, System, GameMode, SimplePlayerResponse, Bot, Unit (ANSI names 0x14c877c48..0x14c878398).",
+     "correction": "[I] ELiveNetworkType is a network object/message category, not a server choice. ELiveLoginSequenceType::DebugLogin was not traced."
+    },
+    {
+     "claim": "Verdict: this group gives RVNG no offline way into online match setup; unsafe.",
+     "verdict": "confirmed",
+     "evidence": "[V] The pages hold no match setup (MatchingOption is empty; the other rows go to the local LocalizeText/TutorialDialog test pages). [V] The only match-setup code is the Debug Boot PlayGame chain, made of GAC login/sign-up (gate B), NM StartMatching -> Chronicle (GI+0x918, not covered by D5/D7), room wait on SM+0x1fa, and Strix-gated aircraft select, ending in the RequestChangeMap + 0x1474ae080 travel RVNG already uses."
+    }
+   ],
+   "missedDependencies": [
+    {
+     "addr": "0x14756ae44 -> 0x1474b5650 (Strix SDK 0x145239880 at 0x1474b5715, 0x1452392f0 at 0x1474b576f)",
+     "what": "The debug-boot OnNetworkMissionError handler runs NM's network reset/leave. It reads SM (0x1474ae240), calls Strix SDK functions that read the Strix client global 0x14e4c5818, and clears SM+0x1f9/+0x1fa (0x1474b5721) and SM+0x1f8 (0x1474b5774).",
+     "service": "strix",
+     "evidence": "[V] Disassembly of 0x14756ad10 (string 'ULiveNUIDebugBootMenuWidget::OnNetworkMissionError' passed as arg), 0x1474b5650, 0x145239884 / 0x1452392f4 mov rax,[0x14e4c5818]. [I] It is a no-op while the Strix client is null."
+    },
+    {
+     "addr": "0x1475704cb -> 0x1474909d0 (0x147490a3d -> 0x1474efb30; 0x147490a6d -> 0x1474ce870)",
+     "what": "The debug-boot 'Aircraft Select Start' calls NM 0x1474909d0, which is gated on SM+0x1fa. Online, it queries the Strix client (0x1474efb30 reads 0x14e4c5818 and calls 0x1452947b0) and sends through NM+0x4c0 (0x1474ce870). The earlier map called this step local_only.",
+     "service": "strix",
+     "evidence": "[V] cmp [SM+0x1fa] at 0x147490a26 / 0x147490a56; 0x1474efb3a mov rcx,[0x14e4c5818]. [I] Offline both branches are skipped."
+    },
+    {
+     "addr": "0x1474afa93 -> 0x1474e33c0 (0x1474e36e5 [GI+0x920]+0xf8 -> 0x145421230 at 0x1474e3712)",
+     "what": "StartMatching's party branch (PartyManager_ GI+0x948 with more than 1 member) calls into the Strix Messenger.",
+     "service": "strix",
+     "evidence": "[V] Reflected GI property names (0x948 PartyManager_, 0x920 StrixMessenger_) and the disassembly. [I] 0x145421230 is a messenger send."
+    },
+    {
+     "addr": "0x147556cbc -> 0x14756ef00 (0x14756ef62 GI+0x920; unbind 0x14756f0f0 -> 0x147ece970)",
+     "what": "Debug-boot init (vslot +0x4b8) binds a handler into StrixMessenger_+0x40 as soon as the menu opens (handle at widget+0x480).",
+     "service": "strix",
+     "evidence": "[V] Disassembly 0x14756ef00..0x14756f0e0. [I] Only a local delegate add; no network call in it."
+    },
+    {
+     "addr": "0x147556cab..0x147556cb2",
+     "what": "Debug-boot init writes the GeneralAPIController field: [[GI+0x8e0]+0xfb0]+0x140 = 0.",
+     "service": "webapi",
+     "evidence": "[V] mov rax,[rbx+0x8e0]; mov rax,[rax+0xfb0]; mov byte [rax+0x140],0. [?] What the flag means."
+    },
+    {
+     "addr": "0x147570b1c -> 0x1474b39e0 (0x1474b39ee)",
+     "what": "The debug-boot room wait ('Connect Matching Server' / 'Room Member Count') tests SM+0x1fa through 0x1474ae240, so it never completes offline.",
+     "service": "online_flag",
+     "evidence": "[V] Walk output: 0x1474b39e9 call 0x1474ae240, 0x1474b39ee cmp [rax+0x1fa]."
+    },
+    {
+     "addr": "0x1475710d8 jmp 0x1474ae080 (0x1474ae0e5 SM+0x1fa; 0x1474ae169 GI+0x958)",
+     "what": "The travel lambda's NM tail is online-flag dependent: SM+0x1fa picks the path, and MRMM is read. This matches DEATHMATCH_NATIVE (it seeds NM+0x4d0). It was labelled local_only.",
+     "service": "online_flag",
+     "evidence": "[V] Walk output; already documented in DEATHMATCH_NATIVE.md sections 1/6.3. No new risk for RVNG."
+    },
+    {
+     "addr": "0x147557d00 (0x147557d18 -> 0x144478ea0 with slot 0x14e32fe00 'OnlineDebugBootMenuSlot'); 0x14755bf80 rows 'SaveDebugBootMenuData' / 'DeleteDebugBootMenuData' / 'DeleteUserSaveData' (0x14755c3be)",
+     "what": "The debug boot has its own local save slot, and a SaveData tab with a 'DeleteUserSaveData' action against the user's save. The handler was not traced.",
+     "service": "save",
+     "evidence": "[V] Slot-name initializer 0x1412f4de0 writes global 0x14e32fe00; its users are 0x147557af0, 0x147557d00 and 0x14757b4c0. [I] 0x144478ea0 is LoadGameFromSlot. This is local, not Bandai."
+    }
+   ],
+   "verdictAgrees": true,
+   "correctedVerdict": "unsafe",
+   "notes": "The other agent's verdict holds: this group gives RVNG nothing to reuse for offline match setup.\n\n**The four pages**\n- [V] They make no Bandai calls. They hold no match setup either: \"Matching Option\" is an empty page in shipping, and LocalizeText / TutorialDialog are local UI test pages.\n- [V] No shipping code opens them:\n  - The resource-bank keys that would load them are never looked up by any of the 21 literal-key lookups.\n  - The ULiveCheatManager exec command \"OpenDebugMenu\" exists by name, but its native thunk is the shared empty P_FINISH stub (0x143cbef30 -> 0x152836630). This is direct evidence the opener was compiled out.\n\n**The only match-setup path: the Debug Boot PlayGame chain**\nIt is built entirely from Bandai-facing steps:\n- GAC login and sign-up, which gate B refuses (D5).\n- NM StartMatching 0x1474af800, which goes to the Chronicle matchmaker. D5/D7 do not block it, and an anti-cheat restriction check sits at 0x1474af870 (not analysed).\n- A Strix room wait gated on SM+0x1fa.\n- A Strix-gated aircraft-select step.\n- Finally the RequestChangeMap + 0x1474ae080 travel, which RVNG already does directly.\n\nStubbing everything before that travel step would mean rebuilding RVNG's own lobby. So RVNG should never open WBP_DebugBootMenu, and never call 0x1474af800, 0x1474b0980 / 0x1474b00d0, or the Chronicle debug thunks 0x1453fbbe0 / 0x1453fca60.\n\n**New facts not in the map**\n- [V] ULiveNUIStartupPartManager (StaticClass 0x146f75030, vtable 0x14c978ea0) keeps a reflected DebugBootMenuWidget pointer at +0x4a8 and PlayGamePartTaskProcessor at +0x4b0.\n  - Its ctor 0x146f78650 zeroes both.\n  - Its own overrides (0x1477f60e0, 0x1477f6140) never write +0x4a8. This fits a compiled-out debug-boot creator.\n- [V] Another native-only debug class, ULiveNUIDebugUITestFieldMenuWidget (StaticClass 0x146f25c70, vtable 0x14c8cc9d0):\n  - Only registration 0x1411b7940 references it, and it has no cooked asset.\n  - Its rows are SelectDialog / TutorialDialog / BootMenu. It pushes menus through 0x14767ef00 and reads the debug-boot save slot.\n  - It gives no match setup.\n- [V] The real-lobby caller of 0x1474af800 is 0x1477e7afa (function 0x1477e7ac0), not 0x1477e77d0.\n\n**Limits**\n- The brute-force string-reference scan covered .text and .edata only. The protected .sbss was not scanned.\n- Whether any cooked Blueprint outside this group calls ApplyMatchDebug / JoinLobbyDebug is unverifiable without a name-table scan of all packages.\n- Data-driven creation of the debug classes (through config or a soft class) cannot be ruled out statically. DefaultGame.ini was not read, as required.\n- Anti-cheat call at 0x1474af870 (GI+0x938 restriction check inside StartMatching): not analysed.\n\nMy notes and helper scripts are under <scratchpad>/lobby_ui/debug_verify/. NOTES.txt is the summary; the walks are walk_*.txt, the string scan is scan_dbgstr_verified.txt, and the importers are in importers.txt."
+  }
+ }
+]

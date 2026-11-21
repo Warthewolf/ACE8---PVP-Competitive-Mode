@@ -1,5 +1,6 @@
 'use strict';
-const { DatabaseSync } = require('node:sqlite');
+// node:sqlite is loaded only by openDb (the Node server). On Cloudflare the same SQL runs on a Durable Object's own
+// SQLite through worker/sqlstore.js, which brings its own transactions (db.runInTransaction).
 const { canonPath } = require('./integrity');
 
 const SCHEMA = `
@@ -19,7 +20,12 @@ CREATE TABLE IF NOT EXISTS players (
   kills         INTEGER NOT NULL DEFAULT 0,
   deaths        INTEGER NOT NULL DEFAULT 0,
   draws         INTEGER NOT NULL DEFAULT 0,
-  status        TEXT NOT NULL DEFAULT 'active', -- active | flagged | banned
+  status        TEXT NOT NULL DEFAULT 'active', -- active | pending (invite-only, not let in yet) | flagged | banned
+  role          TEXT NOT NULL DEFAULT 'player', -- admin-set badge: player | tester | veteran (config.players.roles)
+  note          TEXT NOT NULL DEFAULT '',       -- admin's short note, shown on the player's card
+  hide_rating   INTEGER NOT NULL DEFAULT 0,     -- player setting: public views show the tier, not the number
+  casual_rating REAL,                           -- hidden casual MMR, only used for matching; NULL until the first casual game
+  casual_games  INTEGER NOT NULL DEFAULT 0,
   created_at    INTEGER NOT NULL
 );
 
@@ -72,6 +78,7 @@ CREATE TABLE IF NOT EXISTS queue (
   region        TEXT NOT NULL,
   integrity_id  INTEGER NOT NULL REFERENCES integrity_reports(id),
   game_version  TEXT NOT NULL DEFAULT '',   -- build the player scanned clean on; only equal builds are paired
+  mode          TEXT NOT NULL DEFAULT 'ranked', -- ranked | casual; the two queues never pair with each other
   joined_at     INTEGER NOT NULL
 );
 
@@ -81,6 +88,7 @@ CREATE TABLE IF NOT EXISTS matches (
   player_b      INTEGER NOT NULL REFERENCES players(id),
   rules         TEXT NOT NULL,
   game_version  TEXT NOT NULL DEFAULT '',   -- from both players' clean scans, never from the match logs
+  mode          TEXT NOT NULL DEFAULT 'ranked', -- ranked (also event games) | casual (only moves the hidden casual rating)
   lobby_code    TEXT,
   state         TEXT NOT NULL,  -- pending | live | awaiting_reports | verified | disputed | void
   winner        INTEGER REFERENCES players(id),
@@ -88,6 +96,8 @@ CREATE TABLE IF NOT EXISTS matches (
   score_b       INTEGER,
   rating_delta_a REAL,
   rating_delta_b REAL,
+  casual_delta_a REAL,                    -- casual matches: change of the hidden casual rating (never shown)
+  casual_delta_b REAL,
   series_id     INTEGER REFERENCES series(id),
   flags         TEXT NOT NULL DEFAULT '[]',
   -- kills/deaths credited to each player when the result was applied (so a void can undo them)
@@ -128,6 +138,27 @@ CREATE TABLE IF NOT EXISTS tournament_entrants (
   PRIMARY KEY (tournament_id, player_id)
 );
 
+-- Player reports. They go to an admin and never change ratings, records or statuses by themselves.
+CREATE TABLE IF NOT EXISTS player_reports (
+  id          INTEGER PRIMARY KEY,
+  reporter_id INTEGER NOT NULL REFERENCES players(id),
+  reported_id INTEGER NOT NULL REFERENCES players(id),
+  match_id    TEXT REFERENCES matches(id), -- optional: a match the two pilots played against each other
+  reason      TEXT NOT NULL,               -- cheating | griefing | abuse | other (config.reports.reasons)
+  details     TEXT NOT NULL DEFAULT '',
+  state       TEXT NOT NULL DEFAULT 'open', -- open | resolved | dismissed
+  resolution  TEXT NOT NULL DEFAULT '',     -- the admin's note when closing it
+  created_at  INTEGER NOT NULL,
+  closed_at   INTEGER
+);
+
+-- A matched host who never opened the room: the sweep voided the match. Repeated lapses mean a queue cooldown.
+CREATE TABLE IF NOT EXISTS lapses (
+  match_id  TEXT PRIMARY KEY REFERENCES matches(id),
+  player_id INTEGER NOT NULL REFERENCES players(id),
+  at        INTEGER NOT NULL
+);
+
 -- One row per bracket slot. round 1 = first round; the final is round log2(size).
 CREATE TABLE IF NOT EXISTS series (
   id            INTEGER PRIMARY KEY,
@@ -149,6 +180,12 @@ CREATE INDEX IF NOT EXISTS idx_nonces_seen ON nonces(seen_at);
 CREATE INDEX IF NOT EXISTS idx_matches_state ON matches(state);
 CREATE INDEX IF NOT EXISTS idx_matches_series ON matches(series_id);
 CREATE INDEX IF NOT EXISTS idx_integrity_player ON integrity_reports(player_id, id);
+CREATE INDEX IF NOT EXISTS idx_matches_created ON matches(created_at);
+CREATE INDEX IF NOT EXISTS idx_reports_reporter ON player_reports(reporter_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_reports_state ON player_reports(state, id);
+-- One open report per reporter, reported pilot and match (or no match).
+CREATE UNIQUE INDEX IF NOT EXISTS idx_reports_open ON player_reports(reporter_id, reported_id, COALESCE(match_id, '')) WHERE state = 'open';
+CREATE INDEX IF NOT EXISTS idx_lapses_player ON lapses(player_id, at);
 `;
 
 // Columns added after the first release. CREATE TABLE IF NOT EXISTS does not add them to older databases.
@@ -161,6 +198,16 @@ const ADDED_COLUMNS = [
   ['matches', 'live_at', 'INTEGER'],
   ['matches', 'swept_at', 'INTEGER'],
   ['approved_mods', 'version', "TEXT NOT NULL DEFAULT ''"],
+  ['players', 'role', "TEXT NOT NULL DEFAULT 'player'"],
+  ['players', 'note', "TEXT NOT NULL DEFAULT ''"],
+  ['players', 'hide_rating', 'INTEGER NOT NULL DEFAULT 0'],
+  ['players', 'casual_rating', 'REAL'],
+  ['players', 'casual_games', 'INTEGER NOT NULL DEFAULT 0'],
+  ['queue', 'mode', "TEXT NOT NULL DEFAULT 'ranked'"],
+  ['matches', 'mode', "TEXT NOT NULL DEFAULT 'ranked'"],
+  ['matches', 'casual_delta_a', 'REAL'], ['matches', 'casual_delta_b', 'REAL'],
+  // The two PCs' link (relay-only Steam P2P): each pilot's SteamID64, posted by their mod, shown only to the opponent.
+  ['matches', 'link_a', 'TEXT'], ['matches', 'link_b', 'TEXT'],
 ];
 
 const parse = (s) => { try { return JSON.parse(s); } catch { return null; } };
@@ -197,7 +244,7 @@ function migrate(db) {
   const rep = db.prepare('SELECT report FROM match_reports WHERE match_id = ? AND player_id = ?');
   const setKd = db.prepare('UPDATE matches SET kills_a = ?, deaths_a = ?, kills_b = ?, deaths_b = ? WHERE id = ?');
   const int = (n) => (Number.isSafeInteger(n) && n >= 0 ? n : 0);
-  for (const m of db.prepare("SELECT * FROM matches WHERE state = 'verified' AND kills_a IS NULL").all()) {
+  for (const m of db.prepare("SELECT * FROM matches WHERE state = 'verified' AND mode != 'casual' AND kills_a IS NULL").all()) {
     const flags = parse(m.flags);
     const ra = parse(rep.get(m.id, m.player_a)?.report); const rb = parse(rep.get(m.id, m.player_b)?.report);
     if (Array.isArray(flags) && !flags.length && ra?.self && rb?.self) setKd.run(int(ra.self.kills), int(ra.self.deaths), int(rb.self.kills), int(rb.self.deaths), m.id);
@@ -205,28 +252,27 @@ function migrate(db) {
   }
   // A verified match that carries a dispute flag was settled by an admin, and every release credited such a
   // settle from the scores. One earlier upgrade filled these from the logs instead: put the scores back.
-  for (const m of db.prepare("SELECT * FROM matches WHERE state = 'verified' AND flags != '[]'").all()) {
+  for (const m of db.prepare("SELECT * FROM matches WHERE state = 'verified' AND mode != 'casual' AND flags != '[]'").all()) {
     const flags = parse(m.flags);
     if (!Array.isArray(flags) || !flags.some((f) => !['no_reports', 'missing_opponent_report'].includes(f?.code))) continue;
     const want = [int(m.score_a), int(m.score_b), int(m.score_b), int(m.score_a)];
     if ([m.kills_a, m.deaths_a, m.kills_b, m.deaths_b].some((v, i) => v !== want[i])) setKd.run(...want, m.id);
   }
-  // Career totals: exactly the sum of the pilot's verified matches, now that every verified match records what
-  // it credited. This counts draws from the first release, which had no draws column, and repairs totals that
+  // Career totals: exactly the sum of the pilot's verified ranked and event matches (casual games never count),
+  // now that every verified match records what it credited. This counts draws from the first release, which had no draws column, and repairs totals that
   // voids on earlier releases took too much from (they undid scores or logs instead of what was credited).
   // Ratings are not recomputed (see docs/SECURITY.md).
   // The matches are read inside the same write transaction as the totals: a server still running on this
   // database (a second start, an overlapping deploy) cannot verify a match in between and lose its credit.
   const setTotals = db.prepare('UPDATE players SET kills = ?, deaths = ?, wins = ?, losses = ?, draws = ? WHERE id = ?');
-  db.exec('BEGIN IMMEDIATE');
-  try {
+  tx(db, () => {
     const totals = new Map();
     const add = (id, k, d, w, l, dr) => {
       const t = totals.get(id) || { kills: 0, deaths: 0, wins: 0, losses: 0, draws: 0 };
       t.kills += k; t.deaths += d; t.wins += w; t.losses += l; t.draws += dr;
       totals.set(id, t);
     };
-    for (const m of db.prepare("SELECT player_a, player_b, winner, kills_a, deaths_a, kills_b, deaths_b FROM matches WHERE state = 'verified'").all()) {
+    for (const m of db.prepare("SELECT player_a, player_b, winner, kills_a, deaths_a, kills_b, deaths_b FROM matches WHERE state = 'verified' AND mode != 'casual'").all()) {
       const draw = m.winner == null ? 1 : 0;
       add(m.player_a, m.kills_a ?? 0, m.deaths_a ?? 0, m.winner === m.player_a ? 1 : 0, m.winner === m.player_b ? 1 : 0, draw);
       add(m.player_b, m.kills_b ?? 0, m.deaths_b ?? 0, m.winner === m.player_b ? 1 : 0, m.winner === m.player_a ? 1 : 0, draw);
@@ -235,8 +281,7 @@ function migrate(db) {
       const t = totals.get(p.id) || { kills: 0, deaths: 0, wins: 0, losses: 0, draws: 0 };
       if (['kills', 'deaths', 'wins', 'losses', 'draws'].some((k) => p[k] !== t[k])) setTotals.run(t.kills, t.deaths, t.wins, t.losses, t.draws, p.id);
     }
-    db.exec('COMMIT');
-  } catch (e) { db.exec('ROLLBACK'); throw e; }
+  });
 }
 
 // Releases before per-build rows keyed approved files by (path, sha256), so a file shared by two builds was
@@ -253,8 +298,7 @@ function rekeyApprovedMods(db) {
   if (keys.includes('name,version,path') && rows.every((r) => canonPath(r.path) === r.path)) return;
   const rank = { required: 2, cosmetic: 1, retired: 0 };
   rows.sort((a, b) => (rank[b.category] ?? 0) - (rank[a.category] ?? 0) || b.id - a.id);
-  db.exec('BEGIN IMMEDIATE');
-  try {
+  tx(db, () => {
     db.exec('DROP TABLE approved_mods');
     db.exec(SCHEMA.slice(SCHEMA.indexOf('CREATE TABLE IF NOT EXISTS approved_mods'), SCHEMA.indexOf('CREATE TABLE IF NOT EXISTS integrity_reports')));
     const ins = db.prepare('INSERT OR IGNORE INTO approved_mods (id, name, path, size, sha256, category, version) VALUES (?, ?, ?, ?, ?, ?, ?)');
@@ -264,12 +308,16 @@ function rekeyApprovedMods(db) {
         ins.run(r.id, r.name, p, r.size, r.sha256, r.category === 'required' ? 'retired' : r.category, `${r.version}#${r.id}`);
       }
     }
-    db.exec('COMMIT');
-  } catch (e) { db.exec('ROLLBACK'); throw e; }
+  });
 }
 
 function openDb(path) {
-  const db = new DatabaseSync(path);
+  const { DatabaseSync } = require('node:sqlite'); // (the Worker bundle: worker/no-sqlite.js)
+  return initDb(new DatabaseSync(path));
+}
+
+// The schema and the upgrades on an open database (node:sqlite, or the Durable Object's store).
+function initDb(db) {
   // Tables first (without the indexes that may reference new columns), then columns, then indexes.
   const [tables, indexes] = SCHEMA.split('CREATE INDEX IF NOT EXISTS idx_players_rating');
   db.exec(tables);
@@ -280,6 +328,7 @@ function openDb(path) {
 
 // Run fn inside a transaction; rolls back on throw.
 function tx(db, fn) {
+  if (typeof db.runInTransaction === 'function') return db.runInTransaction(fn);
   db.exec('BEGIN IMMEDIATE');
   try {
     const out = fn();
@@ -291,4 +340,4 @@ function tx(db, fn) {
   }
 }
 
-module.exports = { openDb, tx };
+module.exports = { openDb, initDb, tx };

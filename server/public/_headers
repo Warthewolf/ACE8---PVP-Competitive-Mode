@@ -1,0 +1,7 @@
+# The headers Cloudflare adds to the website's static files (the Worker's static assets). Keep them the same as
+# src/app.js sets on everything the Node server answers (test/worker.test.js compares them).
+/*
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: no-referrer
+  X-Frame-Options: DENY
+  Content-Security-Policy: default-src 'self'; img-src 'self' data:; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; script-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'

@@ -6,7 +6,11 @@
  *   rvng register   --server URL --name NAME              create an account, writes credentials.json (owner-only)
  *   rvng scan       --game DIR [--no-cache]                integrity scan, prints the server verdict
  *   rvng join-event --id N                                 sign up for an open knockout event
- *   rvng run        --game DIR [--region eu] [--no-cache]  bridge daemon used by the in-game mod
+ *   rvng run        --game DIR [--region eu] [--mode ranked|casual] [--no-cache]
+ *                                                          bridge daemon used by the in-game mod
+ *   rvng report     --player ID --reason cheating|griefing|abuse|other [--match MATCH_ID] [--details TEXT]
+ *                                                          report a pilot to the admins
+ *   rvng settings   --hide-rating on|off                   show only your tier (not the number) on the website
  *   rvng baseline   --game DIR --version V [--aircraft stats.json]             (admins) build a clean-install baseline
  *   rvng approve    --game DIR --path REL[,REL...] --name NAME [--version V] [--category required|cosmetic|retired]
  *                   [--exclude SUB[,SUB...]] [--out FILE]  (admins) pin the files and folders of one build of a
@@ -16,13 +20,16 @@
  *
  * The in-game mod (UE4SS Lua) cannot speak signed HTTPS, so it exchanges small JSON files with this
  * daemon in <game>/ProjectRVNG/bridge/ :
- *   mod -> daemon : request.json  { action: "queue" | "cancel", region? }
+ *   mod -> daemon : request.json  { action: "queue" | "cancel", region?, mode? }   mode: "ranked" | "casual"; without
+ *                                 one, --mode is used, else the server's default (ranked, or casual while ranked is off)
  *                   runtime.json  { gameVersion, aircraft: {...}, loadedModules: [...] }
  *                   lobby.json    { matchId, lobbyCode }        (host only, after creating the room)
+ *                   link.json     { matchId, steamId }          (both: this PC's SteamID64 for the match's relay-only
+ *                                                                Steam link; the server shows it only to the opponent)
  *                   result.json   match log (see server/src/matchlog.js)
- *   daemon -> mod : state.json    { state, message, match, error? }
+ *   daemon -> mod : state.json    { state, message, match, mode?, error? }   (mode while queued)
  *                   state: idle | scanning | waiting | queued | matched | rejected | reported
- * lobby.json and result.json are deleted only once the server has accepted them; a rejection of the content
+ * lobby.json, link.json and result.json are deleted only once the server has accepted them; a rejection of the content
  * (400/403/404/409/413) renames them to *.failed, anything else is retried. Every result is copied to
  * bridge/archive/ before it is sent.
  */
@@ -96,6 +103,32 @@ async function cmdRegister(a) {
   const res = await api(a.server, null, 'POST', '/api/players/register', { name: a.name });
   writeJson(credPath(a), { server: a.server, apiKey: res.apiKey, apiSecret: res.apiSecret, playerId: res.id, name: res.name }, 0o600);
   console.log(`Registered ${res.name} (#${res.id}). Credentials saved to ${credPath(a)} - keep this file private.`);
+  if (res.status === 'pending') console.log('This server is invite-only: an admin has to let you in before you can scan or queue.');
+}
+
+// `call` stands in for the signed request in tests.
+const signedCall = (a) => { const creds = loadCreds(a); return (m, p, b) => api(creds.server, creds, m, p, b); };
+
+async function cmdReport(a, call) {
+  const playerId = Number(a.player);
+  if (a.player === undefined || a.player === true || !Number.isSafeInteger(playerId) || playerId < 1) throw new Error('--player <player id> required (the number in their profile link)');
+  if (!a.reason || a.reason === true) throw new Error('--reason required: cheating, griefing, abuse or other');
+  for (const k of ['match', 'details']) if (a[k] === true) throw new Error(`--${k} needs a value`);
+  const body = { playerId, reason: String(a.reason).toLowerCase() };
+  if (a.match !== undefined) body.matchId = String(a.match);
+  if (a.details !== undefined) body.details = String(a.details);
+  const r = await (call || signedCall(a))('POST', '/api/reports', body);
+  console.log(`Report #${r.id} filed (${r.reason}). An admin will review it; reports never change a rating by themselves.`);
+  return r;
+}
+
+async function cmdSettings(a, call) {
+  const v = a['hide-rating'];
+  const on = ['on', 'true', '1', 'yes'].includes(String(v).toLowerCase()); const off = ['off', 'false', '0', 'no'].includes(String(v).toLowerCase());
+  if (v === undefined || v === true || (!on && !off)) throw new Error('--hide-rating on|off required');
+  const me = await (call || signedCall(a))('POST', '/api/me/settings', { hideRating: on });
+  console.log(on ? `Your rating is hidden: the website shows your tier (${me.tier}) only.` : `Your rating (${me.rating}) is shown again.`);
+  return me;
 }
 
 async function cmdScan(a) {
@@ -206,7 +239,7 @@ function cmdApprove(a) {
  * The bridge between the in-game mod and the server. tick() runs once a second.
  * @param call  (method, path, body) => Promise; defaults to signed requests with `creds`.
  */
-function createBridge({ creds, game, region, noCache = false, call = (m, p, b) => api(creds.server, creds, m, p, b) }) {
+function createBridge({ creds, game, region, mode, noCache = false, call = (m, p, b) => api(creds.server, creds, m, p, b) }) {
   const dir = bridgeDir(game);
   fs.mkdirSync(dir, { recursive: true });
   const file = (n) => path.join(dir, n);
@@ -218,7 +251,7 @@ function createBridge({ creds, game, region, noCache = false, call = (m, p, b) =
   const show = (q, message) => {
     current = q;
     if (q.state === 'matched') setState('matched', { match: q.match, message: message || `Match ${q.match.id} (${q.match.state})` });
-    else if (q.state === 'queued') setState('queued', { message: message || `Searching... ${q.waitingSec}s` });
+    else if (q.state === 'queued') setState('queued', { ...(q.mode ? { mode: q.mode } : {}), message: message || `Searching... ${q.waitingSec}s` });
     else setState(q.state, { message: message || 'Ready' });
   };
   // Ask the server where this pilot stands: after a restart, a cancel, or a refused join. If that fails, later
@@ -272,7 +305,10 @@ function createBridge({ creds, game, region, noCache = false, call = (m, p, b) =
       }
       try {
         const reg = String(req.region || region || 'global').toLowerCase();
-        const q = await call('POST', '/api/queue/join', { integrityToken: scanRes.integrityToken, region: reg });
+        // ranked or casual, from the mod's request, else --mode. Without either the server picks its default, as
+        // for mods from before modes existed.
+        const m = req.mode || mode;
+        const q = await call('POST', '/api/queue/join', { integrityToken: scanRes.integrityToken, region: reg, ...(m ? { mode: String(m).toLowerCase() } : {}) });
         show(q, q.state === 'queued' ? 'Searching for opponent' : 'Opponent found');
       } catch (e) {
         if (e.status === 409) await resync('You already have an open match');
@@ -347,6 +383,9 @@ function createBridge({ creds, game, region, noCache = false, call = (m, p, b) =
     // A 409 on the lobby means the room was already posted (the earlier response was lost).
     await submit('lobby.json', (l) => call('POST', `/api/matches/${encodeURIComponent(l.matchId)}/lobby`, { lobbyCode: l.lobbyCode }),
       (e) => e.status === 409);
+    // The two PCs' link: this PC's SteamID for the match. A 409 means the match is over or the id is already set.
+    await submit('link.json', (l) => call('POST', `/api/matches/${encodeURIComponent(l.matchId)}/link`, { steamId: String(l.steamId) }),
+      (e) => e.status === 409);
   }
 
   return { dir, tick, resync, fail, setState, current: () => current, last: () => last };
@@ -354,7 +393,8 @@ function createBridge({ creds, game, region, noCache = false, call = (m, p, b) =
 
 async function cmdRun(a) {
   const creds = loadCreds(a);
-  const bridge = createBridge({ creds, game: a.game, region: a.region, noCache: !!a['no-cache'] });
+  if (a.mode === true) throw new Error('--mode needs a value: ranked or casual');
+  const bridge = createBridge({ creds, game: a.game, region: a.region, mode: a.mode, noCache: !!a['no-cache'] });
   await bridge.resync('Companion connected').catch((e) => bridge.setState('idle', { message: 'Companion connected (server unreachable)', error: e.message }));
   console.log(`Bridge running in ${bridge.dir}`);
   for (;;) {
@@ -374,6 +414,8 @@ async function main() {
   if (cmd === 'register') return cmdRegister(a);
   if (cmd === 'scan') return cmdScan(a);
   if (cmd === 'join-event') return cmdJoinEvent(a);
+  if (cmd === 'report') return cmdReport(a);
+  if (cmd === 'settings') return cmdSettings(a);
   if (cmd === 'baseline') return cmdBaseline(a);
   if (cmd === 'approve') return cmdApprove(a);
   if (cmd === 'run') return cmdRun(a);
@@ -381,4 +423,4 @@ async function main() {
 }
 
 if (require.main === module) main().catch((e) => { console.error(e.message); process.exit(1); });
-module.exports = { buildReport, createBridge, writeJson, cmdApprove, DEFAULT_EXCLUDES };
+module.exports = { buildReport, createBridge, writeJson, cmdApprove, cmdReport, cmdSettings, DEFAULT_EXCLUDES };

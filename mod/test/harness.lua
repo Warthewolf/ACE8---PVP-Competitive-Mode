@@ -14,6 +14,7 @@ Key = { F8 = "F8", F9 = "F9" }
 function RegisterKeyBind() end
 function RegisterHook(path, fn) hooks[path] = fn end
 function LoopAsync(_, fn) loop = fn end
+RVNG_TICK_SYNC = true   -- rvng_tick.lua runs its job straight from LoopAsync here (no game thread)
 local params = {}
 local function param(id, stats)
   local p = { IsValid = function() return true end, GetFName = function() return { ToString = function() return id end } end }
@@ -155,4 +156,30 @@ writeState({ state = "matched", match = { id = "m4", state = "live", role = "hos
 os.remove(RVNG_BRIDGE .. "lobby.json")
 tick(10)
 check(read("lobby.json") == nil, "no re-post once the server has the room code")
+
+-- 4. The two PCs' link: this PC's SteamID posted for the match (as a string), the link started once the opponent's is
+-- there (host = player 1), never twice, and posted again only if the server lacks it.
+local linkStarts, selfId = {}, ""
+RVNG_LinkSelf = function() return selfId end
+RVNG_LinkStart = function(peer, player, tag) linkStarts[#linkStarts + 1] = { peer, player, tag }; return 1 end
+os.remove(RVNG_BRIDGE .. "link.json")
+writeState({ state = "matched", match = { id = "m5", state = "pending", role = "guest" } })
+tick()
+check(read("link.json") == nil, "no link post while Steam has no id yet")
+selfId = "76561190000000202"
+tick()
+local lk = read("link.json")
+check(lk and lk:find('"steamId":"76561190000000202"', 1, true) and Json.decode(lk).matchId == "m5", "this PC's SteamID posted for the match, as a string")
+check(#linkStarts == 0, "no link before the opponent's id is known")
+os.remove(RVNG_BRIDGE .. "link.json")
+writeState({ state = "matched", match = { id = "m5", state = "live", role = "guest",
+  link = { self = "76561190000000202", peer = "76561190000000101" } } })
+tick(); tick()
+check(#linkStarts == 1 and linkStarts[1][1] == "76561190000000101" and linkStarts[1][2] == 2 and linkStarts[1][3] == "m5",
+  "the link started once, as the guest (player 2), tagged with the match id")
+check(read("link.json") == nil, "no re-post once the server has this PC's id")
+writeState({ state = "matched", match = { id = "m6", state = "live", role = "host",
+  link = { self = "76561190000000202", peer = "76561190000000303" } } })
+tick()
+check(#linkStarts == 2 and linkStarts[2][2] == 1 and linkStarts[2][3] == "m6", "a new match: the link started again, as the host (player 1)")
 print("all mod checks passed")

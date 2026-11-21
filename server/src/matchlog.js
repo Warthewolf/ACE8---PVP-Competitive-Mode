@@ -29,6 +29,12 @@ const SPEED_TOLERANCE = 1.05; // observed speed may exceed baseline max by 5% (d
 const DURATION_TOLERANCE_SEC = 15;
 const MAX_DURATION_SEC = 24 * 3600;
 const MAX_SPEED = 100000; // km/h; anything above is a malformed value, not an observation
+const MAX_SCORE = 1e7;
+// The native deathmatch: the game's own clock (MC_DM MissionLimitTime 210 s, docs/re/DEATHMATCH_NATIVE.md 1), counted by
+// the mod from GamePlaying to the result; both PCs hold the same scores (the host's ScoreUpdates), as shown (one decimal).
+const NATIVE_DM_TIME_SEC = 210;
+const NATIVE_DM_TIME_SLACK_SEC = 30;
+const SCORE_TOLERANCE = 0.5;
 
 const isInt = (n) => Number.isInteger(n) && n >= 0;
 const isNum = (n) => typeof n === 'number' && Number.isFinite(n);
@@ -59,6 +65,14 @@ function validateShape(r) {
     }
   }
   if (r.runtime !== undefined && !isPlainObject(r.runtime)) errs.push('runtime');
+  // The game's own deathmatch (RVNG runtime 0.4.4): each side's score as the game shows it, decided at time-up.
+  if (r.format !== undefined && r.format !== 'native_dm') errs.push('format');
+  if (r.format === 'native_dm') {
+    for (const side of ['self', 'opponent']) {
+      const s = r[side];
+      if (!isPlainObject(s) || !isNum(s.score) || s.score < 0 || s.score > MAX_SCORE) errs.push(`${side}.score`);
+    }
+  }
   return errs;
 }
 
@@ -168,4 +182,46 @@ function reconcile(repA, repB, ctx) {
   return { ok: flags.length === 0, scoreA, scoreB, outcome, flags };
 }
 
-module.exports = { validateShape, reconcile, SPEED_TOLERANCE, DURATION_TOLERANCE_SEC };
+/**
+ * Reconcile two native deathmatch logs (format 'native_dm', RVNG runtime 0.4.4: docs/re/DEATHMATCH_NATIVE.md 9.15).
+ * The match is the game's own deathmatch on the two PCs: decided by score at time-up; a pilot's kills are the other's
+ * deaths. Both logs must agree on everything (kills, deaths, aircraft, scores, length, end). A lost link (endReason
+ * 'disconnect') can't say who left, so it goes to an admin. The old design's sampled flight stats aren't in these logs.
+ * @param ctx { rules, playerA, playerB, minDurationSec }
+ */
+function reconcileNativeDm(repA, repB, ctx) {
+  const { rules = {}, playerA, playerB, minDurationSec = 0 } = ctx;
+  const flags = [];
+  const flag = (code, extra = {}) => flags.push({ code, ...extra });
+  const sides = [[repA, repB, playerA], [repB, repA, playerB]];
+  if (repA.format !== 'native_dm' || repB.format !== 'native_dm') flag('format_mismatch', { a: repA.format ?? null, b: repB.format ?? null });
+  if (repA.self.kills !== repB.opponent.kills || repA.opponent.kills !== repB.self.kills) {
+    flag('kills_mismatch', { a: [repA.self.kills, repA.opponent.kills], b: [repB.opponent.kills, repB.self.kills] });
+  }
+  if (repA.self.deaths !== repB.opponent.deaths || repA.opponent.deaths !== repB.self.deaths) flag('death_mismatch');
+  if (repA.self.aircraftId !== repB.opponent.aircraftId || repA.opponent.aircraftId !== repB.self.aircraftId) flag('aircraft_mismatch');
+  const sa = repA.self.score; const sb = repA.opponent.score;
+  if (Math.abs(sa - repB.opponent.score) > SCORE_TOLERANCE || Math.abs(sb - repB.self.score) > SCORE_TOLERANCE) {
+    flag('score_mismatch', { a: [sa, sb], b: [repB.opponent.score, repB.self.score] });
+  }
+  if (Math.abs(repA.durationSec - repB.durationSec) > DURATION_TOLERANCE_SEC) flag('duration_mismatch');
+  if (Math.min(repA.durationSec, repB.durationSec) < minDurationSec) flag('too_short');
+  if (repA.endReason !== repB.endReason) flag('end_reason_mismatch', { a: repA.endReason, b: repB.endReason });
+  const bans = new Set(rules.aircraftBans || []);
+  for (const [rep, , pid] of sides) {
+    if (rep.endReason !== 'time_limit' && rep.endReason !== 'disconnect') flag('end_reason_invalid', { player: pid, endReason: rep.endReason });
+    if (rep.endReason === 'time_limit' && (rep.durationSec < NATIVE_DM_TIME_SEC - DURATION_TOLERANCE_SEC
+      || rep.durationSec > NATIVE_DM_TIME_SEC + NATIVE_DM_TIME_SLACK_SEC)) {
+      flag('duration_off_clock', { player: pid, durationSec: rep.durationSec });
+    }
+    if (bans.has(rep.self.aircraftId)) flag('banned_aircraft', { player: pid, aircraft: rep.self.aircraftId });
+    const killEvents = rep.events.filter((e) => e.type === 'kill' && e.actor === 'self').length;
+    if (killEvents !== rep.self.kills) flag('kill_events_inconsistent', { player: pid, claimed: rep.self.kills, events: killEvents });
+  }
+  if (repA.endReason === 'disconnect' && repB.endReason === 'disconnect') flag('link_lost');
+  const scoreA = Math.round(sa); const scoreB = Math.round(sb);
+  const outcome = sa > sb ? 'a' : sb > sa ? 'b' : 'draw';
+  return { ok: flags.length === 0, scoreA, scoreB, outcome, flags };
+}
+
+module.exports = { validateShape, reconcile, reconcileNativeDm, SPEED_TOLERANCE, DURATION_TOLERANCE_SEC, NATIVE_DM_TIME_SEC };

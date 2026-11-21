@@ -8,6 +8,12 @@ const md = (t) => { const d = new Date(t); return `${pad(d.getMonth() + 1)}.${pa
 const delta = (d) => (d == null ? '—' : `<span class="${d >= 0 ? 'pos' : 'neg'}">${d >= 0 ? '+' : ''}${Math.round(d)}</span>`);
 const stateLabel = { awaiting_reports: 'awaiting', registration: 'open' };
 const badge = (cls, text) => `<span class="badge ${esc(cls)}">${esc(text ?? stateLabel[cls] ?? cls)}</span>`;
+// Admin-set roles (tester, veteran, ...). The default role, player, shows no badge.
+const roleBadge = (role) => (role && role !== 'player' ? ` ${badge(`role role-${role}`, role)}` : '');
+const who = (p) => `${esc(p.name)}${roleBadge(p.role)}`;
+// A pilot who hides their rating shows the tier only: the API sends no number for them.
+const ratingText = (p) => (p.rating == null ? esc(p.tier) : esc(p.rating));
+const pnote = (p) => (p.note ? `<p class="pnote">${esc(p.note)}</p>` : '');
 
 // ---------- generated HUD artwork (no third-party game art) ----------
 const SVG = {
@@ -32,13 +38,13 @@ function pilotRow(p, i) {
   return `<div class="row" role="button" tabindex="0" aria-expanded="false" data-drawer="d${i}">
       <div class="thumb">${tile({ art: '', big: esc((p.name || '?').charAt(0).toUpperCase()), cls: 'sq' })}</div>
       <div class="yr">${p.rank}</div>
-      <div class="name"><a href="#/player/${p.id}">${esc(p.name)}</a> ${badge(p.tier, p.tier)}</div>
-      <div class="stats"><span><b>${p.rating}</b>Rating</span><span><b>${record(p)}</b>Record</span>
+      <div class="name"><a href="#/player/${p.id}">${esc(p.name)}</a> ${badge(p.tier, p.tier)}${roleBadge(p.role)}</div>
+      <div class="stats"><span><b>${ratingText(p)}</b>${p.rating == null ? 'Tier' : 'Rating'}</span><span><b>${record(p)}</b>Record</span>
         <span class="opt"><b>${Math.round((100 * p.wins) / Math.max(1, p.wins + p.losses))}%</b>Win rate</span><span class="opt"><b>${p.kd}</b>K/D</span></div>
       <span class="plus" aria-hidden="true"></span>
     </div>
-    <div class="drawer" id="d${i}">
-      <div class="figures">${fig('Peak rating', p.peakRating)}${fig('Kills', p.kills)}${fig('Deaths', p.deaths)}${fig('K/D', p.kd)}</div>
+    <div class="drawer" id="d${i}">${pnote(p)}
+      <div class="figures">${p.peakRating == null ? '' : fig('Peak rating', p.peakRating)}${fig('Kills', p.kills)}${fig('Deaths', p.deaths)}${fig('K/D', p.kd)}</div>
       <a class="btn-line" href="#/player/${p.id}">Pilot profile</a>
     </div>`;
 }
@@ -53,13 +59,13 @@ function matchCard(m) {
   // Decide by id: two pilots' names can look alike, ids cannot.
   const hostWon = m.winner != null && m.winner === m.host.id;
   const guestWon = m.winner != null && m.winner === m.guest.id;
-  const [winner, loser] = hostWon ? [m.host.name, m.guest.name] : [m.guest.name, m.host.name];
+  const [winner, loser] = hostWon ? [m.host, m.guest] : [m.guest, m.host];
   const txt = m.state === 'verified'
-    ? (hostWon || guestWon ? `${esc(winner)} defeats ${esc(loser)}` : `${esc(m.host.name)} and ${esc(m.guest.name)} draw`)
-    : `${esc(m.host.name)} vs ${esc(m.guest.name)}`;
+    ? (hostWon || guestWon ? `${who(winner)} defeats ${who(loser)}` : `${who(m.host)} and ${who(m.guest)} draw`)
+    : `${who(m.host)} vs ${who(m.guest)}`;
   return `<a class="card" href="#/match/${encodeURIComponent(m.id)}">
       ${tile({ big: score, names: `${esc(m.host.name)} · ${esc(m.guest.name)}`, cls: m.seriesId ? 'final' : '' })}
-      <div class="meta"><span class="date">${ymd(m.createdAt)}</span>${m.seriesId ? badge('event', 'event') : badge(m.state)}</div>
+      <div class="meta"><span class="date">${ymd(m.createdAt)}</span>${m.seriesId ? badge('event', 'event') : `${m.mode === 'casual' ? badge('casual') : ''}${badge(m.state)}`}</div>
       <div class="txt">${txt}</div></a>`;
 }
 const matchGrid = (rows, cls = '') => (rows.length ? `<div class="grid ${cls}">${rows.map(matchCard).join('')}</div>` : '<div class="empty">No matches yet.</div>');
@@ -101,8 +107,10 @@ const routes = {
   },
 
   async leaderboard() {
-    const rows = await get('/api/leaderboard?limit=200');
-    return sheet(`${title('Leaderboard', 'Ranked 1v1. Only matches where both pilots\' logs agree and pass the integrity checks are counted.')}${leaderList(rows)}`);
+    const [rows, s] = await Promise.all([get('/api/leaderboard?limit=200'), get('/api/stats')]);
+    const paused = s.queues && s.queues.ranked === false
+      ? '<div class="chron"><p>The ranked queue is paused on this server. Casual matches are played on their own hidden rating and never count here.</p></div>' : '';
+    return sheet(`${title('Leaderboard', 'Ranked 1v1. Only matches where both pilots\' logs agree and pass the integrity checks are counted.')}${paused}${leaderList(rows)}`);
   },
 
   async player(id) {
@@ -111,8 +119,8 @@ const routes = {
       ? `<div class="chron"><div class="when">${ymd(p.integrity.at)}</div><p>Last scan ${badge(p.integrity.verdict)}</p>
          ${p.integrity.mods.length ? `<p>${p.integrity.mods.map((m) => `<span class="box">${esc(m.name)}${m.approved ? '' : ' · unapproved'}</span>`).join(' ')}${p.integrity.modsTotal > p.integrity.mods.length ? ` <span class="box">+${esc(p.integrity.modsTotal - p.integrity.mods.length)} more</span>` : ''}</p>` : '<p>No mods besides the competitive client.</p>'}</div>`
       : '<div class="chron"><p>No integrity scan submitted yet.</p></div>';
-    return sheet(`${title(esc(p.name), `${badge(p.tier, p.tier)} ${p.status !== 'active' ? badge(p.status) : ''}`)}
-      <div class="figures">${fig('Rating', p.rating)}${fig('Peak', p.peakRating)}${fig('Wins', p.wins)}${fig('Losses', p.losses)}${p.draws ? fig('Draws', p.draws) : ''}${fig('K/D', p.kd)}</div>
+    return sheet(`${title(esc(p.name), `${badge(p.tier, p.tier)}${roleBadge(p.role)} ${p.status !== 'active' ? badge(p.status) : ''}`)}${pnote(p)}
+      <div class="figures">${p.rating == null ? fig('Tier', p.tier) : `${fig('Rating', p.rating)}${fig('Peak', p.peakRating)}`}${fig('Wins', p.wins)}${fig('Losses', p.losses)}${p.draws ? fig('Draws', p.draws) : ''}${fig('K/D', p.kd)}</div>
       <div class="bar">Integrity <span class="i">i</span></div>${integ}
       <section>${title('Recent Matches', '', 'h2')}${matchGrid(p.matches.slice(0, 12))}</section>`);
   },
@@ -129,12 +137,12 @@ const routes = {
     // Only a verified result shows a winner and rating changes (a voided one has been undone).
     const ok = m.state === 'verified';
     const won = (p) => ok && m.winner === p.id;
-    const row = (p, role, score, d) => `<tr><td><a href="#/player/${p.id}"><b>${esc(p.name)}</b></a>${won(p) ? ' ' + badge('verified', 'win') : ''}</td>
+    const row = (p, role, score, d) => `<tr><td><a href="#/player/${p.id}"><b>${esc(p.name)}</b></a>${roleBadge(p.role)}${won(p) ? ' ' + badge('verified', 'win') : ''}</td>
       <td class="opt">${role}</td><td class="r">${score ?? '—'}</td><td class="r">${delta(d)}</td></tr>`;
     const r = m.rules || {};
     return sheet(`${title('Match', `${ymd(m.createdAt)} ${badge(m.state)}`)}
       <div class="champion">${tile({ big: m.score ? `${m.score.host} – ${m.score.guest}` : 'VS', names: `${esc(m.host.name)} · ${esc(m.guest.name)}`, cls: m.seriesId ? 'final' : '' })}
-        <div class="who"><span class="box">${m.seriesId ? 'Knockout event' : 'Ranked'}</span><b>${esc(m.host.name)}</b><span class="when">vs</span><b>${esc(m.guest.name)}</b></div></div>
+        <div class="who"><span class="box">${m.seriesId ? 'Knockout event' : m.mode === 'casual' ? 'Casual' : 'Ranked'}</span><b>${esc(m.host.name)}</b><span class="when">vs</span><b>${esc(m.guest.name)}</b></div></div>
       <div class="bar">Result <span class="i">i</span></div>
       <table class="tbl"><thead><tr><th>Pilot</th><th class="opt">Role</th><th class="r">Kills</th><th class="r">Rating</th></tr></thead><tbody>
         ${row(m.host, 'Host', m.score?.host, ok ? m.ratingDelta?.host : null)}${row(m.guest, 'Guest', m.score?.guest, ok ? m.ratingDelta?.guest : null)}</tbody></table>
@@ -157,7 +165,7 @@ const routes = {
     let body;
     if (t.state === 'registration') {
       body = `<div class="bar">Registered pilots · ${t.entrants.length}/${t.size} <span class="i">i</span></div>
-        <div class="chron">${t.entrants.length ? t.entrants.map((e) => `<p><a href="#/player/${e.id}"><b>${esc(e.name)}</b></a> <span class="box">${Math.round(e.rating)}</span></p>`).join('') : '<p>No pilots yet.</p>'}</div>`;
+        <div class="chron">${t.entrants.length ? t.entrants.map((e) => `<p><a href="#/player/${e.id}"><b>${esc(e.name)}</b></a>${roleBadge(e.role)} <span class="box">${e.rating == null ? esc(e.tier) : Math.round(e.rating)}</span></p>`).join('') : '<p>No pilots yet.</p>'}</div>`;
     } else {
       const byRound = {};
       for (const s of t.series) (byRound[s.round] ||= []).push(s);
@@ -240,6 +248,7 @@ document.addEventListener('submit', async (e) => {
     form.dataset.done = '1';
     const creds = { server: location.origin, apiKey: d.apiKey, apiSecret: d.apiSecret, playerId: d.id, name: d.name };
     out.innerHTML = `<p><b>Welcome, ${esc(d.name)}.</b> Save this as <code>credentials.json</code> in the folder you run the companion app from (or next to <code>rvng.js</code>). It is shown only once.</p>
+      ${d.status === 'pending' ? '<p class="pending-note">This server is invite-only: your account is waiting for an admin to let you in. You can queue once you are approved.</p>' : ''}
       <pre class="secret">${esc(JSON.stringify(creds, null, 2))}</pre>`;
   } catch (err) {
     out.innerHTML = `<p class="error">${esc(err.message)}</p>`;

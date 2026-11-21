@@ -1,6 +1,7 @@
 'use strict';
 /** Single-elimination knockout brackets, seeded by rating, ending in a 1v1 championship final. */
 const { tx } = require('./db');
+const { tierFor } = require('./rating');
 
 class HttpError extends Error {
   constructor(status, message) { super(message); this.status = status; }
@@ -32,6 +33,7 @@ function register(db, tournamentId, player) {
   const t = db.prepare('SELECT * FROM tournaments WHERE id = ?').get(tournamentId);
   if (!t) throw new HttpError(404, 'tournament not found');
   if (t.state !== 'registration') throw new HttpError(409, 'registration closed');
+  if (player.status === 'pending') throw new HttpError(403, 'your account is waiting for an admin to let you in (this server is invite-only)');
   if (player.status !== 'active') throw new HttpError(403, `account is ${player.status}; event entry disabled`);
   // Only active entrants hold a slot: flagged or banned sign-ups are dropped at start.
   const count = db.prepare(`SELECT COUNT(*) c FROM tournament_entrants e JOIN players p ON p.id = e.player_id
@@ -177,8 +179,10 @@ function openSeriesFor(db, playerId) {
 function get(db, id) {
   const t = db.prepare(`SELECT t.*, p.name champion_name FROM tournaments t LEFT JOIN players p ON p.id = t.champion WHERE t.id = ?`).get(id);
   if (!t) return null;
-  const entrants = db.prepare(`SELECT p.id, p.name, p.rating, e.seed FROM tournament_entrants e JOIN players p ON p.id = e.player_id
-    WHERE e.tournament_id = ? ORDER BY COALESCE(e.seed, 9999), p.rating DESC`).all(id);
+  // A pilot who hides their rating shows the tier only (the seed order still follows the rating).
+  const entrants = db.prepare(`SELECT p.id, p.name, p.rating, p.hide_rating, p.role, e.seed FROM tournament_entrants e JOIN players p ON p.id = e.player_id
+    WHERE e.tournament_id = ? ORDER BY COALESCE(e.seed, 9999), p.rating DESC`).all(id)
+    .map(({ hide_rating: hide, ...e }) => ({ ...e, rating: hide ? null : e.rating, tier: tierFor(e.rating), role: e.role || 'player' }));
   const series = db.prepare(`SELECT s.*, pa.name a_name, pb.name b_name FROM series s
     LEFT JOIN players pa ON pa.id = s.player_a LEFT JOIN players pb ON pb.id = s.player_b
     WHERE s.tournament_id = ? ORDER BY s.round, s.slot`).all(id);
