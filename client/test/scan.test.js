@@ -21,3 +21,25 @@ test('scan reports size and sha256, skips excluded folders, and refreshes cache 
   assert.equal(scan(root)[0].size, 6);
   fs.rmSync(root, { recursive: true });
 });
+
+test('scan: the anti-cheat folder and the protected launcher are never read, not even listed', () => {
+  const { scan: scanDir } = require('../lib/scan');
+  const root = require('node:fs').mkdtempSync(require('node:path').join(require('node:os').tmpdir(), 'rvng-eac-'));
+  const fsx = require('node:fs'); const px = require('node:path');
+  try {
+    fsx.mkdirSync(px.join(root, 'EasyAntiCheat', 'Certificates'), { recursive: true });
+    fsx.writeFileSync(px.join(root, 'EasyAntiCheat', 'EasyAntiCheat_EOS_Setup.exe'), 'x');
+    fsx.writeFileSync(px.join(root, 'EasyAntiCheat', 'Certificates', 'base.bin'), 'x');
+    fsx.writeFileSync(px.join(root, 'start_protected_game.exe'), 'x');
+    fsx.mkdirSync(px.join(root, 'Game', 'EasyAntiCheat'), { recursive: true });       // (deeper: an ordinary folder)
+    fsx.writeFileSync(px.join(root, 'Game', 'EasyAntiCheat', 'mod.dll'), 'x');
+    fsx.writeFileSync(px.join(root, 'game.exe'), 'x');
+    const opened = [];
+    const realOpen = fsx.openSync;
+    fsx.openSync = (f, ...r) => { opened.push(String(f)); return realOpen(f, ...r); };
+    let files;
+    try { files = scanDir(root, { useCache: false }).map((f) => f.path); } finally { fsx.openSync = realOpen; }
+    assert.deepEqual(files, ['Game/EasyAntiCheat/mod.dll', 'game.exe']);
+    assert.ok(!opened.some((f) => /start_protected_game|[\/]EasyAntiCheat[\/](EasyAntiCheat_EOS|Certificates)/i.test(f)), 'never opened');
+  } finally { fsx.rmSync(root, { recursive: true, force: true }); }
+});

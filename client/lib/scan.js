@@ -18,9 +18,13 @@ const DEFAULT_EXCLUDES = [
 ];
 // File types the game or a loader can load are always reported, whatever folder they are in.
 const NEVER_EXCLUDE = /\.(pak|ucas|utoc|sig|dll|asi|exe|lua|py|js)$/i;
+// Never read at all, not even listed: the anti-cheat's folder and the protected launcher at the install root. RVNG
+// doesn't touch, analyse or bypass them (the project's rule), and a scan that hashed them would read them.
+const NEVER_READ = /^(easyanticheat|start_protected_game\.exe)$/i;
 
 function walk(root, rel = '', out = []) {
   for (const ent of fs.readdirSync(path.join(root, rel), { withFileTypes: true })) {
+    if (!rel && NEVER_READ.test(ent.name)) continue;
     const r = rel ? `${rel}/${ent.name}` : ent.name;
     // Symlinks and junctions are reported as such (the server rejects them): following them could pull in
     // a mods folder that lives anywhere on the disk.
@@ -80,4 +84,4 @@ function scan(root, { excludes = DEFAULT_EXCLUDES, cacheFile, useCache = true, o
   return files.sort((a, b) => (a.path < b.path ? -1 : 1));
 }
 
-module.exports = { scan, hashFile, excluded, DEFAULT_EXCLUDES, NEVER_EXCLUDE };
+module.exports = { scan, hashFile, excluded, DEFAULT_EXCLUDES, NEVER_EXCLUDE, NEVER_READ };

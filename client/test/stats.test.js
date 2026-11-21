@@ -96,6 +96,16 @@ test('stats: rvng baseline takes the clean install\'s stats from its runtime.jso
     assert.throws(() => cmdBaseline({ game, out, match: path.join(root, 'nope.json') }), /no match capture at/);
     fs.rmSync(path.join(bridge(game), 'runtime_match.json'));
 
+    // --exclude: a loader's proxy DLL and a tool's leftover left out of the clean game
+    const win64 = path.join(game, 'Game', 'Binaries', 'Win64');
+    fs.writeFileSync(path.join(win64, 'dwmapi.dll'), 'proxy');
+    fs.writeFileSync(path.join(win64, 'IGCS_ImGuiSettings.ini'), '[x]');
+    cmdBaseline({ game, out, exclude: 'Game/Binaries/Win64/dwmapi.dll,Game\\Binaries\\Win64\\IGCS_ImGuiSettings.ini,Game/nope.txt' });
+    const bx = JSON.parse(fs.readFileSync(out, 'utf8'));
+    assert.ok(!bx.manifest.files.some((f) => /dwmapi|IGCS/i.test(f.path)), 'both left out');
+    assert.ok(bx.manifest.files.some((f) => /AceCombat8\.exe$/.test(f.path)), 'the game kept');
+    assert.match(warns.join('\n'), /--exclude matched no file: game\/nope\.txt/);
+
     // --aircraft: a runtime.json taken elsewhere
     const other = path.join(root, 'other-runtime.json');
     fs.writeFileSync(other, JSON.stringify({ stats: stats({ leaves: 1 }) }));

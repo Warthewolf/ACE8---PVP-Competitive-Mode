@@ -197,9 +197,15 @@ function baselineStats(a) {
 function cmdBaseline(a) {
   const version = a.version || steamBuild(a.game);
   if (!version) throw new Error('--version required (the install has no Steam build id to use)');
-  const files = scan(a.game, { useCache: false })
+  // --exclude a,b: files that aren't the clean game's (a loader's proxy DLL approved with its mod, a tool's leftover)
+  const skip = new Set(String(a.exclude && a.exclude !== true ? a.exclude : '').split(',').map((p) => p.trim().replace(/\\/g, '/').toLowerCase()).filter(Boolean));
+  const all = scan(a.game, { useCache: false });
+  const unmatched = [...skip].filter((p) => !all.some((f) => f.path.toLowerCase() === p));
+  if (unmatched.length) console.warn(`note: --exclude matched no file: ${unmatched.join(', ')}`);
+  const files = all
     // Mods are registered separately as approved mods, never baked into the baseline.
-    .filter((f) => !/(^|\/)(~mods|logicmods|ue4ss|projectrvng)\//i.test(f.path));
+    .filter((f) => !/(^|\/)(~mods|logicmods|ue4ss|projectrvng)\//i.test(f.path))
+    .filter((f) => !skip.has(f.path.toLowerCase()));
   const links = files.filter((f) => f.size < 0);
   if (links.length) throw new Error(`the install contains links, which cannot be part of a baseline: ${links.map((f) => f.path).join(', ')}`);
   const { src, stats } = baselineStats(a);
