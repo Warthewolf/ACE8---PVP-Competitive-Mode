@@ -247,9 +247,18 @@ document.addEventListener('submit', async (e) => {
     if (!r.ok) throw new Error(d.error);
     form.dataset.done = '1';
     const creds = { server: location.origin, apiKey: d.apiKey, apiSecret: d.apiSecret, playerId: d.id, name: d.name };
-    out.innerHTML = `<p><b>Welcome, ${esc(d.name)}.</b> Save this as <code>credentials.json</code> in the folder you run the companion app from (or next to <code>rvng.js</code>). It is shown only once.</p>
+    const text = JSON.stringify(creds, null, 2) + '\n';
+    out.innerHTML = `<p><b>Welcome, ${esc(d.name)}.</b> Download <code>credentials.json</code> and put it in the folder you run the companion app from (or next to <code>rvng.js</code>). It is shown only once.</p>
       ${d.status === 'pending' ? '<p class="pending-note">This server is invite-only: your account is waiting for an admin to let you in. You can queue once you are approved.</p>' : ''}
-      <pre class="secret">${esc(JSON.stringify(creds, null, 2))}</pre>`;
+      <p><button type="button" id="regsave">Download credentials.json</button></p>
+      <pre class="secret">${esc(text)}</pre>`;
+    out.querySelector('#regsave').addEventListener('click', () => {
+      const url = URL.createObjectURL(new Blob([text], { type: 'application/json' }));
+      const a = document.createElement('a');
+      a.href = url; a.download = 'credentials.json';
+      document.body.append(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    });
   } catch (err) {
     out.innerHTML = `<p class="error">${esc(err.message)}</p>`;
     controls.forEach((x) => { x.disabled = false; });

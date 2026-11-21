@@ -48,6 +48,14 @@ test('website: own routes only, robust rendering, byes, keyboard links, one-time
       await page.fill('input[name=name]', 'Delta');
       await page.locator('#reg button').dblclick();
       await page.waitForSelector('#regout pre.secret');
+      // The download button saves the same credentials as credentials.json, without submitting the form again.
+      const [dl] = await Promise.all([page.waitForEvent('download'), page.click('#regsave')]);
+      assert.equal(dl.suggestedFilename(), 'credentials.json');
+      const saved = JSON.parse(require('node:fs').readFileSync(await dl.path(), 'utf8'));
+      assert.equal(saved.name, 'Delta');
+      assert.equal(saved.server, env.url);
+      assert.ok(saved.apiKey && saved.apiSecret && saved.playerId);
+      assert.deepEqual(saved, JSON.parse(await page.textContent('#regout pre.secret')));
       await page.locator('#reg').evaluate((f) => f.requestSubmit());
       await page.waitForTimeout(200);
       assert.ok(await page.$('#regout pre.secret'), 'credentials still shown');
