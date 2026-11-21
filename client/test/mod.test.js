@@ -53,3 +53,9 @@ test("mod: RVNG's menu pages (rvng_pages.lua)", { skip: !lua && 'no Lua 5.4 inte
   assert.equal(r.status, 0, r.stdout + r.stderr);
   assert.match(r.stdout, /all page checks passed/);
 });
+
+test('mod: the stats check\'s reader (rvng_stats.lua)', { skip: !lua && 'no Lua 5.4 interpreter' }, () => {
+  const r = spawnSync(lua, [path.join(__dirname, '../../mod/test/stats_test.lua')], { encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /all stats checks passed/);
+});

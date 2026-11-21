@@ -29,9 +29,13 @@ DB_PATH=demo.sqlite node scripts-demo.js  # optional demo data, then: DB_PATH=de
 Admin setup for each game version:
 
 ```bash
-# 1. On a clean, unmodded install. The aircraft stats are required: without them every match is disputed.
-node client/rvng.js baseline --game "C:/.../ACE COMBAT 8" --version 1.0.2 --aircraft aircraft-stats.json
-curl -X PUT "$SERVER/api/admin/baselines" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'content-type: application/json' --data @baseline-1.0.2.json
+# 1. On a clean install (only UE4SS and RVNG added). The stats check (docs/re/STATS.md) needs the clean game's
+#    combat tables: the first command makes the bridge folder; start the game, wait at the main menu until RVNG's log
+#    says "stats pass 1" (about a minute), close it, and run the command again. The version is Steam's build id
+#    (steam-<buildid>), read from the install; --version overrides it. Without the stats nobody scans clean.
+node client/rvng.js baseline --game "C:/.../ACE COMBAT 8"
+curl -X PUT "$SERVER/api/admin/baselines" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'content-type: application/json' --data @baseline-steam-26002268.json
+#    (or upload the JSON file on the website's admin page, Build & mods)
 # 2. Pin the script loader and the competitive mod, every file, as REQUIRED. This includes UE4SS-settings.ini
 #    (with ModsFolderPath empty and the debug console off), mods.txt and the mod's enabled.txt: any loader
 #    file or script that is not pinned is rejected, and a required mod must match one pinned build exactly.
@@ -40,9 +44,9 @@ curl -X PUT "$SERVER/api/admin/baselines" -H "Authorization: Bearer $ADMIN_TOKEN
 #    competitive mod lives inside the loader's Mods folder, so leave it out of the loader with --exclude (the
 #    server refuses a file that another mod already pins). Exclude every Lua mod you approve on its own, e.g.
 #    --exclude Mods/ProjectRVNG,Mods/CockpitColors once a cosmetic mod from step 3 lives there too.
-node client/rvng.js approve --game "C:/.../ACE COMBAT 8" --path ACE8/Binaries/Win64/ue4ss,ACE8/Binaries/Win64/dwmapi.dll --exclude Mods/ProjectRVNG --name UE4SS --version 3.0.1 --category required
+node client/rvng.js approve --game "C:/.../ACE COMBAT 8" --path Game/Binaries/Win64/ue4ss,Game/Binaries/Win64/dwmapi.dll --exclude Mods/ProjectRVNG --name UE4SS --version 3.0.1 --category required
 curl -X POST "$SERVER/api/admin/mods" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'content-type: application/json' --data @mods-UE4SS-3.0.1.json
-node client/rvng.js approve --game "C:/.../ACE COMBAT 8" --path ACE8/Binaries/Win64/ue4ss/Mods/ProjectRVNG --name "Project RVNG" --version 1.0 --category required
+node client/rvng.js approve --game "C:/.../ACE COMBAT 8" --path Game/Binaries/Win64/ue4ss/Mods/ProjectRVNG --name "Project RVNG" --version 1.0 --category required
 #    Upload mods-Project_RVNG-1.0.json the same way.
 # 3. Optional cosmetic mods: --category cosmetic. A Lua mod in the loader's Mods folder is its own build: add its
 #    folder to the loader's --exclude list (step 2) from then on.

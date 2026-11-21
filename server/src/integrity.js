@@ -100,6 +100,79 @@ function compareAircraft(reported, baseline) {
   return findings;
 }
 
+// The stats check (rvng_stats_1, mod/ProjectRVNG/Scripts/rvng_stats.lua, docs/re/STATS.md): the game's combat tables
+// (planes with their flight model at every level, parts, weapons, damage rates, abilities, level-ups, stealth) as one
+// fingerprint per row and per table, compared with the clean install's. Any changed, added or missing row is named.
+const STATS_FORMAT = 'rvng_stats_1';
+const DIGEST = /^[0-9a-f]{16}$/;
+const STATS_LIMITS = { groups: 64, rows: 20000, key: 64 };
+const MAX_STAT_FINDINGS = 50;
+
+// Is it a well-formed stats object? (the size bounds keep a hostile report from costing the server much)
+function validStats(s) {
+  if (!isPlainObject(s) || s.format !== STATS_FORMAT || !isPlainObject(s.groups)) return false;
+  const names = Object.keys(s.groups);
+  if (names.length > STATS_LIMITS.groups) return false;
+  let rows = 0;
+  for (const n of names) {
+    const g = s.groups[n];
+    if (n.length > STATS_LIMITS.key || !isPlainObject(g) || !DIGEST.test(g.digest) || !isPlainObject(g.entries)) return false;
+    for (const [k, d] of Object.entries(g.entries)) {
+      if (++rows > STATS_LIMITS.rows || k.length > STATS_LIMITS.key || typeof d !== 'string' || !DIGEST.test(d)) return false;
+    }
+  }
+  return true;
+}
+
+function compareStats(reported, baseline) {
+  if (!validStats(reported)) {
+    return [reported === undefined || reported === null
+      ? { code: 'runtime_stats_missing', severity: 'high' }
+      : { code: 'malformed_report', severity: 'critical', field: 'runtime.stats' }];
+  }
+  const findings = [];
+  const planes = isPlainObject(reported.planes) ? reported.planes : {};
+  const refPlanes = isPlainObject(baseline.planes) ? baseline.planes : {};
+  const headline = (table, key) => {
+    if (table !== 'PlaneDataMap_') return {};
+    const a = isPlainObject(planes[key]) ? planes[key] : {}; const e = isPlainObject(refPlanes[key]) ? refPlanes[key] : {};
+    const pick = (o) => ({ speedMax: o.speedMax, speedStall: o.speedStall, maxHealth: o.maxHealth });
+    return { expected: pick(e), actual: pick(a) };
+  };
+  for (const [table, ref] of Object.entries(baseline.groups)) {
+    if (ref.missing) continue;                               // (the clean install didn't have it: nothing to compare)
+    const got = Object.hasOwn(reported.groups, table) ? reported.groups[table] : null;
+    if (!got || got.missing) {
+      // an optional table (a DataTable some modes load) is compared when both have it; a required one (the information
+      // manager's) must be there
+      findings.push(ref.optional ? { code: 'stat_table_unchecked', severity: 'info', table }
+        : { code: 'stat_table_missing', severity: 'high', table });
+      continue;
+    }
+    if (got.digest === ref.digest) continue;
+    let named = 0;
+    for (const [key, digest] of Object.entries(ref.entries)) {
+      if (!Object.hasOwn(got.entries, key)) {
+        findings.push({ code: 'stat_row_missing', severity: 'high', table, row: key }); named++;
+      } else if (got.entries[key] !== digest) {
+        findings.push({ code: 'aircraft_stat_modified', severity: 'critical', table, row: key, ...headline(table, key) }); named++;
+      }
+    }
+    for (const key of Object.keys(got.entries)) {
+      if (!Object.hasOwn(ref.entries, key)) { findings.push({ code: 'stat_row_added', severity: 'critical', table, row: key }); named++; }
+    }
+    // (rows all equal but the table's own fingerprint not: the report doesn't add up)
+    if (!named) findings.push({ code: 'aircraft_stat_modified', severity: 'critical', table });
+  }
+  // (a report that changes thousands of rows is named by its first rows and a count: findings are stored)
+  if (findings.length > MAX_STAT_FINDINGS) {
+    const more = findings.length - MAX_STAT_FINDINGS;
+    findings.length = MAX_STAT_FINDINGS;
+    findings.push({ code: 'aircraft_stat_modified', severity: 'critical', more });
+  }
+  return findings;
+}
+
 /**
  * @param report    client report (see top of file)
  * @param baseline  { manifest: {files:[...]}, aircraft: {...} } or null
@@ -234,8 +307,14 @@ function evaluate(report, baseline, approved) {
       findings.push({ code: 'unexpected_loaded_module', severity: 'high', module: name });
     }
   }
-  if (isPlainObject(rt.aircraft) && Object.keys(rt.aircraft).length) {
-    findings.push(...compareAircraft(rt.aircraft, baseline.aircraft || {}));
+  const ref = isPlainObject(baseline.aircraft) ? baseline.aircraft : {};
+  if (ref.format === STATS_FORMAT) {
+    findings.push(...compareStats(rt.stats, ref));
+  } else if (rt.stats !== undefined && !Object.keys(ref).length) {
+    // (a mod that sends the stats, a baseline uploaded without them: nothing to check against, so nobody passes)
+    findings.push({ code: 'no_reference_stats', severity: 'high' });
+  } else if (isPlainObject(rt.aircraft) && Object.keys(rt.aircraft).length) {
+    findings.push(...compareAircraft(rt.aircraft, ref));
   } else findings.push({ code: 'runtime_stats_missing', severity: 'high' });
 
   const worst = findings.reduce((m, f) => Math.max(m, SEVERITY[f.severity] ?? 0), 0);
@@ -248,4 +327,4 @@ function evaluate(report, baseline, approved) {
   return { verdict, findings, mods, manifestHash };
 }
 
-module.exports = { evaluate, compareAircraft, classifyUnknown, norm, canonPath, isPlainObject, STAT_TOLERANCE, SEVERITY };
+module.exports = { evaluate, compareAircraft, compareStats, validStats, STATS_FORMAT, classifyUnknown, norm, canonPath, isPlainObject, STAT_TOLERANCE, SEVERITY };

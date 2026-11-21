@@ -143,7 +143,7 @@ function capList(list, n, budget) {
 }
 
 // Tampered aircraft data or injected code in a player's own report puts the account under review.
-const SELF_INCRIMINATING = ['aircraft_stat_modified', 'proxy_dll_injection', 'approved_mod_tampered'];
+const SELF_INCRIMINATING = ['aircraft_stat_modified', 'stat_row_added', 'proxy_dll_injection', 'approved_mod_tampered'];
 
 // The findings that explain a verdict are never the ones cut: first one finding of every code, those that flag
 // the account first and then by severity, then the remaining findings in the same order. Past `n` entries or
@@ -515,9 +515,26 @@ function resolveMatch(db, m, reports) {
     const res = matchlog.reconcileNativeDm(repA, repB, {
       rules: json(m.rules, {}), playerA: m.player_a, playerB: m.player_b, minDurationSec: config.match.minDurationSec,
     });
+    // The stats check's in-match pass: each pilot's own tables that load with the match (the online weapon and
+    // durability tables), against the clean install's match capture (the baseline's aircraft.match). No capture or
+    // no pass (a short match): nothing to compare.
+    const baseline = baselineFor(db, m.game_version, { activeOnly: false });
+    const matchRef = baseline && isPlainObject(baseline.aircraft) && integrity.validStats(baseline.aircraft.match) ? baseline.aircraft.match : null;
+    const statFlags = [];
+    for (const [rep, pid] of [[repA, m.player_a], [repB, m.player_b]]) {
+      if (!matchRef || !integrity.validStats(rep.stats)) continue;
+      for (const f of integrity.compareStats(rep.stats, matchRef)) {
+        if (f.severity !== 'info') statFlags.push({ ...f, player: pid, when: 'match' });
+      }
+    }
+    res.flags.push(...statFlags);
     if (res.flags.length) {
       db.prepare("UPDATE matches SET state = 'disputed', score_a = ?, score_b = ?, flags = ? WHERE id = ?")
         .run(res.scoreA, res.scoreB, JSON.stringify(res.flags), m.id);
+      // (a changed table in a pilot's OWN log puts that pilot's account under review, as a scan does)
+      for (const f of statFlags.filter((x) => x.code === 'aircraft_stat_modified' || x.code === 'stat_row_added')) {
+        db.prepare("UPDATE players SET status = 'flagged' WHERE id = ? AND status = 'active'").run(f.player);
+      }
       return;
     }
     db.prepare("UPDATE matches SET flags = '[]' WHERE id = ?").run(m.id);
@@ -693,11 +710,22 @@ function putBaseline(db, { gameVersion, manifest, aircraft, active = true } = {}
     throw new HttpError(400, 'gameVersion (string) and manifest.files required');
   }
   if (aircraft !== undefined && !isPlainObject(aircraft)) throw new HttpError(400, 'aircraft must be an object of stats per aircraft id');
+  // (the stats check's tables, taken by the mod on a clean install: rvng baseline puts them here)
+  if (isPlainObject(aircraft) && aircraft.format !== undefined && !integrity.validStats(aircraft)) {
+    throw new HttpError(400, `aircraft: not a well-formed ${integrity.STATS_FORMAT} stats object`);
+  }
+  if (isPlainObject(aircraft) && aircraft.match !== undefined && !integrity.validStats(aircraft.match)) {
+    throw new HttpError(400, `aircraft.match: not a well-formed ${integrity.STATS_FORMAT} stats object (the match capture)`);
+  }
   const on = active === false || active === 0 ? 0 : 1;
   db.prepare(`INSERT INTO baselines (game_version, manifest, aircraft, active, created_at) VALUES (?, ?, ?, ?, ?)
     ON CONFLICT(game_version) DO UPDATE SET manifest = excluded.manifest, aircraft = excluded.aircraft, active = excluded.active`)
     .run(gameVersion, JSON.stringify(manifest), JSON.stringify(aircraft || {}), on, now());
-  return { gameVersion, active: !!on, files: manifest.files.length, aircraft: Object.keys(aircraft || {}).length };
+  const stats = isPlainObject(aircraft) && aircraft.format === integrity.STATS_FORMAT;
+  return { gameVersion, active: !!on, files: manifest.files.length,
+    aircraft: stats ? Object.keys(aircraft.planes || {}).length : Object.keys(aircraft || {}).length,
+    ...(stats ? { tables: Object.keys(aircraft.groups).length,
+      rows: Object.values(aircraft.groups).reduce((n, g) => n + Object.keys(g.entries).length, 0) } : {}) };
 }
 
 // Retire (or re-enable) a game build. Retired builds cannot scan clean and their tokens stop working.

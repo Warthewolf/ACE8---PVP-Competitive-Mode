@@ -21,7 +21,7 @@
  * stats) comes from both players' clean integrity scans, never from the logs.
  */
 
-const { compareAircraft, isPlainObject, SEVERITY } = require('./integrity');
+const { compareAircraft, isPlainObject, SEVERITY, validStats } = require('./integrity');
 
 const EVENT_TYPES = new Set(['missile_fired', 'gun_fired', 'special_fired', 'hit', 'kill', 'death', 'respawn', 'flare', 'disconnect']);
 const END_REASONS = new Set(['kill_target', 'time_limit', 'disconnect', 'surrender']);
@@ -65,6 +65,8 @@ function validateShape(r) {
     }
   }
   if (r.runtime !== undefined && !isPlainObject(r.runtime)) errs.push('runtime');
+  // the stats check's in-match pass (rvng_stats.lua): the tables the match loaded, as fingerprints
+  if (r.stats !== undefined && r.stats !== null && !validStats(r.stats)) errs.push('stats');
   // The game's own deathmatch (RVNG runtime 0.4.4): each side's score as the game shows it, decided at time-up.
   if (r.format !== undefined && r.format !== 'native_dm') errs.push('format');
   if (r.format === 'native_dm') {

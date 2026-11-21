@@ -33,7 +33,8 @@ local HOOKS = {
 local AIRCRAFT_PARAM_CLASS = "TODO_AircraftParameter"
 -- Map from our stat names to the property names on AIRCRAFT_PARAM_CLASS.
 local STAT_PROPS = { maxSpeed = "TODO_MaxSpeed", turnRate = "TODO_TurnRate", hp = "TODO_HP", stallSpeed = "TODO_StallSpeed" }
-local GAME_VERSION = "TODO"   -- read from the build string once located
+-- (the game version: the companion takes Steam's build id of the install; the mod sends none)
+local GAME_VERSION = nil
 
 -- Every game-specific call goes through this table. RVNG_GAME exists only for the test harness
 -- (mod/test/harness.lua); another script mod able to set it would itself fail the integrity scan.
@@ -104,13 +105,83 @@ local function collectAircraftStats()
   return out
 end
 
+-- The stats check (rvng_stats.lua, docs/re/STATS.md): the game's combat tables as fingerprints, read in the
+-- background (a slice of STATS_SLICE_S each tick, paused while a match is armed), a new pass every STATS_EVERY_S, each
+-- written to runtime.json. A clean install's first pass is what `rvng baseline` takes.
+local Stats = require("rvng_stats")
+local STATS_SLICE_S, STATS_EVERY_S = 0.04, 120
+local stats = { job = nil, last = nil, nextAt = 0, passes = 0 }
+RVNG_STATS_STATE = stats                                 -- (the in-game self-test reads it)
 local function writeRuntime()
-  writeJson("runtime.json", { gameVersion = GAME_VERSION, aircraft = collectAircraftStats(), at = os.time() })
+  writeJson("runtime.json", { gameVersion = GAME_VERSION, aircraft = collectAircraftStats(), stats = stats.last, at = os.time() })
+end
+local function statsDone(res)
+  stats.last, stats.job, stats.passes = res, nil, stats.passes + 1
+  stats.nextAt = os.time() + STATS_EVERY_S
+  writeRuntime()
+  print(string.format("[ProjectRVNG] stats pass %d: %d planes, %d parts, %d values, %d ms in %d slices\n", stats.passes,
+    res.groups.PlaneDataMap_.count, res.groups.PartsDataMap_.count, res.leaves, res.ms, res.slices))
+end
+-- In a match (a normal install's armed match, or a test's deathmatch map): no menu pass. Instead the in-match pass
+-- reads the tables the last menu pass found not loaded (the online weapon and durability tables load with the match),
+-- in slices of STATS_MATCH_SLICE_S, once per match: runtime_match.json, and the match's result carries it.
+local STATS_MATCH_SLICE_S = 0.005
+local function inMatch()
+  local f = rawget(_G, "RVNG_MatchInfo")
+  if type(f) == "function" and f(2) ~= 0 then return true end
+  local m = type(rawget(_G, "RVNG_LastMap")) == "function" and RVNG_LastMap() or nil
+  return type(m) == "string" and m:find("PL_DM_", 1, true) ~= nil
+end
+local function matchTables()
+  local only, n = {}, 0
+  for _, g in ipairs(Stats.GROUPS) do
+    local seen = stats.last and stats.last.groups[g.name]
+    if g.optional and (not seen or seen.missing) then only[g.name] = true; n = n + 1 end
+  end
+  return only, n
+end
+local function matchTick()
+  if stats.matchDone then return end
+  if not stats.matchJob then
+    local only, n = matchTables()
+    if n == 0 then stats.matchDone = true; return end
+    stats.matchJob = Stats.new(nil, { only = only })
+    if not stats.matchJob then return end
+  end
+  if stats.matchJob:step(STATS_MATCH_SLICE_S) then
+    local res = stats.matchJob.res
+    stats.match, stats.matchJob, stats.matchDone = res, nil, true
+    writeJson("runtime_match.json", { stats = res, at = os.time() })
+    local read = {}
+    for name, g in pairs(res.groups) do if not g.missing then read[#read + 1] = name .. " " .. g.count end end
+    table.sort(read)
+    print(string.format("[ProjectRVNG] stats in the match: %s (%d ms in %d slices)\n",
+      #read > 0 and table.concat(read, ", ") or "none loaded", res.ms, res.slices))
+  end
+end
+local function statsTick()
+  if inMatch() then return matchTick() end
+  if stats.matchDone or stats.matchJob then             -- (out of the match: the next one reads its tables again)
+    stats.matchDone, stats.matchJob = false, nil
+  end
+  if not stats.job then
+    if os.time() < stats.nextAt then return end
+    stats.job = Stats.new()
+    if not stats.job then return end                    -- (the manager isn't there yet: next tick)
+  end
+  if stats.job:step(STATS_SLICE_S) then statsDone(stats.job.res) end
+end
+-- before a queue: a pass must be there (the first one finished at once if it isn't yet: one pause, on the menu)
+local function statsReady()
+  if stats.last then return end
+  stats.job = stats.job or Stats.new()
+  if stats.job and stats.job:step(nil) then statsDone(stats.job.res) end
 end
 
 -- ---- Main menu entry ----------------------------------------------------------------
 -- COMPETITIVE 1V1 on the main menu queues (rvng_menu.lua, below); F8 = queue and F9 = cancel stay as keys.
 local function requestQueue(mode)
+  pcall(statsReady)
   writeRuntime()
   writeJson("request.json", { action = "queue", mode = mode })   -- (mode: "ranked" | "casual"; nil = the companion's)
   print("[ProjectRVNG] queue requested" .. (mode and (" (" .. mode .. ")") or ""))
@@ -227,6 +298,7 @@ local function nativeResult()
     self = { aircraftId = tostring(myPlane), kills = oppDeaths, deaths = myDeaths, score = (RVNG_ResultInfo(1) or 0) / 10 },
     opponent = { aircraftId = tostring(oppPlane), kills = myDeaths, deaths = oppDeaths, score = (RVNG_ResultInfo(2) or 0) / 10 },
     events = events,
+    stats = stats.match,                             -- (the in-match pass: the tables the match loaded, when it finished)
   })
   state.doneMatchId = L.matchId
   print(string.format("[ProjectRVNG] the match's result written for the leaderboard (%s)\n", tostring(L.matchId)))
@@ -378,6 +450,7 @@ end
 -- thread and the game thread at once).
 local Tick = require("rvng_tick")
 Tick.add(poll)
+Tick.add(function() pcall(statsTick) end)
 
 -- The native runtime's always-on tick: the web gates stay shut and the boot menu's login is ended (rvng_native.lua)
 require("rvng_native")

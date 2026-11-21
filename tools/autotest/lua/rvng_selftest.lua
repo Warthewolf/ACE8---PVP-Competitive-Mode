@@ -289,6 +289,185 @@ elseif suite == "menu" then
       string.format("Online args %s", tostring(args)))
     return "next"
   end)
+elseif suite == "stats" then
+  -- the stats check (2026-11-21, docs/re/STATS.md): main.lua's own background read (rvng_stats.lua in 40 ms slices a
+  -- second), its pass in runtime.json, the same fingerprints as a read in one go, and no slice holding the game long
+  prefix(hooks)
+  local Stats = require("rvng_stats")
+  -- (2026-11-21: two launches gave different WeaponSettingsDataMap_ rows C.STORY and EASY: their whole texts logged)
+  Stats.keepText = { WeaponSettingsDataMap_ = true }
+  local S = rawget(_G, "RVNG_STATS_STATE")
+  local t0
+  step("the background read's first pass", 240, function(e)
+    if type(S) ~= "table" then check(false, "main.lua's stats state (RVNG_STATS_STATE)"); return "abort" end
+    t0 = t0 or e
+    if S.passes >= 1 and S.last then
+      local r = S.last
+      check(r.groups.PlaneDataMap_.count > 30 and r.groups.PartsDataMap_.count > 100 and r.leaves > 300000,
+        "a whole pass in the background: every plane's flight model, every part, every table",
+        string.format("%d planes, %d parts, %d values; %d ms of CPU in %d slices over %d s; the longest slice %d ms",
+          r.groups.PlaneDataMap_.count, r.groups.PartsDataMap_.count, r.leaves, r.ms, r.slices, e, r.maxSliceMs))
+      check(r.maxSliceMs <= 150, "no slice held the game thread long", r.maxSliceMs .. " ms (budget 40 ms + one row)")
+      local sk = {}
+      for k, v in pairs(r.skipped) do sk[#sk + 1] = k .. " " .. v end
+      table.sort(sk)
+      info("stats: skipped (never read): " .. table.concat(sk, ", "))
+      local via = {}
+      for k, v in pairs(Stats.superVia or {}) do via[#via + 1] = k .. " " .. v end
+      local loaded, absent = {}, {}
+      for _, g in ipairs(Stats.GROUPS) do
+        if g.path then
+          local x = r.groups[g.name]
+          if x.missing then absent[#absent + 1] = g.name else loaded[#loaded + 1] = g.name .. " " .. x.count end
+        end
+      end
+      info("stats: parents found by " .. (#via > 0 and table.concat(via, ", ") or "nothing") .. "; DataTables read: "
+        .. table.concat(loaded, ", ") .. "; not loaded: " .. (#absent > 0 and table.concat(absent, ", ") or "none"))
+      local ws = r.texts and (r.texts["WeaponSettingsDataMap_/easy"] or "") or ""
+      check(ws:find("damage=", 1, true) ~= nil, "a struct's parent fields read too (the weapon settings' damage)",
+        ws:sub(1, 160))
+      return "next"
+    end
+  end)
+  step("runtime.json holds the pass", 10, function()
+    local bridge = rawget(_G, "RVNG_BRIDGE") or "../../../ProjectRVNG/bridge/"
+    local f = io.open(bridge .. "runtime.json", "r")
+    local j = f and require("json").decode(f:read("a"))
+    if f then f:close() end
+    local st = j and j.stats
+    check(type(st) == "table" and st.format == "rvng_stats_1" and st.groups.PlaneDataMap_.digest == S.last.groups.PlaneDataMap_.digest
+      and st.groups.PartsDataMap_.digest == S.last.groups.PartsDataMap_.digest, "runtime.json holds the pass (for the companion)",
+      st and string.format("planes %s, parts %s", st.groups.PlaneDataMap_.digest, st.groups.PartsDataMap_.digest) or "no stats in it")
+    return "next"
+  end)
+  step("the same fingerprints read in one go", 60, function()
+    local one = Stats.collect()
+    local diff = {}
+    for name, g in pairs(S.last.groups) do if not one or one.groups[name].digest ~= g.digest then diff[#diff + 1] = name end end
+    table.sort(diff)
+    check(one ~= nil and #diff == 0, "the sliced pass and a read in one go agree on every table",
+      one and string.format("one go: %d ms; %s", one.ms, #diff > 0 and ("differ: " .. table.concat(diff, ",")) or "all 20 the same") or "no read")
+    local gs = {}
+    for _, g in ipairs(Stats.GROUPS) do
+      local x = S.last.groups[g.name]
+      gs[#gs + 1] = g.name .. " " .. (x.missing and "MISSING" or tostring(x.count)) .. " " .. x.digest
+    end
+    info("stats: " .. table.concat(gs, "; "))
+    local keys = {}
+    for k in pairs(S.last.texts or {}) do keys[#keys + 1] = k end
+    table.sort(keys)
+    for _, k in ipairs(keys) do info("stats text " .. k .. " " .. S.last.texts[k]) end
+    if one and one.texts then
+      for _, k in ipairs(keys) do
+        if one.texts[k] ~= S.last.texts[k] then info("stats text (one go, differs) " .. k .. " " .. tostring(one.texts[k])) end
+      end
+    end
+    return "next"
+  end)
+elseif suite == "stats_probe" then
+  -- 2026-11-21, probe 2 (docs/re/STATS.md; probe 1 crashed reading a plane row's soft class pointer, crash 1): the field
+  -- lists by reflection (no values), then rvng_stats.lua's whole read twice. A line is logged before every risky call.
+  prefix(hooks)
+  local Stats = require("rvng_stats")
+  local function pc(f, ...) local ok, r = pcall(f, ...); if ok then return r end return nil, r end
+  local function unwrap(v) local g = pc(function() return v:get() end); if g ~= nil then return g end return v end
+  local function plist(label, sv)
+    info("probe: about to list " .. label)
+    local out, n = {}, 0
+    local ok, e = pcall(function()
+      sv:ForEachProperty(function(p)
+        n = n + 1
+        local nm = pc(function() return p:GetFName():ToString() end)
+        local cls = pc(function() return p:GetClass():GetFName():ToString() end)
+        local inner = cls == "ArrayProperty" and pc(function() return p:GetInner():GetClass():GetFName():ToString() end)
+        out[#out + 1] = tostring(nm) .. ":" .. tostring(cls) .. (inner and ("<" .. inner .. ">") or "")
+      end)
+    end)
+    info(string.format("probe: %s: %d fields (ok %s %s): %s", label, n, tostring(ok), tostring(e or ""),
+      table.concat(out, " "):sub(1, 3500)))
+  end
+  local im
+  step("probe: the information manager", 30, function()
+    im = pc(FindFirstOf, "LiveInformationManager")
+    local valid = im and pc(function() return im:IsValid() end)
+    check(valid == true, "probe: the information manager found")
+    return valid and "next" or "abort"
+  end)
+  local function firstOf(name)
+    local fv
+    pcall(function() im[name]:ForEach(function(_, v) if not fv then fv = unwrap(v) end end) end)
+    return fv
+  end
+  step("probe: the field lists", 30, function()
+    local part = firstOf("PartsDataMap_")
+    if part then plist("a part (FLivePartsDataTable)", part) end
+    local pd = part and unwrap(pc(function() return part.PartsData[1] end))
+    if pd then plist("a part's PartsData[1] (FPartsData)", pd) end
+    local plane = firstOf("PlaneDataMap_")
+    if plane then plist("a plane (FPlayerPlaneDataTable)", plane) end
+    info("probe: about to read the plane's PlayerParameter")
+    local dt = plane and pc(function() return plane.PlayerParameter end)
+    info("probe: about to read its row names")
+    local names = dt and pc(function() return dt:GetRowNames() end)
+    local list = {}
+    for _, n in ipairs(type(names) == "table" and names or {}) do list[#list + 1] = tostring(pc(function() return n:ToString() end)) end
+    info("probe: " .. tostring(pc(function() return dt:GetFullName() end)) .. " rows: " .. table.concat(list, ","))
+    info("probe: about to FindRow " .. tostring(list[1]))
+    local row = list[1] and unwrap(pc(function() return dt:FindRow(list[1]) end))
+    if row then plist("its row (FLivePlayerParameterDataTable)", row) end
+    info("probe: about to read LevelParameter")
+    local lp = row and pc(function() return row.LevelParameter end)
+    info("probe: LevelParameter count " .. tostring(lp and pc(function() return lp:GetArrayNum() end)))
+    local l1 = lp and unwrap(pc(function() return lp[1] end))
+    if l1 then plist("level 1 (FLivePlayerLevelParameter)", l1) end
+    local fe = l1 and pc(function() return l1.FlightEnginePlayerParameter end)
+    if fe then plist("its flight model (FAceFlightEnginePlayerParameter)", fe) end
+    local sp = l1 and pc(function() return l1.SPWeaponInfo1 end)
+    if sp then plist("its SPWeaponInfo1", sp) end
+    local w = firstOf("WeaponDataMap_")
+    if w then plist("a weapon (FPlayerWeaponDataTable)", w) end
+    check(plane ~= nil and part ~= nil, "probe: field lists logged")
+    return "next"
+  end)
+  local first
+  step("probe: rvng_stats.lua's whole read", 60, function()
+    info("probe: about to Stats.collect")
+    Stats.trace = function(g) info("probe: reading " .. g) end
+    local r, why = Stats.collect(im)
+    Stats.trace = nil
+    if not r then check(false, "Stats.collect", why); return "next" end
+    first = r
+    local gs = {}
+    for _, g in ipairs(Stats.GROUPS) do
+      local x = r.groups[g.name]
+      gs[#gs + 1] = string.format("%s %s%d %s", g.name, x.missing and "MISSING " or "", x.count, x.digest)
+    end
+    info("probe: groups: " .. table.concat(gs, "; "))
+    local sk = {}
+    for k, v in pairs(r.skipped) do sk[#sk + 1] = k .. " " .. v end
+    table.sort(sk)
+    info(string.format("probe: %d values in %d ms; skipped: %s", r.leaves, r.ms, table.concat(sk, ", ")))
+    local ps, np = {}, 0
+    for id, h in pairs(r.planes) do
+      np = np + 1
+      if np <= 40 then ps[#ps + 1] = string.format("%s:%s/%s/%s/L%s", id, tostring(h.speedMax), tostring(h.speedStall), tostring(h.maxHealth), tostring(h.levels)) end
+    end
+    table.sort(ps)
+    info("probe: planes (speedMax/speedStall/maxHealth/levels): " .. table.concat(ps, " "))
+    local P, Q = r.groups.PlaneDataMap_, r.groups.PartsDataMap_
+    check(P.count > 30 and Q.count > 100 and r.leaves > P.count * 300, "probe: every plane's flight model and every part read",
+      string.format("%d planes, %d parts, %d values", P.count, Q.count, r.leaves))
+    return "next"
+  end)
+  step("probe: the same read again", 60, function()
+    local r = Stats.collect(im)
+    local same, diff = 0, {}
+    for name, g in pairs(first.groups) do
+      if r and r.groups[name].digest == g.digest then same = same + 1 else diff[#diff + 1] = name end
+    end
+    check(#diff == 0, "probe: the fingerprints repeat exactly", same .. " tables the same" .. (#diff > 0 and ("; differ: " .. table.concat(diff, ",")) or ""))
+    return "next"
+  end)
 elseif suite == "flags" then
   prefix(hooks)
   wait("watching at the main menu", C.watch_s)
@@ -310,7 +489,7 @@ elseif suite == "dm_b" then
   untilState("time-up: GameTerminating (15) reached", 15, 330)
   heldAt(15, 30)
   offlineThrough("through the deathmatch")
-elseif suite == "dm_c" or suite == "dm_f" or suite == "net_dm" or opp then
+elseif suite == "dm_c" or suite == "dm_f" or suite == "net_dm" or suite == "dm_stats" or opp then
   prefix(hooks)
   if readyUp then
     -- the ready-up screen: the row shows the opponent and both ready states; this PC readies (a press on the row; the
@@ -385,6 +564,19 @@ elseif suite == "dm_c" or suite == "dm_f" or suite == "net_dm" or opp then
         check(Ready.phase == "launched", "launched into the match at the agreed time", string.format("%d s into the countdown", e))
         check(Ready.phase == "launched" and Pages.page == "main", "the pages stepped aside for the travel",
           string.format("the game read the row's texts %d times meanwhile", RVNG_MenuInfo(1) - answers0))
+        return "next"
+      end
+    end)
+  end
+  if suite == "dm_stats" then
+    -- (the stats check's in-match pass reads the tables the menu pass found not loaded: the menu pass first)
+    step("the stats check's menu pass before the travel", 150, function(e)
+      local S = rawget(_G, "RVNG_STATS_STATE")
+      if type(S) == "table" and S.last then
+        local absent = {}
+        for name, g in pairs(S.last.groups) do if g.missing and g.optional then absent[#absent + 1] = name end end
+        table.sort(absent)
+        check(true, "the menu pass done before the travel", string.format("%d s; not loaded at the menu: %s", e, table.concat(absent, ", ")))
         return "next"
       end
     end)
@@ -595,9 +787,40 @@ elseif suite == "dm_c" or suite == "dm_f" or suite == "net_dm" or opp then
   wait("in flight", 80)
   step("a picture in flight", 5, function() say("SHOT in_flight_90s"); return "next" end)
   untilState("time-up: GameTerminating (15) reached", 15, 330)
+  if suite == "dm_stats" then
+    step("the stats check's in-match pass", 20, function(e)
+      local S = rawget(_G, "RVNG_STATS_STATE")
+      if not (type(S) == "table" and S.match) then
+        if e < 18 then return nil end
+        check(false, "the in-match pass finished during the match", type(S) == "table" and S.matchJob and "still reading" or "never started")
+        return "next"
+      end
+      local read, absent = {}, {}
+      for name, g in pairs(S.match.groups) do
+        if g.missing then absent[#absent + 1] = name else read[#read + 1] = name .. " " .. g.count end
+      end
+      table.sort(read); table.sort(absent)
+      check(#read > 0, "the in-match pass read the tables the match loaded",
+        string.format("read: %s; still not loaded: %s; %d ms of CPU in %d slices, the longest %d ms", table.concat(read, ", "),
+          #absent > 0 and table.concat(absent, ", ") or "none", S.match.ms, S.match.slices, S.match.maxSliceMs))
+      check(S.match.maxSliceMs <= 40, "no in-match slice held the game long", S.match.maxSliceMs .. " ms (budget 5 ms + one row)")
+      local bridge = rawget(_G, "RVNG_BRIDGE") or "../../../ProjectRVNG/bridge/"
+      local f = io.open(bridge .. "runtime_match.json", "r")
+      check(f ~= nil, "runtime_match.json written (the baseline's match capture)")
+      if f then f:close() end
+      return "next"
+    end)
+  end
   -- the match's stats for the leaderboard (0.4.4, matchstats.h): its length, how it ended, and with the crash (dm_h,
   -- dm_g) this pilot's death and its relayed copy
-  if type(rawget(_G, "RVNG_MatchStat")) == "function" then
+  -- (only with an opponent: the result (ResultCapture) needs both planes, so a suite without one (dm_c, dm_f, net_dm,
+  -- dm_stats) has no match stats to check: run 20261121_190250)
+  if type(rawget(_G, "RVNG_MatchStat")) == "function" and not opp then
+    step("the match's stats (for the leaderboard)", 5, function()
+      info(string.format("no opponent in this suite: no result to count (%d match(es) with stats)", RVNG_MatchStat(0)))
+      return "next"
+    end)
+  elseif type(rawget(_G, "RVNG_MatchStat")) == "function" then
     step("the match's stats (for the leaderboard)", 10, function(e)
       if RVNG_MatchStat(0) < 1 and e < 8 then return nil end
       check(RVNG_MatchStat(0) >= 1 and RVNG_MatchStat(3) >= 150 and RVNG_MatchStat(4) == 0,

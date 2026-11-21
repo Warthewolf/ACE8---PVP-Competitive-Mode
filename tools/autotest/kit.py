@@ -30,6 +30,9 @@ SUITES = {           # suite: rvng_test.ini lines (docs/IN_GAME_TESTS.md)
     'smoke': {'d2': 0, 'w1': 0, 'd6': 0, 'd7': 1},
     'menu': {'d2': 0, 'w1': 0, 'd6': 0, 'd7': 1},    # (d7: the boot login gate B refuses, ended as failed; 0.2.3)
     'flags': {'d2': 0, 'w1': 0, 'd6': 0, 'd7': 1},
+    'stats_probe': {'d2': 0, 'w1': 0, 'd6': 0, 'd7': 1},   # 2026-11-21: how UE4SS hands the stat tables to Lua (read-only)
+    'stats': {'d2': 0, 'w1': 0, 'd6': 0, 'd7': 1, 'bridge': 1},   # the stats check: main.lua's background read, runtime.json
+    'dm_stats': {'d2': 1, 'w1': 1, 'd6': 1, 'd7': 1, 'bridge': 1},   # dm_c with the stats check's in-match pass
     'dm_a': {'d2': 0, 'w1': 0, 'd6': 0, 'd7': 1},
     'dm_b': {'d2': 1, 'w1': 0, 'd6': 0, 'd7': 1},
     'dm_c': {'d2': 1, 'w1': 1, 'd6': 1, 'd7': 1},   # (d6: the Result map crashes offline; run of 2026-11-18 18:35)
@@ -194,6 +197,19 @@ def cmd_install(a):
             f.write(kv.strip() + '\n')
     patch_main(os.path.join(scripts, 'main.lua'))
     st['manifest'] = manifest(tgt)
+    if cfg.get('bridge'):
+        # the companion's bridge folder (<game>/ProjectRVNG/bridge), where the mod writes runtime.json: made for the run
+        # when it isn't there (Lua can't make folders), each folder made recorded first, so restore removes only those
+        made = []
+        d = C.game_dir()
+        for part in ('ProjectRVNG', 'bridge'):
+            d = os.path.join(d, part)
+            if not os.path.isdir(d):
+                made.append(d)
+                st['bridge_made'] = made
+                save_state(st)
+                os.makedirs(d)
+        st['bridge'] = d
     st['phase'] = 'installed'
     save_state(st)
     print('kit: installed RVNG (suite %s, d2=%d w1=%d d6=%d d7=%d) at %s' % (a.suite, cfg['d2'], cfg['w1'], cfg['d6'], cfg['d7'], tgt))
@@ -229,6 +245,26 @@ def cmd_restore(_):
             print('kit: %d installed file(s) changed during the run: %s' % (len(changed), ', '.join(changed[:8])))
         shutil.rmtree(tgt)
         print('kit: the test %s removed' % i['name'])
+    if st.get('bridge'):
+        # the run's runtime.json kept with the run (it is the stats pass the mod wrote), then the folders the kit made
+        # removed: only when they hold nothing but what the mod writes there
+        # (runtime_match.json: the in-match pass, the baseline's match capture)
+        for name in ('runtime.json', 'runtime_match.json'):
+            rt = os.path.join(st['bridge'], name)
+            if os.path.isfile(rt):
+                shutil.copy2(rt, os.path.join(run_dir, name))
+        for d in reversed(st.get('bridge_made', [])):
+            if not os.path.isdir(d):
+                continue
+            left = [f for f in os.listdir(d) if f not in ('runtime.json', 'runtime.json.tmp', 'runtime_match.json',
+                                                          'runtime_match.json.tmp')
+                    and not (d.endswith('ProjectRVNG') and f == 'bridge')]
+            if left:
+                print('kit: %s holds %s (not the run\'s): LEFT ALONE (look at it)' % (d, ', '.join(left[:6])))
+                bad += 1
+                break
+            shutil.rmtree(d)
+            print('kit: the run\'s %s removed' % d)
     aside = C.state_dir('aside')
     for m in reversed(st.get('moved', [])):
         src = os.path.join(aside, m['name'])

@@ -11,7 +11,8 @@
  *   rvng report     --player ID --reason cheating|griefing|abuse|other [--match MATCH_ID] [--details TEXT]
  *                                                          report a pilot to the admins
  *   rvng settings   --hide-rating on|off                   show only your tier (not the number) on the website
- *   rvng baseline   --game DIR --version V [--aircraft stats.json]             (admins) build a clean-install baseline
+ *   rvng baseline   --game DIR [--version V] [--aircraft runtime.json]          (admins) build a clean-install baseline:
+ *                                                          the files, and the stats the mod read (version: Steam's build)
  *   rvng approve    --game DIR --path REL[,REL...] --name NAME [--version V] [--category required|cosmetic|retired]
  *                   [--exclude SUB[,SUB...]] [--out FILE]  (admins) pin the files and folders of one build of a
  *                                                          mod, leaving out folders that belong to another mod
@@ -22,7 +23,7 @@
  * daemon in <game>/ProjectRVNG/bridge/ :
  *   mod -> daemon : request.json  { action: "queue" | "cancel", region?, mode? }   mode: "ranked" | "casual"; without
  *                                 one, --mode is used, else the server's default (ranked, or casual while ranked is off)
- *                   runtime.json  { gameVersion, aircraft: {...}, loadedModules: [...] }
+ *                   runtime.json  { stats: {...} (rvng_stats.lua), loadedModules?: [...] }
  *                   lobby.json    { matchId, lobbyCode }        (host only, after creating the room)
  *                   link.json     { matchId, steamId }          (both: this PC's SteamID64 for the match's relay-only
  *                                                                Steam link; the server shows it only to the opponent)
@@ -85,16 +86,29 @@ function writeJson(f, data, mode) {
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// The game's version: Steam's build id of the install (steamapps/appmanifest_<appid>.acf next to common/), so both
+// PCs on the same Steam update agree with no version typed anywhere. null when the install isn't a Steam library one.
+function steamBuild(game) {
+  try {
+    const appid = fs.readFileSync(path.join(game, 'Game', 'Binaries', 'Win64', 'steam_appid.txt'), 'utf8').trim();
+    if (!/^\d{1,10}$/.test(appid)) return null;
+    const acf = fs.readFileSync(path.join(game, '..', '..', `appmanifest_${appid}.acf`), 'utf8');
+    const m = acf.match(/"buildid"\s+"(\d{1,12})"/);
+    return m ? `steam-${m[1]}` : null;
+  } catch { return null; }
+}
+
 function buildReport(game, opts = {}) {
   const stats = {};
   const files = scan(game, { useCache: !opts.noCache, stats });
   const runtime = readJson(path.join(bridgeDir(game), 'runtime.json')) || {};
   return {
     scannerVersion: VERSION,
-    gameVersion: opts.gameVersion || runtime.gameVersion,
+    gameVersion: opts.gameVersion || steamBuild(game) || runtime.gameVersion,
     files,
     scanStats: stats,
-    runtime: { aircraft: runtime.aircraft, loadedModules: runtime.loadedModules },
+    // stats: the game's combat tables as fingerprints (rvng_stats.lua); aircraft: the older per-plane numbers
+    runtime: { stats: runtime.stats, aircraft: runtime.aircraft, loadedModules: runtime.loadedModules },
   };
 }
 
@@ -148,18 +162,57 @@ async function cmdJoinEvent(a) {
   console.log(`Registered for ${t.name} (${t.entrants.length}/${t.size} pilots). The bracket is seeded when the event starts.`);
 }
 
+// The stats a clean install's mod wrote (runtime.json's stats), for the baseline. --aircraft FILE: a runtime.json
+// (or an older per-aircraft stats file) taken elsewhere.
+function baselineStats(a) {
+  const src = a.aircraft || path.join(bridgeDir(a.game), 'runtime.json');
+  // (the mod can't make folders: the bridge is made here, so the next game start can write runtime.json into it)
+  if (!a.aircraft) fs.mkdirSync(bridgeDir(a.game), { recursive: true });
+  const j = readJson(src);
+  if (!j) throw new Error(`no stats at ${src}: start the game with the RVNG mod and wait at the main menu until its log says `
+    + '"stats pass 1" (about a minute), then run this again; or pass --aircraft <runtime.json>');
+  if (j.stats) {
+    if (j.stats.format !== 'rvng_stats_1' || !j.stats.groups || !j.stats.groups.PlaneDataMap_ || !j.stats.groups.PartsDataMap_
+      || !j.stats.groups.PlaneDataMap_.count || !j.stats.groups.PartsDataMap_.count) {
+      throw new Error(`${src}: the mod's stats are incomplete (no planes or no parts read): not a usable baseline`);
+    }
+    const missing = Object.entries(j.stats.groups).filter(([, g]) => g.missing).map(([n]) => n);
+    if (missing.length) console.warn(`note: tables not loaded at the main menu (checked in matches, from the match capture): ${missing.join(', ')}`);
+    // the match capture: the tables that load with a match, from a clean match's in-match pass (runtime_match.json)
+    const msrc = a.match || path.join(path.dirname(src), 'runtime_match.json');
+    const mj = readJson(msrc);
+    if (mj && mj.stats && mj.stats.format === 'rvng_stats_1' && mj.stats.groups) {
+      const read = Object.entries(mj.stats.groups).filter(([, g]) => !g.missing).map(([n]) => n);
+      console.log(`match capture from ${msrc}: ${read.length ? read.join(', ') : 'no tables loaded'}`);
+      return { src, stats: { ...j.stats, match: mj.stats } };
+    }
+    if (a.match) throw new Error(`no match capture at ${msrc}`);
+    console.warn('note: no match capture (runtime_match.json, written during a match): the tables that load with a match '
+      + 'go unchecked until a baseline has one. Play one match on the clean install and run this again.');
+    return { src, stats: j.stats };
+  }
+  return { src, stats: j.aircraft && typeof j.aircraft === 'object' && !Array.isArray(j.aircraft) ? j.aircraft : j };
+}
+
 function cmdBaseline(a) {
-  if (!a.version) throw new Error('--version required');
+  const version = a.version || steamBuild(a.game);
+  if (!version) throw new Error('--version required (the install has no Steam build id to use)');
   const files = scan(a.game, { useCache: false })
     // Mods are registered separately as approved mods, never baked into the baseline.
     .filter((f) => !/(^|\/)(~mods|logicmods|ue4ss|projectrvng)\//i.test(f.path));
   const links = files.filter((f) => f.size < 0);
   if (links.length) throw new Error(`the install contains links, which cannot be part of a baseline: ${links.map((f) => f.path).join(', ')}`);
-  const aircraft = a.aircraft ? JSON.parse(fs.readFileSync(a.aircraft, 'utf8')) : {};
-  const out = a.out || `baseline-${a.version}.json`;
-  writeJson(out, { gameVersion: a.version, manifest: { files }, aircraft });
-  console.log(`Wrote ${out}: ${files.length} files, ${Object.keys(aircraft).length} aircraft. Upload with PUT /api/admin/baselines.`);
-  if (!Object.keys(aircraft).length) console.warn('warning: no aircraft stats given (--aircraft); every match on this build will be disputed.');
+  const { src, stats } = baselineStats(a);
+  const out = a.out || `baseline-${version}.json`;
+  writeJson(out, { gameVersion: version, manifest: { files }, aircraft: stats });
+  if (stats.format === 'rvng_stats_1') {
+    const rows = Object.values(stats.groups).reduce((n, g) => n + (g.count || 0), 0);
+    console.log(`Wrote ${out} (game version ${version}): ${files.length} files; stats from ${src}: `
+      + `${stats.groups.PlaneDataMap_.count} planes, ${stats.groups.PartsDataMap_.count} parts, ${rows} rows in `
+      + `${Object.keys(stats.groups).length} tables. Upload with PUT /api/admin/baselines (or the admin page).`);
+  } else {
+    console.log(`Wrote ${out} (game version ${version}): ${files.length} files, ${Object.keys(stats).length} aircraft. Upload with PUT /api/admin/baselines.`);
+  }
 }
 
 // Admin helper: pins one file, or every file of a folder (a mod, or the UE4SS loader and its settings), as approved.
@@ -423,4 +476,4 @@ async function main() {
 }
 
 if (require.main === module) main().catch((e) => { console.error(e.message); process.exit(1); });
-module.exports = { buildReport, createBridge, writeJson, cmdApprove, cmdReport, cmdSettings, DEFAULT_EXCLUDES };
+module.exports = { buildReport, steamBuild, cmdBaseline, createBridge, writeJson, cmdApprove, cmdReport, cmdSettings, DEFAULT_EXCLUDES };
