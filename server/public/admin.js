@@ -129,14 +129,20 @@ async function scans() {
 
 // ---- the game build's file list and the approved mods
 async function build() {
-  const mods = await call('GET', '/api/admin/mods');
+  const [mods, builds] = await Promise.all([call('GET', '/api/admin/mods'), call('GET', '/api/admin/baselines')]);
   const list = Array.isArray(mods) ? mods : mods.mods || [];
   const byMod = {};
   for (const m of list) (byMod[`${m.name} ${m.version || ''}`.trim()] ||= []).push(m);
   return `<div class="ttl"><h1>Build &amp; mods</h1><div class="note">The clean game's file list (one per game build) and the mod files pilots may have installed.</div></div>
     <section class="admin-card"><h2>Game build</h2>
       <p>A JSON file as the README's baseline upload sends it: <code>{ "gameVersion", "manifest": { "files": [...] }, "aircraft": {...} }</code>.</p>
-      <form class="admin-settle" data-upload="baseline"><input type="file" name="file" accept=".json,application/json" required><button class="btn-line" type="submit">Upload build</button></form></section>
+      <form class="admin-settle" data-upload="baseline"><input type="file" name="file" accept=".json,application/json" required><button class="btn-line" type="submit">Upload build</button></form>
+      ${builds.length ? `<table class="admin-table"><thead><tr><th>Build</th><th>Uploaded</th><th>Files</th><th>Stats check</th><th>State</th><th></th></tr></thead><tbody>
+      ${builds.map((b) => `<tr data-build="${esc(b.gameVersion)}"><td>${esc(b.gameVersion)}</td><td>${when(b.createdAt)}</td><td>${b.files}</td>
+        <td>${b.tables ? `${b.rows} rows in ${b.tables} tables, ${b.aircraft} planes${b.matchCapture ? ', match capture' : ''}` : 'none'}</td>
+        <td><span class="badge ${b.active ? 'clean' : 'void'}">${b.active ? 'active' : 'retired'}</span></td>
+        <td class="admin-actions"><button type="button" data-build-active="${b.active ? '0' : '1'}">${b.active ? 'retire' : 'enable'}</button></td></tr>`).join('')}
+      </tbody></table>` : '<div class="empty">No game build uploaded yet.</div>'}</section>
     <section class="admin-card"><h2>Approved mods</h2>
       <p>A JSON file with <code>{ "name", "version", "mods": [{ "path", "size", "sha256", "category" }] }</code> (category: required or cosmetic).</p>
       <form class="admin-settle" data-upload="mods"><input type="file" name="file" accept=".json,application/json" required><button class="btn-line" type="submit">Add mods</button></form>
@@ -182,6 +188,12 @@ document.addEventListener('click', async (e) => {
     const note = prompt('Note on the pilot\'s card (empty clears it):');
     if (note === null) return;
     await act(() => call('POST', `/api/admin/players/${id}/role`, { ...(role.trim() ? { role: role.trim() } : {}), note }), 'Card updated.');
+  } else if (b.dataset.buildActive) {
+    const v = b.closest('[data-build]').dataset.build;
+    const on = b.dataset.buildActive === '1';
+    if (on || confirm(`Retire build ${v}? Pilots on it can't scan clean or queue until it's enabled again.`)) {
+      await act(() => call('POST', `/api/admin/baselines/${encodeURIComponent(v)}/active`, { active: on }), on ? 'Build enabled.' : 'Build retired.');
+    }
   } else if (b.dataset.retire) {
     const ids = JSON.parse(b.dataset.retire);
     if (ids.length && confirm('Retire these files? A scan that still finds them is no longer clean.')) await act(() => call('POST', '/api/admin/mods/retire', { ids }), 'Retired.');

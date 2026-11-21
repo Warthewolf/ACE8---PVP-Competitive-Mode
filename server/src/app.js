@@ -146,6 +146,7 @@ function createApp({ db = openDb(config.dbPath) } = {}) {
   app.post('/api/reports', player, wrap((req, res) => { const r = svc.fileReport(db, req.player, req.body || {}); res.status(201); return r; }));
 
   // ----- admin -----
+  app.get('/api/admin/baselines', requireAdmin, wrap(() => svc.listBaselines(db)));
   app.put('/api/admin/baselines', requireAdmin, wrap((req) => svc.putBaseline(db, req.body || {})));
   app.post('/api/admin/baselines/:version/active', requireAdmin, wrap((req) => svc.setBaselineActive(db, req.params.version, (req.body || {}).active)));
   app.get('/api/admin/mods', requireAdmin, wrap(() => svc.listApprovedMods(db)));

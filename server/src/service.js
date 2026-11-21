@@ -728,6 +728,22 @@ function putBaseline(db, { gameVersion, manifest, aircraft, active = true } = {}
       rows: Object.values(aircraft.groups).reduce((n, g) => n + Object.keys(g.entries).length, 0) } : {}) };
 }
 
+// The uploaded game builds, newest first: a summary of each (file, plane and stat-table counts), not the lists.
+function listBaselines(db) {
+  return db.prepare('SELECT game_version, manifest, aircraft, active, created_at FROM baselines ORDER BY created_at DESC, id DESC').all()
+    .map((b) => {
+      let files = 0; let a = {};
+      try { files = (JSON.parse(b.manifest).files || []).length; } catch { /* kept as 0 */ }
+      try { a = JSON.parse(b.aircraft) || {}; } catch { /* kept empty */ }
+      const stats = isPlainObject(a) && a.format === integrity.STATS_FORMAT && isPlainObject(a.groups);
+      return { gameVersion: b.game_version, active: !!b.active, createdAt: b.created_at, files,
+        aircraft: stats ? Object.keys(a.planes || {}).length : Object.keys(a).length,
+        tables: stats ? Object.keys(a.groups).length : 0,
+        rows: stats ? Object.values(a.groups).reduce((n, g) => n + Object.keys((g && g.entries) || {}).length, 0) : 0,
+        matchCapture: !!(stats && isPlainObject(a.match)) };
+    });
+}
+
 // Retire (or re-enable) a game build. Retired builds cannot scan clean and their tokens stop working.
 function setBaselineActive(db, gameVersion, active) {
   if (typeof active !== 'boolean') throw new HttpError(400, 'active must be true or false');
@@ -1003,6 +1019,6 @@ module.exports = {
   fileReport, listReports, closeReport, lapseCooldown, PENDING_MESSAGE,
   submitIntegrity, joinQueue, leaveQueue, queueStatus, runMatchmaker,
   getMatch, setLobby, setLink, submitReport, resolveDispute, sweepStaleMatches, recentMatches,
-  putBaseline, setBaselineActive, addApprovedMods, listApprovedMods, removeApprovedMod, retireMods, capFindings,
+  putBaseline, listBaselines, setBaselineActive, addApprovedMods, listApprovedMods, removeApprovedMod, retireMods, capFindings,
   setPlayerStatus, integrityLog, stats, adminMatch,
 };

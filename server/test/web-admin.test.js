@@ -76,6 +76,13 @@ test('admin page: sign in, settle a lost-link match from both logs, let a pilot 
       await page.goto(env.url + '/admin.html#build');
       await page.waitForSelector('[data-upload=baseline]');
       assert.match(await page.textContent('#panel'), /Project RVNG/);
+      const buildRow = page.locator('[data-build="1.0.0"]');
+      assert.match(await buildRow.textContent(), /1\.0\.0.*active/s, 'the uploaded build is listed');
+      await buildRow.locator('button[data-build-active="0"]').click();
+      await page.waitForFunction(() => document.getElementById('msg').textContent === 'Build retired.');
+      assert.equal((await env.admin('GET', '/api/admin/baselines')).find((b) => b.gameVersion === '1.0.0').active, false);
+      await page.locator('[data-build="1.0.0"] button[data-build-active="1"]').click();
+      await page.waitForFunction(() => document.getElementById('msg').textContent === 'Build enabled.');
       await page.goto(env.url + '/admin.html#scans');
       await page.waitForSelector('.admin-table');
       assert.deepEqual(errors, []);

@@ -116,6 +116,13 @@ test('stats: the whole path through the API', async () => {
   try {
     const put = await env.admin('PUT', '/api/admin/baselines', { gameVersion: 'steam-26002268', manifest: { files: BASE_FILES }, aircraft: REF });
     assert.deepEqual(put, { gameVersion: 'steam-26002268', active: true, files: 2, aircraft: 2, tables: 3, rows: 5 });
+    // the admin page's list of builds: a summary of each, newest first, no file lists
+    const listed = (await env.admin('GET', '/api/admin/baselines')).find((b) => b.gameVersion === 'steam-26002268');
+    assert.deepEqual({ ...listed, createdAt: typeof listed.createdAt },
+      { gameVersion: 'steam-26002268', active: true, createdAt: 'number', files: 2, aircraft: 2, tables: 3, rows: 5, matchCapture: false });
+    assert.equal((await env.admin('GET', '/api/admin/baselines'))[0].gameVersion, 'steam-26002268', 'newest first');
+    const pilot = await env.register('NotAdmin');
+    await assert.rejects(pilot.call('GET', '/api/admin/baselines'), (e) => e.status === 401 || e.status === 403, 'admin only');
     await assert.rejects(env.admin('PUT', '/api/admin/baselines', { gameVersion: 'x', manifest: { files: [] },
       aircraft: { format: 'rvng_stats_1', groups: { G: { digest: 'bad', entries: {} } } } }), /not a well-formed rvng_stats_1/);
 
